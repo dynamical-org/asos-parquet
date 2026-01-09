@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASOS Weather Viewer</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 { margin-bottom: 5px; }
+    .subtitle { color: #666; margin-bottom: 20px; }
+    .controls {
+      display: flex;
+      gap: 15px;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    .control-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .control-group label {
+      font-size: 12px;
+      color: #666;
+      font-weight: 500;
+    }
+    input, select, button {
+      padding: 8px 12px;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    button {
+      background: #0066cc;
+      color: white;
+      border: none;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    button:hover { background: #0055aa; }
+    button:disabled { background: #999; cursor: not-allowed; }
+    .chart-container {
+      background: white;
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      margin-bottom: 15px;
+    }
+    .chart-container h3 {
+      margin: 0 0 10px 0;
+      font-size: 14px;
+      color: #333;
+    }
+    #status {
+      padding: 10px;
+      border-radius: 4px;
+      margin-bottom: 15px;
+    }
+    #status.loading { background: #fff3cd; color: #856404; }
+    #status.error { background: #f8d7da; color: #721c24; }
+    #status.success { background: #d4edda; color: #155724; }
+    #stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin-top: 15px;
+    }
+    .stat {
+      background: #f8f9fa;
+      padding: 10px;
+      border-radius: 4px;
+      text-align: center;
+    }
+    .stat-value { font-size: 20px; font-weight: bold; color: #0066cc; }
+    .stat-label { font-size: 11px; color: #666; }
+    .legend {
+      display: flex;
+      gap: 20px;
+      margin-bottom: 10px;
+      font-size: 12px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .legend-color {
+      width: 12px;
+      height: 12px;
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+  <h1>ASOS Weather Viewer</h1>
+  <p class="subtitle">Load weather data from geoparquet using DuckDB-WASM</p>
+
+  <div class="controls">
+    <div class="control-group">
+      <label>Parquet File</label>
+      <input type="text" id="parquetPath" value="data/asos.parquet" style="width: 250px;">
+    </div>
+    <div class="control-group">
+      <label>Station ID</label>
+      <input type="text" id="stationId" value="BNA" style="width: 100px;">
+    </div>
+    <div class="control-group">
+      <label>&nbsp;</label>
+      <button id="loadBtn" disabled>Load Data</button>
+    </div>
+  </div>
+
+  <div id="status" class="loading">Initializing DuckDB...</div>
+
+  <div id="tempChart" class="chart-container"></div>
+  <div id="precipChart" class="chart-container"></div>
+
+  <div id="stats"></div>
+
+  <script type="module">
+    // Import both libraries as ES modules
+    const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm');
+    const Plot = await import('https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.13/+esm');
+
+    let db = null;
+    let conn = null;
+
+    async function initDuckDB() {
+      try {
+        updateStatus('Initializing DuckDB...', 'loading');
+
+        // Get the bundles
+        const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
+
+        // Select a bundle based on browser checks
+        const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
+
+        const worker_url = URL.createObjectURL(
+          new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+        );
+
+        const worker = new Worker(worker_url);
+        const logger = new duckdb.ConsoleLogger();
+
+        db = new duckdb.AsyncDuckDB(logger, worker);
+        await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+        URL.revokeObjectURL(worker_url);
+
+        conn = await db.connect();
+
+        updateStatus('DuckDB ready. Enter a parquet path and station ID, then click Load Data.', 'success');
+        document.getElementById('loadBtn').disabled = false;
+
+      } catch (error) {
+        updateStatus(`Failed to initialize DuckDB: ${error.message}`, 'error');
+        console.error(error);
+      }
+    }
+
+    function updateStatus(message, type) {
+      const status = document.getElementById('status');
+      status.textContent = message;
+      status.className = type;
+    }
+
+    function createStatElement(value, label, color = '#0066cc') {
+      const stat = document.createElement('div');
+      stat.className = 'stat';
+
+      const valueEl = document.createElement('div');
+      valueEl.className = 'stat-value';
+      valueEl.style.color = color;
+      valueEl.textContent = value;
+
+      const labelEl = document.createElement('div');
+      labelEl.className = 'stat-label';
+      labelEl.textContent = label;
+
+      stat.appendChild(valueEl);
+      stat.appendChild(labelEl);
+      return stat;
+    }
+
+    async function loadData() {
+      const parquetPath = document.getElementById('parquetPath').value.trim();
+      const stationId = document.getElementById('stationId').value.trim().toUpperCase();
+
+      if (!parquetPath || !stationId) {
+        updateStatus('Please enter both parquet path and station ID', 'error');
+        return;
+      }
+
+      try {
+        updateStatus(`Loading data for station ${stationId}...`, 'loading');
+        document.getElementById('loadBtn').disabled = true;
+
+        // Convert relative path to absolute URL for DuckDB-WASM
+        const absoluteUrl = new URL(parquetPath, window.location.href).href;
+
+        // Query all weather data for the station
+        // Convert timestamp to epoch ms in SQL for reliable JS Date handling
+        const query = `
+          SELECT
+            epoch_ms(valid) as timestamp_ms,
+            tmpf as temp_f,
+            dwpf as dewpoint_f,
+            p01i as precip_inches
+          FROM read_parquet('${absoluteUrl}')
+          WHERE station = '${stationId}'
+          ORDER BY valid
+        `;
+
+        const result = await conn.query(query);
+        const data = result.toArray().map(row => ({
+          timestamp: new Date(Number(row.timestamp_ms)),
+          temp_f: row.temp_f !== null ? Number(row.temp_f) : null,
+          dewpoint_f: row.dewpoint_f !== null ? Number(row.dewpoint_f) : null,
+          precip_inches: row.precip_inches !== null ? Number(row.precip_inches) : null
+        }));
+
+        if (data.length === 0) {
+          updateStatus(`No data found for station ${stationId}`, 'error');
+          document.getElementById('tempChart').replaceChildren();
+          document.getElementById('precipChart').replaceChildren();
+          document.getElementById('stats').replaceChildren();
+          document.getElementById('loadBtn').disabled = false;
+          return;
+        }
+
+        // Filter for valid temperature data
+        const tempData = data.filter(d => d.temp_f !== null);
+        const precipData = data.filter(d => d.precip_inches !== null && d.precip_inches > 0);
+
+        // Create temperature chart
+        const tempChartContainer = document.getElementById('tempChart');
+        const tempHeader = document.createElement('h3');
+        tempHeader.textContent = `Temperature at ${stationId}`;
+
+        const tempChart = Plot.plot({
+          width: 960,
+          height: 250,
+          marginLeft: 50,
+          marginBottom: 40,
+          x: {
+            label: null,
+            type: "time"
+          },
+          y: {
+            label: "Temperature (°F)",
+            grid: true
+          },
+          color: {
+            legend: true
+          },
+          marks: [
+            Plot.ruleY([32], { stroke: "#ccc", strokeDasharray: "4,4" }),
+            Plot.lineY(tempData, {
+              x: "timestamp",
+              y: "temp_f",
+              stroke: "#e63946",
+              strokeWidth: 1.5,
+              tip: true
+            }),
+            Plot.lineY(tempData.filter(d => d.dewpoint_f !== null), {
+              x: "timestamp",
+              y: "dewpoint_f",
+              stroke: "#457b9d",
+              strokeWidth: 1,
+              strokeOpacity: 0.7
+            })
+          ]
+        });
+
+        const legend = document.createElement('div');
+        legend.className = 'legend';
+        legend.innerHTML = `
+          <div class="legend-item"><div class="legend-color" style="background: #e63946"></div> Temperature</div>
+          <div class="legend-item"><div class="legend-color" style="background: #457b9d"></div> Dewpoint</div>
+          <div class="legend-item" style="color: #999">— 32°F freezing line</div>
+        `;
+
+        tempChartContainer.replaceChildren(tempHeader, legend, tempChart);
+
+        // Create precipitation chart
+        const precipChartContainer = document.getElementById('precipChart');
+        const precipHeader = document.createElement('h3');
+        precipHeader.textContent = `Precipitation at ${stationId}`;
+
+        const precipChart = Plot.plot({
+          width: 960,
+          height: 200,
+          marginLeft: 50,
+          marginBottom: 40,
+          x: {
+            label: "Date",
+            type: "time"
+          },
+          y: {
+            label: "Precipitation (in)",
+            grid: true
+          },
+          marks: [
+            Plot.ruleY([0]),
+            Plot.rectY(data.filter(d => d.precip_inches !== null), Plot.binX(
+              { y: "sum" },
+              {
+                x: "timestamp",
+                y: "precip_inches",
+                interval: "day",
+                fill: "#0077b6",
+                tip: true
+              }
+            ))
+          ]
+        });
+
+        precipChartContainer.replaceChildren(precipHeader, precipChart);
+
+        // Calculate stats
+        const temps = tempData.map(d => d.temp_f);
+        const minTemp = Math.min(...temps);
+        const maxTemp = Math.max(...temps);
+        const avgTemp = temps.reduce((a, b) => a + b, 0) / temps.length;
+
+        const totalPrecip = data.reduce((sum, d) => sum + (d.precip_inches || 0), 0);
+        const dateRange = `${data[0].timestamp.toLocaleDateString()} - ${data[data.length-1].timestamp.toLocaleDateString()}`;
+
+        const statsContainer = document.getElementById('stats');
+        statsContainer.replaceChildren(
+          createStatElement(`${minTemp.toFixed(0)}°F`, 'Min Temp', '#457b9d'),
+          createStatElement(`${avgTemp.toFixed(0)}°F`, 'Avg Temp', '#333'),
+          createStatElement(`${maxTemp.toFixed(0)}°F`, 'Max Temp', '#e63946'),
+          createStatElement(`${totalPrecip.toFixed(2)}"`, 'Total Precip', '#0077b6'),
+          createStatElement(precipData.length.toLocaleString(), 'Precip Hours', '#0077b6'),
+          createStatElement(data.length.toLocaleString(), 'Total Records', '#666')
+        );
+
+        updateStatus(`Loaded ${data.length.toLocaleString()} records for ${stationId} (${dateRange})`, 'success');
+
+      } catch (error) {
+        updateStatus(`Error: ${error.message}`, 'error');
+        console.error(error);
+      } finally {
+        document.getElementById('loadBtn').disabled = false;
+      }
+    }
+
+    // Attach click handler
+    document.getElementById('loadBtn').addEventListener('click', loadData);
+
+    // Initialize on load
+    initDuckDB();
+  </script>
+</body>
+</html>
