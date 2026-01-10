@@ -67,6 +67,9 @@ def upload_partition(
 ) -> list[str]:
     """Upload all files in a partition directory to R2.
 
+    Merges all parquet files in the partition into a single data.parquet file.
+    This creates predictable URLs for browser access (DuckDB-WASM can't glob over HTTP).
+
     Args:
         partition_path: Local partition directory (e.g., data/asos/date=2024-01-01)
         bucket: R2 bucket name
@@ -76,18 +79,36 @@ def upload_partition(
     Returns:
         List of uploaded S3 URIs
     """
+    import pyarrow.parquet as pq
+
     if client is None:
         client = get_r2_client()
 
-    uploaded = []
     partition_name = partition_path.name  # e.g., "date=2024-01-01"
+    parquet_files = list(partition_path.glob("*.parquet"))
 
-    for parquet_file in partition_path.glob("*.parquet"):
-        key = f"{prefix}/{partition_name}/{parquet_file.name}"
-        uri = upload_file(parquet_file, bucket, key, client)
-        uploaded.append(uri)
+    if not parquet_files:
+        return []
 
-    return uploaded
+    # Merge all parquet files into one and upload as data.parquet
+    if len(parquet_files) == 1:
+        # Single file - upload directly with fixed name
+        key = f"{prefix}/{partition_name}/data.parquet"
+        uri = upload_file(parquet_files[0], bucket, key, client)
+        return [uri]
+    else:
+        # Multiple files - merge first
+        import tempfile
+        tables = [pq.read_table(f) for f in parquet_files]
+        import pyarrow as pa
+        merged = pa.concat_tables(tables)
+
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            pq.write_table(merged, tmp.name)
+            key = f"{prefix}/{partition_name}/data.parquet"
+            uri = upload_file(Path(tmp.name), bucket, key, client)
+            Path(tmp.name).unlink()
+            return [uri]
 
 
 def list_partitions(
@@ -95,7 +116,7 @@ def list_partitions(
     prefix: str = "asos",
     client=None,
 ) -> list[str]:
-    """List all partition dates in the R2 bucket.
+    """List all partition months in the R2 bucket.
 
     Args:
         bucket: R2 bucket name
@@ -103,7 +124,7 @@ def list_partitions(
         client: Optional boto3 client
 
     Returns:
-        List of date strings (e.g., ["2024-01-01", "2024-01-02"])
+        List of year_month strings (e.g., ["2024-01", "2024-02"])
     """
     if client is None:
         client = get_r2_client()
@@ -111,12 +132,12 @@ def list_partitions(
     # Use delimiter to get "directories"
     paginator = client.get_paginator("list_objects_v2")
 
-    dates = set()
-    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/date=", Delimiter="/"):
+    months = set()
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/year_month=", Delimiter="/"):
         for prefix_info in page.get("CommonPrefixes", []):
-            # Extract date from prefix like "asos/date=2024-01-01/"
+            # Extract year_month from prefix like "asos/year_month=2024-01/"
             partition = prefix_info["Prefix"].rstrip("/").split("/")[-1]
-            if partition.startswith("date="):
-                dates.add(partition.replace("date=", ""))
+            if partition.startswith("year_month="):
+                months.add(partition.replace("year_month=", ""))
 
-    return sorted(dates)
+    return sorted(months)

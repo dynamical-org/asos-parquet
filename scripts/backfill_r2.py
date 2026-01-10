@@ -55,11 +55,12 @@ def save_checkpoint(checkpoint: dict) -> None:
 def get_resume_date(r2_client) -> pd.Timestamp | None:
     """Get the date to resume from based on R2 contents."""
     try:
-        uploaded_dates = list_partitions(R2_BUCKET, R2_PREFIX, r2_client)
-        if uploaded_dates:
-            # Resume from day after last uploaded
-            last_date = pd.Timestamp(max(uploaded_dates), tz="UTC")
-            return last_date + timedelta(days=1)
+        uploaded_months = list_partitions(R2_BUCKET, R2_PREFIX, r2_client)
+        if uploaded_months:
+            # Resume from start of month after last uploaded
+            last_month = pd.Period(max(uploaded_months), freq="M")
+            next_month = (last_month + 1).to_timestamp(freq="M")
+            return pd.Timestamp(next_month, tz="UTC")
     except Exception as e:
         print(f"[warning] Could not check R2 for resume point: {e}")
     return None
@@ -137,13 +138,22 @@ def run_backfill(
         if month_end > end_date:
             month_end = end_date
 
+        # Filter to stations that existed during this period
+        active_stations = stations[stations["archive_begin"] <= month_end]
+
         print(f"\n{'='*60}")
         print(f"Processing: {current_start.date()} to {month_end.date()}")
+        print(f"Active stations: {len(active_stations)} / {len(stations)}")
         print(f"{'='*60}")
+
+        if active_stations.empty:
+            print("No stations active in this period, skipping...")
+            current_start = month_end + timedelta(days=1)
+            continue
 
         # Fetch observations
         observations = fetch_observations_batch(
-            stations,
+            active_stations,
             current_start,
             month_end + timedelta(days=1),  # End is exclusive
             show_progress=True,
@@ -162,9 +172,9 @@ def run_backfill(
         print(f"Wrote {len(written)} local partition(s)")
 
         # Upload each partition to R2
-        for date_str, local_path in sorted(written.items()):
+        for month_str, local_path in sorted(written.items()):
             partition_dir = local_path.parent
-            print(f"  Uploading {date_str}...", end=" ", flush=True)
+            print(f"  Uploading {month_str}...", end=" ", flush=True)
 
             try:
                 uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
@@ -182,14 +192,14 @@ def run_backfill(
                 print(f"FAILED: {e}")
                 # Save checkpoint so we can resume
                 save_checkpoint({
-                    "last_successful_date": date_str,
+                    "last_successful_month": month_str,
                     "states": states,
                 })
                 raise
 
         # Update checkpoint
         save_checkpoint({
-            "last_date": str(month_end.date()),
+            "last_month": current_start.strftime("%Y-%m"),
             "states": states,
             "total_records": total_records,
             "total_partitions": total_partitions,
