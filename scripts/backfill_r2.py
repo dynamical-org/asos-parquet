@@ -4,11 +4,15 @@
 Fetches historical ASOS data and uploads each partition to R2 as it's written.
 Supports resuming from the last uploaded partition.
 
+Processing is chunked by month to limit memory usage. Each month is fetched
+and written to a part file, then merged with DuckDB streaming before upload.
+
 Usage:
     python scripts/backfill_r2.py                    # Full archive, all states
     python scripts/backfill_r2.py --states CA,TX    # Specific states
     python scripts/backfill_r2.py --start 2020-01-01  # Start from specific date
     python scripts/backfill_r2.py --resume           # Resume from checkpoint
+    python scripts/backfill_r2.py --chunk-months 3  # Process 3 months at a time
 """
 
 import argparse
@@ -17,6 +21,7 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -37,6 +42,7 @@ from asos_parquet.stations import fetch_all_stations
 CHECKPOINT_FILE = Path("data/backfill_r2_checkpoint.json")
 R2_BUCKET = "dev"
 R2_PREFIX = "asos"
+CHUNK_MONTHS = 1  # Process this many months at a time to limit memory usage
 
 
 def load_checkpoint() -> dict:
@@ -50,6 +56,54 @@ def save_checkpoint(checkpoint: dict) -> None:
     """Save checkpoint to file."""
     CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_FILE.write_text(json.dumps(checkpoint, indent=2, default=str))
+
+
+def merge_partition_files(partition_dir: Path) -> Path | None:
+    """Merge all parquet part files in a partition using DuckDB streaming.
+
+    This avoids loading all files into memory at once by using DuckDB's
+    streaming COPY command.
+
+    Args:
+        partition_dir: Directory containing part-*.parquet files
+
+    Returns:
+        Path to merged data.parquet file, or None if no files
+    """
+    part_files = list(partition_dir.glob("part-*.parquet"))
+    if not part_files:
+        # Check if data.parquet already exists
+        data_file = partition_dir / "data.parquet"
+        return data_file if data_file.exists() else None
+
+    if len(part_files) == 1:
+        # Single file - just rename it
+        data_file = partition_dir / "data.parquet"
+        part_files[0].rename(data_file)
+        return data_file
+
+    # Multiple files - use DuckDB to stream-merge
+    # This reads and writes in chunks, avoiding full memory load
+    glob_pattern = str(partition_dir / "part-*.parquet")
+    data_file = partition_dir / "data.parquet"
+
+    conn = duckdb.connect()
+    try:
+        # Use COPY to stream data through without loading all into memory
+        conn.execute(f"""
+            COPY (
+                SELECT * FROM read_parquet('{glob_pattern}')
+                ORDER BY station, valid
+            ) TO '{data_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+    finally:
+        conn.close()
+
+    # Remove part files after successful merge
+    for f in part_files:
+        f.unlink()
+
+    return data_file
 
 
 def get_resume_date(r2_client) -> pd.Timestamp | None:
@@ -71,6 +125,7 @@ def run_backfill(
     end_date: pd.Timestamp | None = None,
     resume: bool = False,
     keep_local: bool = False,
+    chunk_months: int = CHUNK_MONTHS,
 ) -> None:
     """Run full archive backfill with R2 uploads.
 
@@ -80,6 +135,7 @@ def run_backfill(
         end_date: End date for backfill (defaults to yesterday)
         resume: If True, resume from last uploaded partition
         keep_local: If True, keep local files after uploading
+        chunk_months: Number of months to process at a time (limits memory usage)
     """
     if states is None:
         states = US_STATES
@@ -143,6 +199,7 @@ def run_backfill(
         print(f"\n{'='*60}")
         print(f"Processing year {current_year}: {year_start.date()} to {year_end.date()}")
         print(f"Active stations: {len(active_stations)}")
+        print(f"Processing in {chunk_months}-month chunks to limit memory")
         print(f"{'='*60}")
 
         if active_stations.empty:
@@ -150,50 +207,81 @@ def run_backfill(
             current_year += 1
             continue
 
-        # Fetch entire year at once
-        observations = fetch_observations_batch(
-            active_stations,
-            year_start,
-            year_end + timedelta(days=1),  # End is exclusive
-            show_progress=True,
-        )
+        # Process in monthly chunks to limit memory usage
+        year_records = 0
+        chunk_start = year_start
 
-        if observations.empty:
-            print("No data for this year")
+        while chunk_start <= year_end:
+            # Calculate chunk end (chunk_months months, but not past year_end)
+            chunk_end = chunk_start + pd.DateOffset(months=chunk_months) - timedelta(days=1)
+            chunk_end = min(chunk_end, year_end)
+
+            month_label = chunk_start.strftime("%b")
+            if chunk_months > 1:
+                month_label = f"{chunk_start.strftime('%b')}-{chunk_end.strftime('%b')}"
+
+            print(f"\n  {current_year} {month_label}: ", end="", flush=True)
+
+            # Fetch this chunk
+            observations = fetch_observations_batch(
+                active_stations,
+                chunk_start,
+                chunk_end + timedelta(days=1),  # End is exclusive
+                show_progress=False,  # Quieter output for chunks
+            )
+
+            if observations.empty:
+                print("no data")
+            else:
+                chunk_records = len(observations)
+                year_records += chunk_records
+                print(f"{chunk_records:,} records")
+
+                # Write to local partition (creates part-*.parquet file)
+                write_partition(observations, DEFAULT_DATASET_PATH)
+
+                # Free memory after writing
+                del observations
+
+            # Move to next chunk
+            chunk_start = chunk_end + timedelta(days=1)
+
+        if year_records == 0:
+            print(f"\nNo data for year {current_year}")
             current_year += 1
             continue
 
-        year_records = len(observations)
-        print(f"Fetched {year_records:,} observations")
         total_records += year_records
+        print(f"\n  Year total: {year_records:,} records")
 
-        # Write to local partition
-        write_partition(observations, DEFAULT_DATASET_PATH)
+        # Merge all part files into single data.parquet using DuckDB streaming
+        partition_dir = DEFAULT_DATASET_PATH / f"year={current_year}"
+        print(f"  Merging part files...", end=" ", flush=True)
+        merge_partition_files(partition_dir)
+        print("done")
 
         # Upload the year partition
-        if year_records > 0:
-            partition_dir = DEFAULT_DATASET_PATH / f"year={current_year}"
-            print(f"\n  Uploading year={current_year}...", end=" ", flush=True)
+        print(f"  Uploading year={current_year}...", end=" ", flush=True)
 
-            try:
-                uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
-                print(f"done ({year_records:,} records)")
-                total_partitions += 1
+        try:
+            uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
+            print(f"done ({year_records:,} records)")
+            total_partitions += 1
 
-                # Clean up local files if not keeping
-                if not keep_local:
-                    for f in partition_dir.glob("*.parquet"):
-                        f.unlink()
-                    if not list(partition_dir.glob("*")):
-                        partition_dir.rmdir()
+            # Clean up local files if not keeping
+            if not keep_local:
+                for f in partition_dir.glob("*.parquet"):
+                    f.unlink()
+                if not list(partition_dir.glob("*")):
+                    partition_dir.rmdir()
 
-            except Exception as e:
-                print(f"FAILED: {e}")
-                save_checkpoint({
-                    "last_successful_year": current_year - 1,
-                    "states": states,
-                })
-                raise
+        except Exception as e:
+            print(f"FAILED: {e}")
+            save_checkpoint({
+                "last_successful_year": current_year - 1,
+                "states": states,
+            })
+            raise
 
         # Update checkpoint
         save_checkpoint({
@@ -242,6 +330,12 @@ def main():
         action="store_true",
         help="Keep local files after uploading to R2",
     )
+    parser.add_argument(
+        "--chunk-months",
+        type=int,
+        default=CHUNK_MONTHS,
+        help=f"Months to process at a time (default: {CHUNK_MONTHS}, lower = less memory)",
+    )
 
     args = parser.parse_args()
 
@@ -255,6 +349,7 @@ def main():
         end_date=end_date,
         resume=args.resume,
         keep_local=args.keep_local,
+        chunk_months=args.chunk_months,
     )
 
 

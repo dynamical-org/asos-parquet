@@ -18,8 +18,8 @@
     .controls {
       display: flex;
       gap: 15px;
-      align-items: center;
-      margin-bottom: 20px;
+      align-items: flex-end;
+      margin-bottom: 15px;
       flex-wrap: wrap;
     }
     .control-group {
@@ -32,16 +32,19 @@
       color: #666;
       font-weight: 500;
     }
-    input, select, button {
-      padding: 8px 12px;
+    .control-group input {
+      padding: 8px 10px;
       font-size: 14px;
       border: 1px solid #ccc;
       border-radius: 4px;
     }
     button {
+      padding: 8px 12px;
+      font-size: 14px;
+      border: none;
+      border-radius: 4px;
       background: #0066cc;
       color: white;
-      border: none;
       cursor: pointer;
       font-weight: 500;
     }
@@ -97,6 +100,57 @@
       height: 12px;
       border-radius: 2px;
     }
+    .query-container {
+      background: white;
+      border-radius: 8px;
+      padding: 15px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      margin-bottom: 15px;
+    }
+    .query-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .query-header h3 {
+      margin: 0;
+      font-size: 14px;
+      color: #333;
+    }
+    #exampleSelect {
+      padding: 6px 10px;
+      font-size: 13px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      background: white;
+      cursor: pointer;
+    }
+    #sqlQuery {
+      width: 100%;
+      height: 120px;
+      font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+      font-size: 13px;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      resize: vertical;
+    }
+    .query-buttons {
+      margin-top: 10px;
+      display: flex;
+      gap: 10px;
+    }
+    .query-buttons button {
+      padding: 6px 12px;
+      font-size: 13px;
+    }
+    #runQueryBtn {
+      background: #28a745;
+    }
+    #runQueryBtn:hover {
+      background: #218838;
+    }
   </style>
 </head>
 <body>
@@ -105,32 +159,44 @@
 
   <div class="controls">
     <div class="control-group">
-      <label>Station ID</label>
-      <input type="text" id="stationId" value="BNA" style="width: 100px;">
-    </div>
-    <div class="control-group">
       <label>Start Date</label>
-      <input type="date" id="startDate">
+      <input type="date" id="startDate" value="1938-01-01">
     </div>
     <div class="control-group">
       <label>End Date</label>
-      <input type="date" id="endDate">
+      <input type="date" id="endDate" value="1940-12-31">
+    </div>
+    <div class="control-group">
+      <label>Station</label>
+      <input type="text" id="stationId" value="BNA" style="width: 80px; text-transform: uppercase;">
     </div>
     <div class="control-group">
       <label>&nbsp;</label>
-      <button id="loadBtn" disabled>Load Data</button>
+      <button id="applyBtn">Apply to Query</button>
     </div>
   </div>
 
   <div id="status" class="loading">Initializing DuckDB...</div>
 
+  <div class="query-container">
+    <div class="query-header">
+      <h3>SQL Query</h3>
+      <select id="exampleSelect">
+        <option value="">-- Load Example --</option>
+      </select>
+    </div>
+    <textarea id="sqlQuery" placeholder="SELECT * FROM read_parquet(...) WHERE ..."></textarea>
+    <div class="query-buttons">
+      <button id="runQueryBtn">Run Query</button>
+    </div>
+  </div>
+
   <div id="tempChart" class="chart-container"></div>
   <div id="precipChart" class="chart-container"></div>
-
   <div id="stats"></div>
 
   <script type="module">
-    // Import both libraries as ES modules
+    // Import libraries
     const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm');
     const Plot = await import('https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.13/+esm');
 
@@ -139,27 +205,118 @@
     let db = null;
     let conn = null;
 
-    // Set default dates (last 90 days)
-    function initDateInputs() {
-      const endDate = new Date();
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - 90);
+    // Example queries
+    const EXAMPLE_QUERIES = {
+      'bna_1938_1940': {
+        label: 'Nashville (BNA) 1938-1940',
+        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet([
+  '${R2_BASE_URL}/year=1938/data.parquet',
+  '${R2_BASE_URL}/year=1939/data.parquet',
+  '${R2_BASE_URL}/year=1940/data.parquet'
+])
+WHERE station = 'BNA'
+ORDER BY valid`
+      },
+      'chicago_1940': {
+        label: 'Chicago (ORD) 1940',
+        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${R2_BASE_URL}/year=1940/data.parquet')
+WHERE station = 'ORD'
+ORDER BY valid`
+      },
+      'winter_1940': {
+        label: 'Chicago winter Jan-Feb 1940',
+        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${R2_BASE_URL}/year=1940/data.parquet')
+WHERE station = 'ORD'
+  AND valid >= '1940-01-01' AND valid < '1940-03-01'
+ORDER BY valid`
+      },
+      'multi_station_summer': {
+        label: 'Compare cities - Summer 1939',
+        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${R2_BASE_URL}/year=1939/data.parquet')
+WHERE station IN ('BNA', 'ORD', 'LAX')
+  AND valid >= '1939-06-01' AND valid < '1939-09-01'
+ORDER BY station, valid`
+      },
+      'hurricane_season': {
+        label: 'Miami hurricane season 1940',
+        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${R2_BASE_URL}/year=1940/data.parquet')
+WHERE station = 'MIA'
+  AND valid >= '1940-08-01' AND valid < '1940-11-01'
+ORDER BY valid`
+      }
+    };
 
-      document.getElementById('startDate').value = startDate.toISOString().split('T')[0];
-      document.getElementById('endDate').value = endDate.toISOString().split('T')[0];
-    }
+    const DEFAULT_QUERY = EXAMPLE_QUERIES['bna_1938_1940'].query;
 
-    // Generate list of yearly partition URLs for date range
+    // Generate partition URLs for a date range
     function generatePartitionUrls(startDate, endDate) {
       const urls = [];
       const startYear = new Date(startDate).getFullYear();
       const endYear = new Date(endDate).getFullYear();
-
       for (let year = startYear; year <= endYear; year++) {
-        urls.push(`${R2_BASE_URL}/year=${year}/data.parquet`);
+        urls.push(`'${R2_BASE_URL}/year=${year}/data.parquet'`);
+      }
+      return urls;
+    }
+
+    // Generate query from inputs
+    function generateQueryFromInputs() {
+      const startDate = document.getElementById('startDate').value;
+      const endDate = document.getElementById('endDate').value;
+      const station = document.getElementById('stationId').value.trim().toUpperCase();
+
+      if (!startDate || !endDate || !station) return null;
+
+      const urls = generatePartitionUrls(startDate, endDate);
+      const urlList = urls.length === 1 ? urls[0] : `[\n  ${urls.join(',\n  ')}\n]`;
+
+      return `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet(${urlList})
+WHERE station = '${station}'
+ORDER BY valid`;
+    }
+
+    // Parse query to extract dates and station, update inputs
+    function parseQueryToInputs(query) {
+      // Extract years from partition URLs (year=YYYY)
+      const yearMatches = query.match(/year=(\d{4})/g);
+      if (yearMatches) {
+        const years = yearMatches.map(m => parseInt(m.replace('year=', '')));
+        const minYear = Math.min(...years);
+        const maxYear = Math.max(...years);
+        document.getElementById('startDate').value = `${minYear}-01-01`;
+        document.getElementById('endDate').value = `${maxYear}-12-31`;
       }
 
-      return urls;
+      // Try to extract date filters from WHERE clause
+      const startMatch = query.match(/valid\s*>=?\s*'(\d{4}-\d{2}-\d{2})'/);
+      const endMatch = query.match(/valid\s*<?=?\s*'(\d{4}-\d{2}-\d{2})'/);
+      if (startMatch) document.getElementById('startDate').value = startMatch[1];
+      if (endMatch) document.getElementById('endDate').value = endMatch[1];
+
+      // Extract station from WHERE clause
+      const stationMatch = query.match(/station\s*=\s*'([A-Z]{3,4})'/);
+      if (stationMatch) {
+        document.getElementById('stationId').value = stationMatch[1];
+      }
+      // For IN clause, just take the first station
+      const inMatch = query.match(/station\s+IN\s*\(\s*'([A-Z]{3,4})'/);
+      if (inMatch) {
+        document.getElementById('stationId').value = inMatch[1] + '+';
+      }
+    }
+
+    // Apply inputs to query (update partition URLs and station)
+    function applyInputsToQuery() {
+      const newQuery = generateQueryFromInputs();
+      if (newQuery) {
+        document.getElementById('sqlQuery').value = newQuery;
+      }
     }
 
     async function initDuckDB() {
@@ -185,8 +342,19 @@
 
         conn = await db.connect();
 
-        updateStatus('DuckDB ready. Select a date range and station, then click Load Data.', 'success');
-        document.getElementById('loadBtn').disabled = false;
+        // Populate example select dropdown
+        const select = document.getElementById('exampleSelect');
+        for (const [key, example] of Object.entries(EXAMPLE_QUERIES)) {
+          const option = document.createElement('option');
+          option.value = key;
+          option.textContent = example.label;
+          select.appendChild(option);
+        }
+
+        // Set default query and enable run button
+        document.getElementById('sqlQuery').value = DEFAULT_QUERY;
+        document.getElementById('runQueryBtn').disabled = false;
+        updateStatus('DuckDB ready. Edit the query and click Run Query.', 'success');
 
       } catch (error) {
         updateStatus(`Failed to initialize DuckDB: ${error.message}`, 'error');
@@ -218,137 +386,159 @@
       return stat;
     }
 
-    async function loadData() {
-      const startDate = document.getElementById('startDate').value;
-      const endDate = document.getElementById('endDate').value;
-      const stationId = document.getElementById('stationId').value.trim().toUpperCase();
+    // Run SQL query and display charts
+    async function runCustomQuery() {
+      const query = document.getElementById('sqlQuery').value.trim();
 
-      if (!startDate || !endDate || !stationId) {
-        updateStatus('Please enter start date, end date, and station ID', 'error');
+      if (!query) {
+        updateStatus('Please enter a SQL query', 'error');
         return;
       }
 
       try {
-        document.getElementById('loadBtn').disabled = true;
-
-        // Generate partition URLs for the date range
-        const partitionUrls = generatePartitionUrls(startDate, endDate);
-        updateStatus(`Loading ${partitionUrls.length} year(s) of data for station ${stationId}...`, 'loading');
-
-        // Build URL list for DuckDB (JSON array format)
-        const urlList = JSON.stringify(partitionUrls);
-
-        // Query all weather data for the station across all partitions
-        // Convert timestamp to epoch ms in SQL for reliable JS Date handling
-        const query = `
-          SELECT
-            epoch_ms(valid) as timestamp_ms,
-            tmpf as temp_f,
-            dwpf as dewpoint_f,
-            p01i as precip_inches
-          FROM read_parquet(${urlList})
-          WHERE station = '${stationId}'
-          ORDER BY valid
-        `;
+        document.getElementById('runQueryBtn').disabled = true;
+        updateStatus('Running query...', 'loading');
 
         const result = await conn.query(query);
-        const data = result.toArray().map(row => ({
-          timestamp: new Date(Number(row.timestamp_ms)),
-          temp_f: row.temp_f !== null ? Number(row.temp_f) : null,
-          dewpoint_f: row.dewpoint_f !== null ? Number(row.dewpoint_f) : null,
-          precip_inches: row.precip_inches !== null ? Number(row.precip_inches) : null
-        }));
+        const data = result.toArray().map(row => {
+          // DuckDB-WASM returns timestamps as microseconds (BigInt)
+          let timestamp = null;
+          if (row.valid) {
+            const val = Number(row.valid);
+            // If value is too large to be milliseconds (after year 2100), it's microseconds
+            timestamp = val > 4102444800000 ? new Date(val / 1000) : new Date(val);
+          }
+          return {
+            timestamp,
+            temp_f: row.temp_f !== null && row.temp_f !== undefined ? Number(row.temp_f) : null,
+            dewpoint_f: row.dewpoint_f !== null && row.dewpoint_f !== undefined ? Number(row.dewpoint_f) : null,
+            precip_inches: row.precip_inches !== null && row.precip_inches !== undefined ? Number(row.precip_inches) : null,
+            station: row.station
+          };
+        });
 
         if (data.length === 0) {
-          updateStatus(`No data found for station ${stationId}`, 'error');
+          updateStatus('Query returned no results', 'error');
           document.getElementById('tempChart').replaceChildren();
           document.getElementById('precipChart').replaceChildren();
           document.getElementById('stats').replaceChildren();
-          document.getElementById('loadBtn').disabled = false;
           return;
         }
 
         // Filter for valid temperature data
-        const tempData = data.filter(d => d.temp_f !== null);
+        const tempData = data.filter(d => d.temp_f !== null && d.timestamp !== null);
         const precipData = data.filter(d => d.precip_inches !== null && d.precip_inches > 0);
+
+        // Add segment IDs to break lines at gaps > 25 hours
+        const GAP_THRESHOLD_MS = 25 * 60 * 60 * 1000;
+        let segment = 0;
+        for (let i = 0; i < tempData.length; i++) {
+          if (i > 0 && tempData[i].timestamp - tempData[i-1].timestamp > GAP_THRESHOLD_MS) {
+            segment++;
+          }
+          tempData[i].segment = segment;
+        }
+
+        // Get unique stations for title and multi-station detection
+        const stations = [...new Set(data.map(d => d.station).filter(Boolean))];
+        const isMultiStation = stations.length > 1;
+        const stationLabel = isMultiStation ? `${stations.length} stations` : stations[0];
 
         // Create temperature chart
         const tempChartContainer = document.getElementById('tempChart');
         const tempHeader = document.createElement('h3');
-        tempHeader.textContent = `Temperature at ${stationId}`;
+        tempHeader.textContent = `Temperature at ${stationLabel}`;
 
+        // Calculate date range for explicit domain
+        const timestamps = tempData.map(d => d.timestamp).filter(Boolean);
+        const minDate = new Date(Math.min(...timestamps));
+        const maxDate = new Date(Math.max(...timestamps));
+
+        // For multi-station, color by station; for single station, use fixed colors
         const tempChart = Plot.plot({
           width: 960,
           height: 250,
           marginLeft: 50,
           marginBottom: 40,
-          x: {
-            label: null,
-            type: "time"
-          },
-          y: {
-            label: "Temperature (°F)",
-            grid: true
-          },
-          color: {
-            legend: true
-          },
+          x: { label: null, type: "time", domain: [minDate, maxDate] },
+          y: { label: "Temperature (°F)", grid: true },
+          color: isMultiStation ? { legend: true } : undefined,
           marks: [
             Plot.ruleY([32], { stroke: "#ccc", strokeDasharray: "4,4" }),
             Plot.lineY(tempData, {
               x: "timestamp",
               y: "temp_f",
-              stroke: "#e63946",
+              z: isMultiStation ? "station" : "segment",
+              stroke: isMultiStation ? "station" : "#e63946",
               strokeWidth: 1.5,
               tip: true
             }),
-            Plot.lineY(tempData.filter(d => d.dewpoint_f !== null), {
-              x: "timestamp",
-              y: "dewpoint_f",
-              stroke: "#457b9d",
-              strokeWidth: 1,
-              strokeOpacity: 0.7
-            })
+            // Only show dewpoint for single station (too noisy with multiple)
+            ...(isMultiStation ? [] : [
+              Plot.lineY(tempData.filter(d => d.dewpoint_f !== null), {
+                x: "timestamp",
+                y: "dewpoint_f",
+                z: "segment",
+                stroke: "#457b9d",
+                strokeWidth: 1,
+                strokeOpacity: 0.7
+              })
+            ])
           ]
         });
 
-        const legend = document.createElement('div');
-        legend.className = 'legend';
-        legend.innerHTML = `
-          <div class="legend-item"><div class="legend-color" style="background: #e63946"></div> Temperature</div>
-          <div class="legend-item"><div class="legend-color" style="background: #457b9d"></div> Dewpoint</div>
-          <div class="legend-item" style="color: #999">— 32°F freezing line</div>
-        `;
+        // Add legend for single-station mode
+        if (!isMultiStation) {
+          const legend = document.createElement('div');
+          legend.className = 'legend';
+          legend.style.marginTop = '8px';
 
-        tempChartContainer.replaceChildren(tempHeader, legend, tempChart);
+          const items = [
+            { color: '#e63946', label: 'Temperature' },
+            { color: '#457b9d', label: 'Dewpoint' },
+            { color: '#ccc', label: '32°F freezing' }
+          ];
+
+          items.forEach(item => {
+            const legendItem = document.createElement('div');
+            legendItem.className = 'legend-item';
+            const colorBox = document.createElement('div');
+            colorBox.className = 'legend-color';
+            colorBox.style.background = item.color;
+            legendItem.appendChild(colorBox);
+            legendItem.appendChild(document.createTextNode(' ' + item.label));
+            legend.appendChild(legendItem);
+          });
+
+          tempChartContainer.replaceChildren(tempHeader, tempChart, legend);
+        } else {
+          tempChartContainer.replaceChildren(tempHeader, tempChart);
+        }
 
         // Create precipitation chart
         const precipChartContainer = document.getElementById('precipChart');
         const precipHeader = document.createElement('h3');
-        precipHeader.textContent = `Precipitation at ${stationId}`;
+        precipHeader.textContent = `Precipitation at ${stationLabel}`;
+
+        const precipFilteredData = data.filter(d => d.precip_inches !== null && d.timestamp !== null);
 
         const precipChart = Plot.plot({
           width: 960,
           height: 200,
           marginLeft: 50,
           marginBottom: 40,
-          x: {
-            label: "Date",
-            type: "time"
-          },
-          y: {
-            label: "Precipitation (in)",
-            grid: true
-          },
+          x: { label: "Date", type: "time", domain: [minDate, maxDate] },
+          y: { label: "Precipitation (in)", grid: true },
+          color: isMultiStation ? { legend: true } : undefined,
           marks: [
             Plot.ruleY([0]),
-            Plot.rectY(data.filter(d => d.precip_inches !== null), Plot.binX(
+            Plot.rectY(precipFilteredData, Plot.binX(
               { y: "sum" },
               {
                 x: "timestamp",
                 y: "precip_inches",
                 interval: "day",
-                fill: "#0077b6",
+                fill: isMultiStation ? "station" : "#0077b6",
                 tip: true
               }
             ))
@@ -359,12 +549,10 @@
 
         // Calculate stats
         const temps = tempData.map(d => d.temp_f);
-        const minTemp = Math.min(...temps);
-        const maxTemp = Math.max(...temps);
-        const avgTemp = temps.reduce((a, b) => a + b, 0) / temps.length;
-
+        const minTemp = temps.length ? Math.min(...temps) : 0;
+        const maxTemp = temps.length ? Math.max(...temps) : 0;
+        const avgTemp = temps.length ? temps.reduce((a, b) => a + b, 0) / temps.length : 0;
         const totalPrecip = data.reduce((sum, d) => sum + (d.precip_inches || 0), 0);
-        const dateRange = `${data[0].timestamp.toLocaleDateString()} - ${data[data.length-1].timestamp.toLocaleDateString()}`;
 
         const statsContainer = document.getElementById('stats');
         statsContainer.replaceChildren(
@@ -376,21 +564,32 @@
           createStatElement(data.length.toLocaleString(), 'Total Records', '#666')
         );
 
-        updateStatus(`Loaded ${data.length.toLocaleString()} records for ${stationId} (${dateRange})`, 'success');
+        updateStatus(`Loaded ${data.length.toLocaleString()} records`, 'success');
 
       } catch (error) {
-        updateStatus(`Error: ${error.message}`, 'error');
+        updateStatus(`Query error: ${error.message}`, 'error');
         console.error(error);
       } finally {
-        document.getElementById('loadBtn').disabled = false;
+        document.getElementById('runQueryBtn').disabled = false;
       }
     }
 
-    // Attach click handler
-    document.getElementById('loadBtn').addEventListener('click', loadData);
+    // Attach event handlers
+    document.getElementById('runQueryBtn').addEventListener('click', runCustomQuery);
+    document.getElementById('applyBtn').addEventListener('click', applyInputsToQuery);
+
+    document.getElementById('exampleSelect').addEventListener('change', (e) => {
+      const key = e.target.value;
+      if (key && EXAMPLE_QUERIES[key]) {
+        const query = EXAMPLE_QUERIES[key].query;
+        document.getElementById('sqlQuery').value = query;
+        parseQueryToInputs(query); // Sync inputs with example
+        e.target.value = ''; // Reset to placeholder
+      }
+    });
 
     // Initialize on load
-    initDateInputs();
+    parseQueryToInputs(DEFAULT_QUERY); // Sync inputs with default
     initDuckDB();
   </script>
 </body>
