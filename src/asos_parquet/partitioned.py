@@ -88,9 +88,9 @@ def write_partition(
         df = df.copy()
         df["valid"] = pd.to_datetime(df["valid"], utc=True)
 
-    # Extract year_month for partitioning
+    # Extract year_month for partitioning (as string to avoid timezone warning)
     df = df.copy()
-    df["_year_month"] = df["valid"].dt.to_period("M")
+    df["_year_month"] = df["valid"].dt.strftime("%Y-%m")
 
     written_files = {}
 
@@ -99,7 +99,7 @@ def write_partition(
         group = group.drop(columns=["_year_month"])
 
         # Get partition path
-        partition_path = get_partition_path(base_path, year_month.to_timestamp())
+        partition_path = get_partition_path(base_path, pd.Timestamp(f"{year_month}-01"))
         partition_path.mkdir(parents=True, exist_ok=True)
 
         # Generate unique filename
@@ -119,8 +119,7 @@ def write_partition(
         # Write as geoparquet
         gdf.to_parquet(file_path, index=False)
 
-        month_str = str(year_month)  # e.g., "2024-01"
-        written_files[month_str] = file_path
+        written_files[year_month] = file_path  # year_month is already "2024-01" string
 
     return written_files
 
