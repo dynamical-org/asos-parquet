@@ -84,8 +84,8 @@ def fetch_station_observations(
             if df.empty or "valid" not in df.columns:
                 return None
 
-            # Parse timestamp
-            df["valid"] = pd.to_datetime(df["valid"], utc=True)
+            # Parse timestamp (IEM format: "YYYY-MM-DD HH:MM")
+            df["valid"] = pd.to_datetime(df["valid"], format="%Y-%m-%d %H:%M", utc=True)
 
             # Add state if provided
             if state is not None:
