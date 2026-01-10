@@ -1,12 +1,13 @@
-"""Partitioned geoparquet operations for efficient cloud storage updates.
+"""Partitioned geoparquet operations for efficient cloud storage.
 
-Uses date-based partitioning optimized for hourly appends:
-- data/asos/date=2024-01-01/part-001.parquet
-- data/asos/date=2024-01-01/part-002.parquet
-- data/asos/date=2024-01-02/part-001.parquet
+Uses monthly partitioning for optimal browser access:
+- data/asos/year_month=2024-01/data.parquet
+- data/asos/year_month=2024-02/data.parquet
 
-Each hourly update writes a new part file (no rewrite needed).
-Periodic compaction merges small files into larger ones.
+Monthly partitions provide good balance between:
+- Browser performance (fewer HTTP requests)
+- Query efficiency (partition pruning)
+- Update granularity (rewrite one month at a time)
 """
 
 import uuid
@@ -27,12 +28,12 @@ DEFAULT_DATASET_PATH = Path("data/asos")
 
 
 def get_partition_path(base_path: Path, date: datetime | pd.Timestamp) -> Path:
-    """Get the partition directory for a given date."""
+    """Get the partition directory for a given date (monthly partition)."""
     if isinstance(date, pd.Timestamp):
-        date_str = date.strftime("%Y-%m-%d")
+        month_str = date.strftime("%Y-%m")
     else:
-        date_str = date.strftime("%Y-%m-%d")
-    return base_path / f"date={date_str}"
+        month_str = date.strftime("%Y-%m")
+    return base_path / f"year_month={month_str}"
 
 
 def generate_part_filename() -> str:
@@ -67,9 +68,9 @@ def write_partition(
     df: pd.DataFrame,
     base_path: Path = DEFAULT_DATASET_PATH,
 ) -> dict[str, Path]:
-    """Write DataFrame to date-partitioned parquet files.
+    """Write DataFrame to monthly-partitioned parquet files.
 
-    Each unique date in the data gets its own partition directory,
+    Each unique month in the data gets its own partition directory,
     and a new part file is created within each partition.
 
     Args:
@@ -77,7 +78,7 @@ def write_partition(
         base_path: Base directory for the dataset
 
     Returns:
-        Dict mapping date strings to written file paths
+        Dict mapping year_month strings to written file paths
     """
     if df.empty:
         return {}
@@ -87,18 +88,18 @@ def write_partition(
         df = df.copy()
         df["valid"] = pd.to_datetime(df["valid"], utc=True)
 
-    # Extract date for partitioning
+    # Extract year_month for partitioning
     df = df.copy()
-    df["_date"] = df["valid"].dt.date
+    df["_year_month"] = df["valid"].dt.to_period("M")
 
     written_files = {}
 
-    for date, group in df.groupby("_date"):
+    for year_month, group in df.groupby("_year_month"):
         # Drop the temporary partition column
-        group = group.drop(columns=["_date"])
+        group = group.drop(columns=["_year_month"])
 
         # Get partition path
-        partition_path = get_partition_path(base_path, pd.Timestamp(date))
+        partition_path = get_partition_path(base_path, year_month.to_timestamp())
         partition_path.mkdir(parents=True, exist_ok=True)
 
         # Generate unique filename
@@ -118,8 +119,8 @@ def write_partition(
         # Write as geoparquet
         gdf.to_parquet(file_path, index=False)
 
-        date_str = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
-        written_files[date_str] = file_path
+        month_str = str(year_month)  # e.g., "2024-01"
+        written_files[month_str] = file_path
 
     return written_files
 
@@ -143,7 +144,7 @@ def read_dataset(
         return gpd.GeoDataFrame()
 
     # Find all partition directories
-    partition_dirs = sorted(base_path.glob("date=*"))
+    partition_dirs = sorted(base_path.glob("year_month=*"))
 
     if not partition_dirs:
         return gpd.GeoDataFrame()
@@ -152,17 +153,22 @@ def read_dataset(
     if start_date is not None or end_date is not None:
         filtered_dirs = []
         for pdir in partition_dirs:
-            # Extract date from partition name
-            date_str = pdir.name.replace("date=", "")
+            # Extract year_month from partition name
+            month_str = pdir.name.replace("year_month=", "")
             try:
-                partition_date = pd.Timestamp(date_str, tz="UTC")
+                partition_period = pd.Period(month_str, freq="M")
             except Exception:
                 continue
 
-            if start_date is not None and partition_date.date() < start_date.date():
-                continue
-            if end_date is not None and partition_date.date() > end_date.date():
-                continue
+            # Check if partition month overlaps with date range
+            if start_date is not None:
+                start_period = pd.Period(start_date, freq="M")
+                if partition_period < start_period:
+                    continue
+            if end_date is not None:
+                end_period = pd.Period(end_date, freq="M")
+                if partition_period > end_period:
+                    continue
 
             filtered_dirs.append(pdir)
         partition_dirs = filtered_dirs
@@ -279,13 +285,13 @@ def compact_partition(
 
 def compact_dataset(
     base_path: Path = DEFAULT_DATASET_PATH,
-    older_than_days: int = 1,
+    older_than_months: int = 1,
 ) -> list[Path]:
-    """Compact all partitions older than specified days.
+    """Compact all partitions older than specified months.
 
     Args:
         base_path: Base directory for the dataset
-        older_than_days: Only compact partitions older than this many days
+        older_than_months: Only compact partitions older than this many months
 
     Returns:
         List of compacted file paths
@@ -293,19 +299,19 @@ def compact_dataset(
     if not base_path.exists():
         return []
 
-    cutoff_date = (pd.Timestamp.now("UTC") - pd.Timedelta(days=older_than_days)).date()
+    cutoff_period = pd.Period(pd.Timestamp.now("UTC"), freq="M") - older_than_months
     compacted = []
 
-    for partition_dir in base_path.glob("date=*"):
-        # Extract date from partition name
-        date_str = partition_dir.name.replace("date=", "")
+    for partition_dir in base_path.glob("year_month=*"):
+        # Extract year_month from partition name
+        month_str = partition_dir.name.replace("year_month=", "")
         try:
-            partition_date = pd.Timestamp(date_str).date()
+            partition_period = pd.Period(month_str, freq="M")
         except Exception:
             continue
 
         # Only compact old partitions
-        if partition_date >= cutoff_date:
+        if partition_period >= cutoff_period:
             continue
 
         # Count part files
@@ -330,7 +336,7 @@ def get_dataset_info(base_path: Path = DEFAULT_DATASET_PATH) -> dict:
     if not base_path.exists():
         return {"exists": False, "path": str(base_path)}
 
-    partition_dirs = list(base_path.glob("date=*"))
+    partition_dirs = list(base_path.glob("year_month=*"))
 
     if not partition_dirs:
         return {"exists": True, "path": str(base_path), "partitions": 0}
@@ -338,17 +344,17 @@ def get_dataset_info(base_path: Path = DEFAULT_DATASET_PATH) -> dict:
     # Count files and calculate total size
     total_files = 0
     total_size = 0
-    dates = []
+    months = []
 
     for pdir in partition_dirs:
-        date_str = pdir.name.replace("date=", "")
-        dates.append(date_str)
+        month_str = pdir.name.replace("year_month=", "")
+        months.append(month_str)
 
         for f in pdir.glob("*.parquet"):
             total_files += 1
             total_size += f.stat().st_size
 
-    dates.sort()
+    months.sort()
 
     return {
         "exists": True,
@@ -356,8 +362,8 @@ def get_dataset_info(base_path: Path = DEFAULT_DATASET_PATH) -> dict:
         "partitions": len(partition_dirs),
         "total_files": total_files,
         "total_size_mb": round(total_size / (1024 * 1024), 2),
-        "date_range": {
-            "min": dates[0] if dates else None,
-            "max": dates[-1] if dates else None,
+        "month_range": {
+            "min": months[0] if months else None,
+            "max": months[-1] if months else None,
         },
     }

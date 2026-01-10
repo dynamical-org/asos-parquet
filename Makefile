@@ -1,4 +1,4 @@
-.PHONY: install test test-unit test-integration test-cov lint format validate backfill worker worker-hourly compact clean help
+.PHONY: install test test-unit test-integration test-cov lint format validate backfill worker worker-hourly compact clean serve help
 
 # Default target
 help:
@@ -29,8 +29,16 @@ help:
 	@echo "  make compact          Compact old partitions into single files"
 	@echo "  make dataset-info     Show partitioned dataset info"
 	@echo ""
+	@echo "R2 Cloud Storage:"
+	@echo "  make backfill-r2      Full archive backfill with R2 uploads"
+	@echo "  make clear-r2         Clear all data from R2 bucket"
+	@echo ""
+	@echo "Development:"
+	@echo "  make serve            Serve viewer.html on localhost:3000"
+	@echo ""
 	@echo "Maintenance:"
 	@echo "  make clean            Remove generated files"
+	@echo "  make clean-data       Remove local data files"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make backfill STATES=CA,TX START=2024-01-01"
@@ -112,6 +120,14 @@ endif
 compact:
 	uv run python scripts/compact.py --older-than $(OLDER_THAN)
 
+# R2 cloud operations
+backfill-r2:
+ifdef START
+	uv run python scripts/backfill_r2.py --start $(START) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES))
+else
+	uv run python scripts/backfill_r2.py --resume
+endif
+
 dataset-info:
 	@uv run python -c "from asos_parquet.partitioned import get_dataset_info; import json; print(json.dumps(get_dataset_info(), indent=2))"
 
@@ -122,4 +138,13 @@ clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 clean-data:
-	rm -rf data/asos data/asos.parquet data/backfill_checkpoint.json
+	rm -rf data/asos data/asos.parquet data/backfill_checkpoint.json data/backfill_r2_checkpoint.json
+
+clear-r2:
+	@echo "Clearing all data from R2 bucket..."
+	@bash -c 'source .env && AWS_ACCESS_KEY_ID=$$R2_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$$R2_SECRET_ACCESS_KEY aws s3 rm s3://dev/asos --recursive --endpoint-url https://$$R2_ACCOUNT_ID.r2.cloudflarestorage.com'
+
+# Development
+serve:
+	@echo "Serving viewer at http://localhost:3000/viewer.html"
+	uv run python -m http.server 3000

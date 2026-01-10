@@ -105,12 +105,16 @@
 
   <div class="controls">
     <div class="control-group">
-      <label>Parquet File</label>
-      <input type="text" id="parquetPath" value="data/asos.parquet" style="width: 250px;">
-    </div>
-    <div class="control-group">
       <label>Station ID</label>
       <input type="text" id="stationId" value="BNA" style="width: 100px;">
+    </div>
+    <div class="control-group">
+      <label>Start Date</label>
+      <input type="date" id="startDate">
+    </div>
+    <div class="control-group">
+      <label>End Date</label>
+      <input type="date" id="endDate">
     </div>
     <div class="control-group">
       <label>&nbsp;</label>
@@ -130,8 +134,40 @@
     const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm');
     const Plot = await import('https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.13/+esm');
 
+    const R2_BASE_URL = 'https://pub-edb100793f1249388da0cf71a4a2430b.r2.dev/asos';
+
     let db = null;
     let conn = null;
+
+    // Set default dates (last 90 days)
+    function initDateInputs() {
+      const endDate = new Date();
+      const startDate = new Date();
+      startDate.setDate(startDate.getDate() - 90);
+
+      document.getElementById('startDate').value = startDate.toISOString().split('T')[0];
+      document.getElementById('endDate').value = endDate.toISOString().split('T')[0];
+    }
+
+    // Generate list of monthly partition URLs for date range
+    function generatePartitionUrls(startDate, endDate) {
+      const urls = [];
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+
+      // Start from the first day of start month
+      let current = new Date(start.getFullYear(), start.getMonth(), 1);
+
+      while (current <= end) {
+        const year = current.getFullYear();
+        const month = String(current.getMonth() + 1).padStart(2, '0');
+        urls.push(`${R2_BASE_URL}/year_month=${year}-${month}/data.parquet`);
+        // Move to next month
+        current.setMonth(current.getMonth() + 1);
+      }
+
+      return urls;
+    }
 
     async function initDuckDB() {
       try {
@@ -156,7 +192,7 @@
 
         conn = await db.connect();
 
-        updateStatus('DuckDB ready. Enter a parquet path and station ID, then click Load Data.', 'success');
+        updateStatus('DuckDB ready. Select a date range and station, then click Load Data.', 'success');
         document.getElementById('loadBtn').disabled = false;
 
       } catch (error) {
@@ -190,22 +226,26 @@
     }
 
     async function loadData() {
-      const parquetPath = document.getElementById('parquetPath').value.trim();
+      const startDate = document.getElementById('startDate').value;
+      const endDate = document.getElementById('endDate').value;
       const stationId = document.getElementById('stationId').value.trim().toUpperCase();
 
-      if (!parquetPath || !stationId) {
-        updateStatus('Please enter both parquet path and station ID', 'error');
+      if (!startDate || !endDate || !stationId) {
+        updateStatus('Please enter start date, end date, and station ID', 'error');
         return;
       }
 
       try {
-        updateStatus(`Loading data for station ${stationId}...`, 'loading');
         document.getElementById('loadBtn').disabled = true;
 
-        // Convert relative path to absolute URL for DuckDB-WASM
-        const absoluteUrl = new URL(parquetPath, window.location.href).href;
+        // Generate partition URLs for the date range
+        const partitionUrls = generatePartitionUrls(startDate, endDate);
+        updateStatus(`Loading ${partitionUrls.length} month(s) of data for station ${stationId}...`, 'loading');
 
-        // Query all weather data for the station
+        // Build URL list for DuckDB (JSON array format)
+        const urlList = JSON.stringify(partitionUrls);
+
+        // Query all weather data for the station across all partitions
         // Convert timestamp to epoch ms in SQL for reliable JS Date handling
         const query = `
           SELECT
@@ -213,7 +253,7 @@
             tmpf as temp_f,
             dwpf as dewpoint_f,
             p01i as precip_inches
-          FROM read_parquet('${absoluteUrl}')
+          FROM read_parquet(${urlList})
           WHERE station = '${stationId}'
           ORDER BY valid
         `;
@@ -357,6 +397,7 @@
     document.getElementById('loadBtn').addEventListener('click', loadData);
 
     // Initialize on load
+    initDateInputs();
     initDuckDB();
   </script>
 </body>
