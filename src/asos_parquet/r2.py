@@ -116,7 +116,7 @@ def list_partitions(
     prefix: str = "asos",
     client=None,
 ) -> list[str]:
-    """List all partition months in the R2 bucket.
+    """List all partition years in the R2 bucket.
 
     Args:
         bucket: R2 bucket name
@@ -124,7 +124,7 @@ def list_partitions(
         client: Optional boto3 client
 
     Returns:
-        List of year_month strings (e.g., ["2024-01", "2024-02"])
+        List of year strings (e.g., ["2023", "2024"])
     """
     if client is None:
         client = get_r2_client()
@@ -132,12 +132,12 @@ def list_partitions(
     # Use delimiter to get "directories"
     paginator = client.get_paginator("list_objects_v2")
 
-    months = set()
-    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/year_month=", Delimiter="/"):
+    years = set()
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/year=", Delimiter="/"):
         for prefix_info in page.get("CommonPrefixes", []):
-            # Extract year_month from prefix like "asos/year_month=2024-01/"
+            # Extract year from prefix like "asos/year=2024/"
             partition = prefix_info["Prefix"].rstrip("/").split("/")[-1]
-            if partition.startswith("year_month="):
-                months.add(partition.replace("year_month=", ""))
+            if partition.startswith("year="):
+                years.add(partition.replace("year=", ""))
 
-    return sorted(months)
+    return sorted(years)
