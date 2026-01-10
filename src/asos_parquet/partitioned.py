@@ -1,13 +1,11 @@
 """Partitioned geoparquet operations for efficient cloud storage.
 
-Uses monthly partitioning for optimal browser access:
-- data/asos/year_month=2024-01/data.parquet
-- data/asos/year_month=2024-02/data.parquet
+Uses yearly partitioning for optimal browser access:
+- data/asos/year=2024/data.parquet
+- data/asos/year=2025/data.parquet
 
-Monthly partitions provide good balance between:
-- Browser performance (fewer HTTP requests)
-- Query efficiency (partition pruning)
-- Update granularity (rewrite one month at a time)
+Yearly partitions minimize HTTP requests while maintaining reasonable file sizes.
+Data is sorted by station then timestamp for efficient predicate pushdown.
 """
 
 import uuid
@@ -28,12 +26,12 @@ DEFAULT_DATASET_PATH = Path("data/asos")
 
 
 def get_partition_path(base_path: Path, date: datetime | pd.Timestamp) -> Path:
-    """Get the partition directory for a given date (monthly partition)."""
+    """Get the partition directory for a given date (yearly partition)."""
     if isinstance(date, pd.Timestamp):
-        month_str = date.strftime("%Y-%m")
+        year_str = date.strftime("%Y")
     else:
-        month_str = date.strftime("%Y-%m")
-    return base_path / f"year_month={month_str}"
+        year_str = date.strftime("%Y")
+    return base_path / f"year={year_str}"
 
 
 def generate_part_filename() -> str:
@@ -68,9 +66,9 @@ def write_partition(
     df: pd.DataFrame,
     base_path: Path = DEFAULT_DATASET_PATH,
 ) -> dict[str, Path]:
-    """Write DataFrame to monthly-partitioned parquet files.
+    """Write DataFrame to yearly-partitioned parquet files.
 
-    Each unique month in the data gets its own partition directory,
+    Each unique year in the data gets its own partition directory,
     and a new part file is created within each partition.
 
     Args:
@@ -78,7 +76,7 @@ def write_partition(
         base_path: Base directory for the dataset
 
     Returns:
-        Dict mapping year_month strings to written file paths
+        Dict mapping year strings to written file paths
     """
     if df.empty:
         return {}
@@ -88,23 +86,27 @@ def write_partition(
         df = df.copy()
         df["valid"] = pd.to_datetime(df["valid"], utc=True)
 
-    # Extract year_month for partitioning (as string to avoid timezone warning)
+    # Extract year for partitioning
     df = df.copy()
-    df["_year_month"] = df["valid"].dt.strftime("%Y-%m")
+    df["_year"] = df["valid"].dt.strftime("%Y")
 
     written_files = {}
 
-    for year_month, group in df.groupby("_year_month"):
+    for year, group in df.groupby("_year"):
         # Drop the temporary partition column
-        group = group.drop(columns=["_year_month"])
+        group = group.drop(columns=["_year"])
 
         # Get partition path
-        partition_path = get_partition_path(base_path, pd.Timestamp(f"{year_month}-01"))
+        partition_path = get_partition_path(base_path, pd.Timestamp(f"{year}-01-01"))
         partition_path.mkdir(parents=True, exist_ok=True)
 
         # Generate unique filename
         filename = generate_part_filename()
         file_path = partition_path / filename
+
+        # Sort by station then timestamp for optimal row group clustering
+        # This enables efficient predicate pushdown when filtering by station
+        group = group.sort_values(["station", "valid"])
 
         # Convert to GeoDataFrame for proper geoparquet writing
         if "geometry" not in group.columns:
@@ -119,7 +121,7 @@ def write_partition(
         # Write as geoparquet
         gdf.to_parquet(file_path, index=False)
 
-        written_files[year_month] = file_path  # year_month is already "2024-01" string
+        written_files[year] = file_path
 
     return written_files
 
@@ -143,7 +145,7 @@ def read_dataset(
         return gpd.GeoDataFrame()
 
     # Find all partition directories
-    partition_dirs = sorted(base_path.glob("year_month=*"))
+    partition_dirs = sorted(base_path.glob("year=*"))
 
     if not partition_dirs:
         return gpd.GeoDataFrame()
@@ -152,21 +154,19 @@ def read_dataset(
     if start_date is not None or end_date is not None:
         filtered_dirs = []
         for pdir in partition_dirs:
-            # Extract year_month from partition name
-            month_str = pdir.name.replace("year_month=", "")
+            # Extract year from partition name
+            year_str = pdir.name.replace("year=", "")
             try:
-                partition_period = pd.Period(month_str, freq="M")
+                partition_year = int(year_str)
             except Exception:
                 continue
 
-            # Check if partition month overlaps with date range
+            # Check if partition year overlaps with date range
             if start_date is not None:
-                start_period = pd.Period(start_date, freq="M")
-                if partition_period < start_period:
+                if partition_year < start_date.year:
                     continue
             if end_date is not None:
-                end_period = pd.Period(end_date, freq="M")
-                if partition_period > end_period:
+                if partition_year > end_date.year:
                     continue
 
             filtered_dirs.append(pdir)
@@ -284,13 +284,13 @@ def compact_partition(
 
 def compact_dataset(
     base_path: Path = DEFAULT_DATASET_PATH,
-    older_than_months: int = 1,
+    older_than_years: int = 1,
 ) -> list[Path]:
-    """Compact all partitions older than specified months.
+    """Compact all partitions older than specified years.
 
     Args:
         base_path: Base directory for the dataset
-        older_than_months: Only compact partitions older than this many months
+        older_than_years: Only compact partitions older than this many years
 
     Returns:
         List of compacted file paths
@@ -298,19 +298,19 @@ def compact_dataset(
     if not base_path.exists():
         return []
 
-    cutoff_period = pd.Period(pd.Timestamp.now("UTC"), freq="M") - older_than_months
+    cutoff_year = pd.Timestamp.now("UTC").year - older_than_years
     compacted = []
 
-    for partition_dir in base_path.glob("year_month=*"):
-        # Extract year_month from partition name
-        month_str = partition_dir.name.replace("year_month=", "")
+    for partition_dir in base_path.glob("year=*"):
+        # Extract year from partition name
+        year_str = partition_dir.name.replace("year=", "")
         try:
-            partition_period = pd.Period(month_str, freq="M")
+            partition_year = int(year_str)
         except Exception:
             continue
 
         # Only compact old partitions
-        if partition_period >= cutoff_period:
+        if partition_year >= cutoff_year:
             continue
 
         # Count part files
@@ -335,7 +335,7 @@ def get_dataset_info(base_path: Path = DEFAULT_DATASET_PATH) -> dict:
     if not base_path.exists():
         return {"exists": False, "path": str(base_path)}
 
-    partition_dirs = list(base_path.glob("year_month=*"))
+    partition_dirs = list(base_path.glob("year=*"))
 
     if not partition_dirs:
         return {"exists": True, "path": str(base_path), "partitions": 0}
@@ -343,17 +343,17 @@ def get_dataset_info(base_path: Path = DEFAULT_DATASET_PATH) -> dict:
     # Count files and calculate total size
     total_files = 0
     total_size = 0
-    months = []
+    years = []
 
     for pdir in partition_dirs:
-        month_str = pdir.name.replace("year_month=", "")
-        months.append(month_str)
+        year_str = pdir.name.replace("year=", "")
+        years.append(year_str)
 
         for f in pdir.glob("*.parquet"):
             total_files += 1
             total_size += f.stat().st_size
 
-    months.sort()
+    years.sort()
 
     return {
         "exists": True,
@@ -361,8 +361,8 @@ def get_dataset_info(base_path: Path = DEFAULT_DATASET_PATH) -> dict:
         "partitions": len(partition_dirs),
         "total_files": total_files,
         "total_size_mb": round(total_size / (1024 * 1024), 2),
-        "month_range": {
-            "min": months[0] if months else None,
-            "max": months[-1] if months else None,
+        "year_range": {
+            "min": years[0] if years else None,
+            "max": years[-1] if years else None,
         },
     }

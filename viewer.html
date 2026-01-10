@@ -149,21 +149,14 @@
       document.getElementById('endDate').value = endDate.toISOString().split('T')[0];
     }
 
-    // Generate list of monthly partition URLs for date range
+    // Generate list of yearly partition URLs for date range
     function generatePartitionUrls(startDate, endDate) {
       const urls = [];
-      const start = new Date(startDate);
-      const end = new Date(endDate);
+      const startYear = new Date(startDate).getFullYear();
+      const endYear = new Date(endDate).getFullYear();
 
-      // Start from the first day of start month
-      let current = new Date(start.getFullYear(), start.getMonth(), 1);
-
-      while (current <= end) {
-        const year = current.getFullYear();
-        const month = String(current.getMonth() + 1).padStart(2, '0');
-        urls.push(`${R2_BASE_URL}/year_month=${year}-${month}/data.parquet`);
-        // Move to next month
-        current.setMonth(current.getMonth() + 1);
+      for (let year = startYear; year <= endYear; year++) {
+        urls.push(`${R2_BASE_URL}/year=${year}/data.parquet`);
       }
 
       return urls;
@@ -240,7 +233,7 @@
 
         // Generate partition URLs for the date range
         const partitionUrls = generatePartitionUrls(startDate, endDate);
-        updateStatus(`Loading ${partitionUrls.length} month(s) of data for station ${stationId}...`, 'loading');
+        updateStatus(`Loading ${partitionUrls.length} year(s) of data for station ${stationId}...`, 'loading');
 
         // Build URL list for DuckDB (JSON array format)
         const urlList = JSON.stringify(partitionUrls);

@@ -55,12 +55,11 @@ def save_checkpoint(checkpoint: dict) -> None:
 def get_resume_date(r2_client) -> pd.Timestamp | None:
     """Get the date to resume from based on R2 contents."""
     try:
-        uploaded_months = list_partitions(R2_BUCKET, R2_PREFIX, r2_client)
-        if uploaded_months:
-            # Resume from start of month after last uploaded
-            last_month = pd.Period(max(uploaded_months), freq="M")
-            next_month = (last_month + 1).to_timestamp(freq="M")
-            return pd.Timestamp(next_month, tz="UTC")
+        uploaded_years = list_partitions(R2_BUCKET, R2_PREFIX, r2_client)
+        if uploaded_years:
+            # Resume from start of year after last uploaded
+            last_year = int(max(uploaded_years))
+            return pd.Timestamp(f"{last_year + 1}-01-01", tz="UTC")
     except Exception as e:
         print(f"[warning] Could not check R2 for resume point: {e}")
     return None
@@ -127,86 +126,84 @@ def run_backfill(
         print("No stations found. Exiting.")
         return
 
-    # Process in monthly chunks
-    current_start = start_date
+    # Process year by year
     total_records = 0
     total_partitions = 0
 
-    while current_start <= end_date:
-        # Process one month at a time
-        month_end = (current_start + pd.DateOffset(months=1)).normalize() - timedelta(days=1)
-        if month_end > end_date:
-            month_end = end_date
+    current_year = start_date.year
+    end_year = end_date.year
+
+    while current_year <= end_year:
+        year_start = max(start_date, pd.Timestamp(f"{current_year}-01-01", tz="UTC"))
+        year_end = min(end_date, pd.Timestamp(f"{current_year}-12-31", tz="UTC"))
 
         # Filter to stations that existed during this period
-        active_stations = stations[stations["archive_begin"] <= month_end]
+        active_stations = stations[stations["archive_begin"] <= year_end]
 
         print(f"\n{'='*60}")
-        print(f"Processing: {current_start.date()} to {month_end.date()}")
-        print(f"Active stations: {len(active_stations)} / {len(stations)}")
+        print(f"Processing year {current_year}: {year_start.date()} to {year_end.date()}")
+        print(f"Active stations: {len(active_stations)}")
         print(f"{'='*60}")
 
         if active_stations.empty:
-            print("No stations active in this period, skipping...")
-            current_start = month_end + timedelta(days=1)
+            print("No active stations, skipping...")
+            current_year += 1
             continue
 
-        # Fetch observations
+        # Fetch entire year at once
         observations = fetch_observations_batch(
             active_stations,
-            current_start,
-            month_end + timedelta(days=1),  # End is exclusive
+            year_start,
+            year_end + timedelta(days=1),  # End is exclusive
             show_progress=True,
         )
 
         if observations.empty:
-            print("No observations for this period")
-            current_start = month_end + timedelta(days=1)
+            print("No data for this year")
+            current_year += 1
             continue
 
-        print(f"Fetched {len(observations):,} observations")
-        total_records += len(observations)
+        year_records = len(observations)
+        print(f"Fetched {year_records:,} observations")
+        total_records += year_records
 
-        # Write to local partitions
-        written = write_partition(observations, DEFAULT_DATASET_PATH)
-        print(f"Wrote {len(written)} local partition(s)")
+        # Write to local partition
+        write_partition(observations, DEFAULT_DATASET_PATH)
 
-        # Upload each partition to R2
-        for month_str, local_path in sorted(written.items()):
-            partition_dir = local_path.parent
-            print(f"  Uploading {month_str}...", end=" ", flush=True)
+        # Upload the year partition
+        if year_records > 0:
+            partition_dir = DEFAULT_DATASET_PATH / f"year={current_year}"
+            print(f"\n  Uploading year={current_year}...", end=" ", flush=True)
 
             try:
                 uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
-                print(f"done ({len(uploaded)} file(s))")
+                print(f"done ({year_records:,} records)")
                 total_partitions += 1
 
-                # Clean up local file if not keeping
+                # Clean up local files if not keeping
                 if not keep_local:
-                    local_path.unlink()
-                    # Remove partition dir if empty
+                    for f in partition_dir.glob("*.parquet"):
+                        f.unlink()
                     if not list(partition_dir.glob("*")):
                         partition_dir.rmdir()
 
             except Exception as e:
                 print(f"FAILED: {e}")
-                # Save checkpoint so we can resume
                 save_checkpoint({
-                    "last_successful_month": month_str,
+                    "last_successful_year": current_year - 1,
                     "states": states,
                 })
                 raise
 
         # Update checkpoint
         save_checkpoint({
-            "last_month": current_start.strftime("%Y-%m"),
+            "last_year": current_year,
             "states": states,
             "total_records": total_records,
             "total_partitions": total_partitions,
         })
 
-        # Move to next month
-        current_start = month_end + timedelta(days=1)
+        current_year += 1
 
     print(f"\n{'='*60}")
     print(f"Backfill complete!")
