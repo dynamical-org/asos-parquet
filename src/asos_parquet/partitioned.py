@@ -96,6 +96,10 @@ def write_partition(
         # Drop the temporary partition column
         group = group.drop(columns=["_year"])
 
+        # Ensure station is string (prevents PyArrow type inference issues)
+        if "station" in group.columns:
+            group["station"] = group["station"].astype(str)
+
         # Get partition path
         partition_path = get_partition_path(base_path, pd.Timestamp(f"{year}-01-01"))
         partition_path.mkdir(parents=True, exist_ok=True)
