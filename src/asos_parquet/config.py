@@ -7,10 +7,10 @@ STATION_METADATA_URL = "https://mesonet.agron.iastate.edu/geojson/network/{state
 OBSERVATION_DATA_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 
 # Rate limiting
-MAX_CONCURRENT_REQUESTS = 20  # IEM handles parallelism well
-MAX_RETRIES = 3
-RETRY_BACKOFF = 1.0  # seconds
-REQUEST_TIMEOUT = 30  # seconds - most requests complete in <5s
+MAX_CONCURRENT_REQUESTS = 10  # Reduced for yearly fetches (more data per request)
+MAX_RETRIES = 5
+RETRY_BACKOFF = 2.0  # seconds (exponential: 2s, 4s, 8s, 16s, 32s)
+REQUEST_TIMEOUT = 60  # seconds - yearly requests can be large
 
 # Data fields to fetch (core weather subset with both imperial and metric)
 DATA_FIELDS = [
