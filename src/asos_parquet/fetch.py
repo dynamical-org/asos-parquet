@@ -10,8 +10,8 @@ from tqdm import tqdm
 
 from .config import (
     DATA_FIELDS,
+    MAX_BACKOFF,
     MAX_CONCURRENT_REQUESTS,
-    MAX_RETRIES,
     OBSERVATION_DATA_URL,
     REQUEST_TIMEOUT,
     RETRY_BACKOFF,
@@ -58,6 +58,10 @@ def fetch_station_observations(
 ) -> pd.DataFrame | None:
     """Fetch observation data for a single station with retry on 503.
 
+    Retries indefinitely on 503 errors (server overload) with exponential
+    backoff capped at MAX_BACKOFF seconds. This ensures no gaps in data
+    due to transient server issues.
+
     Args:
         station_id: ASOS station identifier
         start_date: Start timestamp
@@ -69,8 +73,8 @@ def fetch_station_observations(
     """
     url = build_observation_url(station_id, start_date, end_date)
 
-    last_error: Exception | None = None
-    for attempt in range(MAX_RETRIES):
+    attempt = 0
+    while True:
         try:
             response = requests.get(url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
@@ -119,17 +123,20 @@ def fetch_station_observations(
             if e.response is not None and e.response.status_code == 404:
                 return None
             if e.response is not None and e.response.status_code == 503:
-                last_error = e
-                time.sleep(RETRY_BACKOFF * (2**attempt))
+                # Exponential backoff capped at MAX_BACKOFF
+                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+                if attempt == 0:
+                    print(f"[503] {station_id}: server overloaded, retrying...", end="", flush=True)
+                elif attempt % 5 == 0:
+                    # Periodic status update every 5 retries
+                    print(f" (attempt {attempt + 1}, waiting {wait_time:.0f}s)", end="", flush=True)
+                time.sleep(wait_time)
+                attempt += 1
                 continue
             raise
         except Exception as e:
             print(f"[warning] {station_id}: {e}")
             return None
-
-    if last_error:
-        print(f"[warning] {station_id}: max retries exceeded - {last_error}")
-    return None
 
 
 def fetch_observations_batch(
