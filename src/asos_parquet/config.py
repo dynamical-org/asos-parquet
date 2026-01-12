@@ -7,10 +7,11 @@ STATION_METADATA_URL = "https://mesonet.agron.iastate.edu/geojson/network/{state
 OBSERVATION_DATA_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 
 # Rate limiting
-MAX_CONCURRENT_REQUESTS = 10  # Reduced for yearly fetches (more data per request)
+MAX_CONCURRENT_REQUESTS = 5  # Keep low to avoid overwhelming Iowa Mesonet server
 MAX_RETRIES = 5
-RETRY_BACKOFF = 2.0  # seconds (exponential: 2s, 4s, 8s, 16s, 32s)
-REQUEST_TIMEOUT = 60  # seconds - yearly requests can be large
+RETRY_BACKOFF = 3.0  # seconds (base for exponential backoff)
+MAX_BACKOFF = 300.0  # seconds (5 minutes) - cap for exponential backoff
+REQUEST_TIMEOUT = 120  # seconds - monthly requests can be large
 
 # Data fields to fetch (core weather subset with both imperial and metric)
 DATA_FIELDS = [
