@@ -53,7 +53,8 @@ class LiveProgressDisplay:
         self.description = description
         self.completed = 0
         self.successful = 0
-        self.failed = 0
+        self.empty = 0  # Stations with no data (normal)
+        self.errors = 0  # Actual failures
         self.in_flight: dict[str, RequestStatus] = {}
         self.warnings: list[str] = []
         self.lock = Lock()
@@ -71,15 +72,22 @@ class LiveProgressDisplay:
                 self.in_flight[station].status = status
                 self.in_flight[station].attempt = attempt
 
-    def complete_request(self, station: str, success: bool) -> None:
-        """Mark a request as completed."""
+    def complete_request(self, station: str, result: str) -> None:
+        """Mark a request as completed.
+
+        Args:
+            station: Station ID
+            result: One of "success", "empty", or "error"
+        """
         with self.lock:
             self.in_flight.pop(station, None)
             self.completed += 1
-            if success:
+            if result == "success":
                 self.successful += 1
-            else:
-                self.failed += 1
+            elif result == "empty":
+                self.empty += 1
+            else:  # error
+                self.errors += 1
 
     def add_warning(self, message: str) -> None:
         """Add a warning message."""
@@ -337,7 +345,9 @@ def _fetch_with_rich_display(
         pct = progress.completed / progress.total * 100 if progress.total > 0 else 0
         lines.append(
             f"Progress: {progress.completed}/{progress.total} ({pct:.0f}%) | "
-            f"[green]OK: {progress.successful}[/] | [red]Failed: {progress.failed}[/]\n"
+            f"[green]OK: {progress.successful}[/] | "
+            f"[dim]Empty: {progress.empty}[/] | "
+            f"[red]Errors: {progress.errors}[/]\n"
         )
 
         # Show recent warnings
@@ -382,20 +392,27 @@ def _fetch_with_rich_display(
                     df = future.result()
                     if df is not None and not df.empty:
                         all_observations.append(df)
-                        progress.complete_request(station_id, success=True)
+                        progress.complete_request(station_id, result="success")
                     else:
-                        progress.complete_request(station_id, success=False)
+                        # No data for this station/period - normal for inactive stations
+                        progress.complete_request(station_id, result="empty")
                 except Exception as e:
-                    logger.warning(f"{station_id}: {e}")
-                    progress.add_warning(f"[warning] {station_id}: {e}")
-                    progress.complete_request(station_id, success=False)
+                    logger.error(f"{station_id}: {e}")
+                    progress.add_warning(f"{station_id}: {e}")
+                    progress.complete_request(station_id, result="error")
 
                 live.update(make_display())
 
     # Final summary
     console.print(
-        f"Fetch complete: [green]{progress.successful}[/] successful, "
-        f"[red]{progress.failed}[/] failed/empty"
+        f"Fetch complete: [green]{progress.successful}[/] OK, "
+        f"[dim]{progress.empty}[/] empty, "
+        f"[red]{progress.errors}[/] errors"
+    )
+
+    # Log summary
+    logger.info(
+        f"Fetch complete: {progress.successful} OK, {progress.empty} empty, {progress.errors} errors"
     )
 
     if not all_observations:
@@ -429,7 +446,8 @@ def _fetch_simple(
         }
 
         successful = 0
-        failed = 0
+        empty = 0
+        errors = 0
         completed = 0
 
         iterator = as_completed(futures)
@@ -452,10 +470,11 @@ def _fetch_simple(
                     all_observations.append(df)
                     successful += 1
                 else:
-                    failed += 1
+                    empty += 1
             except Exception as e:
-                print(f"\n[warning] {station_id}: {e}")
-                failed += 1
+                logger.error(f"{station_id}: {e}")
+                print(f"\n[error] {station_id}: {e}")
+                errors += 1
 
             # Inline progress when not using progress bar
             if not show_progress and progress_interval > 0:
@@ -468,7 +487,9 @@ def _fetch_simple(
         print()
 
     if show_progress:
-        print(f"Fetch complete: {successful} successful, {failed} failed/empty")
+        print(f"Fetch complete: {successful} OK, {empty} empty, {errors} errors")
+
+    logger.info(f"Fetch complete: {successful} OK, {empty} empty, {errors} errors")
 
     if not all_observations:
         return pd.DataFrame()
