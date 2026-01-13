@@ -36,7 +36,7 @@ from asos_parquet.stations import fetch_all_stations
 
 # Constants
 LOG_DIR = Path("logs")
-CHUNK_MONTHS = 24  # Process 2 years at a time (fewer API calls)
+CHUNK_MONTHS = 36  # Process 3 years at a time (optimal throughput)
 
 
 def setup_logging() -> Path:

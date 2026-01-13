@@ -51,7 +51,7 @@ format:
 STATES ?=
 START ?=
 END ?=
-CHUNK_MONTHS ?= 24
+CHUNK_MONTHS ?= 36
 
 # Backfill to local parquet files
 # Logs are automatically saved to logs/backfill-{timestamp}.log
