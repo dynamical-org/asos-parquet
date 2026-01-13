@@ -1,4 +1,4 @@
-.PHONY: install test lint format backfill-r2 validate query clean serve help
+.PHONY: install test lint format backfill-r2 update-r2 validate query clean serve help
 
 # Default target
 help:
@@ -10,6 +10,7 @@ help:
 	@echo ""
 	@echo "Data:"
 	@echo "  make backfill-r2      Backfill historical data to R2 (resumes automatically)"
+	@echo "  make update-r2        Incremental update (for hourly cron)"
 	@echo "  make validate         Validate R2 data for gaps and quality issues"
 	@echo "  make query            Run example queries against R2 data"
 	@echo "  make clear-r2         Clear all data from R2 bucket"
@@ -27,6 +28,7 @@ help:
 	@echo "  make backfill-r2 START=2020-01-01"
 	@echo "  make backfill-r2 STATES=CA,TX START=2024-01-01"
 	@echo "  make backfill-r2 CHUNK_MONTHS=1  # Monthly chunks (less memory)"
+	@echo "  make update-r2 LOOKBACK=6        # Fetch last 6 hours"
 	@echo "  make validate YEAR=2023          # Validate specific year"
 
 # Setup
@@ -58,6 +60,12 @@ ifdef START
 else
 	uv run python scripts/backfill_r2.py --resume --chunk-months $(CHUNK_MONTHS)
 endif
+
+# Incremental update for hourly cron
+# Logs are automatically saved to logs/update-{timestamp}.log
+LOOKBACK ?= 2
+update-r2:
+	uv run python scripts/update_r2.py --lookback $(LOOKBACK) $(if $(STATES),--states $(STATES))
 
 # Validate R2 data for gaps and quality issues
 YEAR ?=
