@@ -387,6 +387,7 @@ def _fetch_with_rich_display(
             for future in as_completed(futures):
                 row = futures[future]
                 station_id = row["station"]
+                state = row["state"]
 
                 try:
                     df = future.result()
@@ -394,10 +395,11 @@ def _fetch_with_rich_display(
                         all_observations.append(df)
                         progress.complete_request(station_id, result="success")
                     else:
-                        # No data for this station/period - normal for inactive stations
+                        # No data for this station/period
+                        logger.info(f"{station_id} ({state}): no data")
                         progress.complete_request(station_id, result="empty")
                 except Exception as e:
-                    logger.error(f"{station_id}: {e}")
+                    logger.error(f"{station_id} ({state}): {e}")
                     progress.add_warning(f"{station_id}: {e}")
                     progress.complete_request(station_id, result="error")
 
@@ -441,7 +443,7 @@ def _fetch_simple(
                 end_date,
                 row["state"],
                 None,  # No callback
-            ): row["station"]
+            ): row
             for row in station_list
         }
 
@@ -461,7 +463,9 @@ def _fetch_simple(
             )
 
         for future in iterator:
-            station_id = futures[future]
+            row = futures[future]
+            station_id = row["station"]
+            state = row["state"]
             completed += 1
 
             try:
@@ -470,9 +474,10 @@ def _fetch_simple(
                     all_observations.append(df)
                     successful += 1
                 else:
+                    logger.info(f"{station_id} ({state}): no data")
                     empty += 1
             except Exception as e:
-                logger.error(f"{station_id}: {e}")
+                logger.error(f"{station_id} ({state}): {e}")
                 print(f"\n[error] {station_id}: {e}")
                 errors += 1
 
