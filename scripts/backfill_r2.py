@@ -143,9 +143,10 @@ def run_backfill(
     end_date: pd.Timestamp | None = None,
     resume: bool = False,
     keep_local: bool = False,
+    skip_upload: bool = False,
     chunk_months: int = CHUNK_MONTHS,
 ) -> None:
-    """Run full archive backfill with R2 uploads.
+    """Run full archive backfill with optional R2 uploads.
 
     Args:
         states: List of state codes. Defaults to all US states.
@@ -153,6 +154,7 @@ def run_backfill(
         end_date: End date for backfill (defaults to yesterday)
         resume: If True, resume from last uploaded partition
         keep_local: If True, keep local files after uploading
+        skip_upload: If True, skip R2 upload (local only)
         chunk_months: Number of months to process at a time (limits memory usage)
     """
     # Set up logging to file
@@ -165,25 +167,30 @@ def run_backfill(
     if states is None:
         states = US_STATES
 
-    # Initialize R2 client
-    print("Connecting to R2...")
-    try:
-        r2_client = get_r2_client()
-        # Test connection with a list operation (head_bucket may be restricted)
-        r2_client.list_objects_v2(Bucket=R2_BUCKET, MaxKeys=1)
-        print(f"Connected to R2 bucket: {R2_BUCKET}")
-        logging.info(f"Connected to R2 bucket: {R2_BUCKET}")
-    except Exception as e:
-        print(f"Failed to connect to R2: {e}")
-        print("Check your .env file has R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY")
-        logging.error(f"Failed to connect to R2: {e}")
-        return
+    # Initialize R2 client (unless skip_upload)
+    r2_client = None
+    if not skip_upload:
+        print("Connecting to R2...")
+        try:
+            r2_client = get_r2_client()
+            # Test connection with a list operation (head_bucket may be restricted)
+            r2_client.list_objects_v2(Bucket=R2_BUCKET, MaxKeys=1)
+            print(f"Connected to R2 bucket: {R2_BUCKET}")
+            logging.info(f"Connected to R2 bucket: {R2_BUCKET}")
+        except Exception as e:
+            print(f"Failed to connect to R2: {e}")
+            print("Check your .env file has R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY")
+            logging.error(f"Failed to connect to R2: {e}")
+            return
+    else:
+        print("Skipping R2 upload (local only mode)")
+        logging.info("Skipping R2 upload (local only mode)")
 
     # Determine date range
     if end_date is None:
         end_date = pd.Timestamp.now("UTC").normalize() - timedelta(days=1)
 
-    if resume:
+    if resume and r2_client:
         resume_date = get_resume_date(r2_client)
         if resume_date:
             print(f"Resuming from {resume_date.date()}")
@@ -292,30 +299,35 @@ def run_backfill(
         merge_partition_files(partition_dir)
         print("done")
 
-        # Upload the year partition
-        print(f"  Uploading year={current_year}...", end=" ", flush=True)
-
-        try:
-            uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
-            print(f"done ({year_records:,} records)")
-            logging.info(f"Uploaded year={current_year}: {year_records:,} records")
+        # Upload the year partition (unless skip_upload)
+        if skip_upload:
+            print(f"  Saved locally: {partition_dir}/data.parquet")
+            logging.info(f"Saved year={current_year} locally: {year_records:,} records")
             total_partitions += 1
+        else:
+            print(f"  Uploading year={current_year}...", end=" ", flush=True)
 
-            # Clean up local files if not keeping
-            if not keep_local:
-                for f in partition_dir.glob("*.parquet"):
-                    f.unlink()
-                if not list(partition_dir.glob("*")):
-                    partition_dir.rmdir()
+            try:
+                uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
+                print(f"done ({year_records:,} records)")
+                logging.info(f"Uploaded year={current_year}: {year_records:,} records")
+                total_partitions += 1
 
-        except Exception as e:
-            print(f"FAILED: {e}")
-            logging.error(f"Upload FAILED for year={current_year}: {e}")
-            save_checkpoint({
-                "last_successful_year": current_year - 1,
-                "states": states,
-            })
-            raise
+                # Clean up local files if not keeping
+                if not keep_local:
+                    for f in partition_dir.glob("*.parquet"):
+                        f.unlink()
+                    if not list(partition_dir.glob("*")):
+                        partition_dir.rmdir()
+
+            except Exception as e:
+                print(f"FAILED: {e}")
+                logging.error(f"Upload FAILED for year={current_year}: {e}")
+                save_checkpoint({
+                    "last_successful_year": current_year - 1,
+                    "states": states,
+                })
+                raise
 
         # Update checkpoint
         save_checkpoint({
@@ -371,6 +383,11 @@ def main():
         help="Keep local files after uploading to R2",
     )
     parser.add_argument(
+        "--skip-upload",
+        action="store_true",
+        help="Skip R2 upload, only save locally to data/asos/",
+    )
+    parser.add_argument(
         "--chunk-months",
         type=int,
         default=CHUNK_MONTHS,
@@ -389,6 +406,7 @@ def main():
         end_date=end_date,
         resume=args.resume,
         keep_local=args.keep_local,
+        skip_upload=args.skip_upload,
         chunk_months=args.chunk_months,
     )
 
