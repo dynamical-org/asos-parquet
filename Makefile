@@ -51,24 +51,21 @@ END ?=
 CHUNK_MONTHS ?= 1
 
 # R2 backfill (resumes automatically if no START specified)
-# Logs are saved to logs/backfill-{timestamp}.log
+# Logs are automatically saved to logs/backfill-{timestamp}.log
 backfill-r2:
-	@mkdir -p logs
 ifdef START
-	uv run python scripts/backfill_r2.py --start $(START) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS) 2>&1 | tee logs/backfill-$$(date +%Y%m%d-%H%M%S).log
+	uv run python scripts/backfill_r2.py --start $(START) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS)
 else
-	uv run python scripts/backfill_r2.py --resume --chunk-months $(CHUNK_MONTHS) 2>&1 | tee logs/backfill-$$(date +%Y%m%d-%H%M%S).log
+	uv run python scripts/backfill_r2.py --resume --chunk-months $(CHUNK_MONTHS)
 endif
 
 # Validate R2 data for gaps and quality issues
-# Logs are saved to logs/validate-{timestamp}.log
 YEAR ?=
 validate:
-	@mkdir -p logs
 ifdef YEAR
-	uv run python scripts/validate_r2.py --year $(YEAR) --verbose 2>&1 | tee logs/validate-$$(date +%Y%m%d-%H%M%S).log
+	uv run python scripts/validate_r2.py --year $(YEAR) --verbose
 else
-	uv run python scripts/validate_r2.py --verbose 2>&1 | tee logs/validate-$$(date +%Y%m%d-%H%M%S).log
+	uv run python scripts/validate_r2.py --verbose
 endif
 
 # Run example queries

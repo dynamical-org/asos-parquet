@@ -17,8 +17,9 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -40,9 +41,26 @@ from asos_parquet.stations import fetch_all_stations
 
 # Constants
 CHECKPOINT_FILE = Path("data/backfill_r2_checkpoint.json")
+LOG_DIR = Path("logs")
 R2_BUCKET = "dev"
 R2_PREFIX = "asos"
 CHUNK_MONTHS = 1  # Process this many months at a time to limit memory usage
+
+
+def setup_logging() -> Path:
+    """Set up logging to file. Returns log file path."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"backfill-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+
+    # Configure file handler for all important events
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+        ],
+    )
+    return log_file
 
 
 def load_checkpoint() -> dict:
@@ -137,6 +155,13 @@ def run_backfill(
         keep_local: If True, keep local files after uploading
         chunk_months: Number of months to process at a time (limits memory usage)
     """
+    # Set up logging to file
+    log_file = setup_logging()
+    print(f"Logging to: {log_file}")
+    logging.info("=" * 60)
+    logging.info("BACKFILL STARTED")
+    logging.info("=" * 60)
+
     if states is None:
         states = US_STATES
 
@@ -147,9 +172,11 @@ def run_backfill(
         # Test connection with a list operation (head_bucket may be restricted)
         r2_client.list_objects_v2(Bucket=R2_BUCKET, MaxKeys=1)
         print(f"Connected to R2 bucket: {R2_BUCKET}")
+        logging.info(f"Connected to R2 bucket: {R2_BUCKET}")
     except Exception as e:
         print(f"Failed to connect to R2: {e}")
         print("Check your .env file has R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY")
+        logging.error(f"Failed to connect to R2: {e}")
         return
 
     # Determine date range
@@ -172,6 +199,8 @@ def run_backfill(
     print(f"  Date range: {start_date.date()} to {end_date.date()}")
     print(f"  R2 bucket: {R2_BUCKET}/{R2_PREFIX}")
     print()
+
+    logging.info(f"Configuration: {len(states)} states, {start_date.date()} to {end_date.date()}")
 
     # Fetch station metadata
     print(f"Fetching station metadata for {len(states)} states...")
@@ -202,6 +231,8 @@ def run_backfill(
         print(f"Processing in {chunk_months}-month chunks to limit memory")
         print(f"{'='*60}")
 
+        logging.info(f"Processing year {current_year}: {len(active_stations)} stations")
+
         if active_stations.empty:
             print("No active stations, skipping...")
             current_year += 1
@@ -231,10 +262,12 @@ def run_backfill(
 
             if observations.empty:
                 print("no data")
+                logging.info(f"  {current_year} {month_label}: no data")
             else:
                 chunk_records = len(observations)
                 year_records += chunk_records
                 print(f"{chunk_records:,} records")
+                logging.info(f"  {current_year} {month_label}: {chunk_records:,} records")
 
                 # Write to local partition (creates part-*.parquet file)
                 write_partition(observations, DEFAULT_DATASET_PATH)
@@ -265,6 +298,7 @@ def run_backfill(
         try:
             uploaded = upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
             print(f"done ({year_records:,} records)")
+            logging.info(f"Uploaded year={current_year}: {year_records:,} records")
             total_partitions += 1
 
             # Clean up local files if not keeping
@@ -276,6 +310,7 @@ def run_backfill(
 
         except Exception as e:
             print(f"FAILED: {e}")
+            logging.error(f"Upload FAILED for year={current_year}: {e}")
             save_checkpoint({
                 "last_successful_year": current_year - 1,
                 "states": states,
@@ -298,6 +333,12 @@ def run_backfill(
     print(f"  Total partitions: {total_partitions}")
     print(f"  R2 location: s3://{R2_BUCKET}/{R2_PREFIX}/")
     print(f"{'='*60}")
+
+    logging.info("=" * 60)
+    logging.info("BACKFILL COMPLETE")
+    logging.info(f"Total records: {total_records:,}")
+    logging.info(f"Total partitions: {total_partitions}")
+    logging.info("=" * 60)
 
 
 def main():
