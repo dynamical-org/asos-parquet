@@ -220,15 +220,13 @@ def run_backfill(
             if chunk_months > 1:
                 month_label = f"{chunk_start.strftime('%b')}-{chunk_end.strftime('%b')}"
 
-            print(f"\n  {current_year} {month_label}: ", end="", flush=True)
-
-            # Fetch this chunk (show inline progress every 100 stations)
+            # Fetch this chunk with live progress display
             observations = fetch_observations_batch(
                 active_stations,
                 chunk_start,
                 chunk_end + timedelta(days=1),  # End is exclusive
-                show_progress=False,
-                progress_interval=100,
+                show_progress=True,
+                description=f"{current_year} {month_label}",
             )
 
             if observations.empty:
