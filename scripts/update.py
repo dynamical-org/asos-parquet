@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Incremental update worker for ASOS data in R2.
+"""Incremental update for ASOS data.
 
-Fetches recent observations and uploads to R2. Designed for hourly cron execution.
+Fetches recent observations and writes to local parquet files.
+Designed for hourly cron execution, followed by upload_s3.sh.
 
 Usage:
-    python scripts/update_r2.py                 # Update all stations (last 2 hours)
-    python scripts/update_r2.py --states CA,TX  # Specific states only
-    python scripts/update_r2.py --lookback 6    # Hours to look back
+    python scripts/update.py                 # Update all stations (last 2 hours)
+    python scripts/update.py --states CA,TX  # Specific states only
+    python scripts/update.py --lookback 6    # Hours to look back
 """
 
 import argparse
@@ -27,13 +28,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from asos_parquet.config import US_STATES
 from asos_parquet.fetch import fetch_observations_batch
 from asos_parquet.partitioned import DEFAULT_DATASET_PATH, write_partition
-from asos_parquet.r2 import get_r2_client, upload_partition
 from asos_parquet.stations import fetch_all_stations
 
 # Constants
 LOG_DIR = Path("logs")
-R2_BUCKET = "dev"
-R2_PREFIX = "asos"
 
 
 def setup_logging() -> Path:
@@ -54,14 +52,12 @@ def setup_logging() -> Path:
 def run_update(
     states: list[str] | None = None,
     lookback_hours: int = 2,
-    keep_local: bool = False,
 ) -> None:
-    """Run incremental update.
+    """Run incremental update to local parquet files.
 
     Args:
         states: List of state codes. Defaults to all US states.
         lookback_hours: Hours to look back from now for new data.
-        keep_local: If True, keep local files after uploading to R2.
     """
     log_file = setup_logging()
     print(f"Logging to: {log_file}")
@@ -76,6 +72,7 @@ def run_update(
     print(f"=======================")
     print(f"Time: {now.isoformat()}")
     print(f"Lookback: {lookback_hours} hours (since {lookback_start.isoformat()})")
+    print(f"Output: {DEFAULT_DATASET_PATH}")
     print()
 
     logging.info("=" * 60)
@@ -83,20 +80,8 @@ def run_update(
     logging.info(f"Lookback: {lookback_hours} hours, States: {len(states)}")
     logging.info("=" * 60)
 
-    # Connect to R2
-    print("Connecting to R2...")
-    try:
-        r2_client = get_r2_client()
-        r2_client.list_objects_v2(Bucket=R2_BUCKET, MaxKeys=1)
-        print(f"Connected to R2 bucket: {R2_BUCKET}")
-        logging.info(f"Connected to R2 bucket: {R2_BUCKET}")
-    except Exception as e:
-        print(f"Failed to connect to R2: {e}")
-        logging.error(f"Failed to connect to R2: {e}")
-        return
-
     # Fetch station metadata
-    print(f"\nFetching station metadata for {len(states)} states...")
+    print(f"Fetching station metadata for {len(states)} states...")
     stations = fetch_all_stations(states=states, online_only=True)
     print(f"Found {len(stations)} online stations")
     logging.info(f"Found {len(stations)} online stations")
@@ -127,39 +112,19 @@ def run_update(
     # Write to local partitioned dataset
     written = write_partition(observations, DEFAULT_DATASET_PATH)
 
-    print(f"\nWrote {len(written)} partition(s) locally")
+    print(f"\nWrote {len(written)} partition(s):")
     for year, path in sorted(written.items()):
         print(f"  year={year}: {path.name}")
         logging.info(f"Wrote partition year={year}: {path.name}")
 
-    # Upload to R2
-    for year, local_path in sorted(written.items()):
-        partition_dir = local_path.parent
-        print(f"Uploading year={year}...", end=" ", flush=True)
-
-        try:
-            upload_partition(partition_dir, R2_BUCKET, R2_PREFIX, r2_client)
-            print("done")
-            logging.info(f"Uploaded year={year}")
-
-            # Clean up local files if not keeping
-            if not keep_local:
-                for f in partition_dir.glob("*.parquet"):
-                    f.unlink()
-                if not list(partition_dir.glob("*")):
-                    partition_dir.rmdir()
-
-        except Exception as e:
-            print(f"FAILED: {e}")
-            logging.error(f"Upload FAILED for year={year}: {e}")
-
-    print("\nUpdate complete!")
+    print(f"\nUpdate complete!")
+    print(f"Run 'make upload-backfill' to sync to S3")
     logging.info("UPDATE COMPLETE")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Incremental ASOS update to R2"
+        description="Incremental ASOS update to local parquet"
     )
     parser.add_argument(
         "--states",
@@ -172,11 +137,6 @@ def main():
         default=2,
         help="Hours to look back for new data (default: 2)",
     )
-    parser.add_argument(
-        "--keep-local",
-        action="store_true",
-        help="Keep local files after uploading to R2",
-    )
 
     args = parser.parse_args()
 
@@ -185,7 +145,6 @@ def main():
     run_update(
         states=states,
         lookback_hours=args.lookback,
-        keep_local=args.keep_local,
     )
 
 
