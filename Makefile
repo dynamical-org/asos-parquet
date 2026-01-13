@@ -25,10 +25,10 @@ help:
 	@echo "  make clean            Remove generated files"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make backfill START=2020-01-01"
+	@echo "  make backfill START=2000-01-01"
 	@echo "  make backfill STATES=CA,TX START=2024-01-01"
-	@echo "  make backfill PARALLEL=3       # Process 3 years concurrently"
-	@echo "  make backfill CHUNK_MONTHS=1   # Monthly chunks (less memory)"
+	@echo "  make backfill CHUNK_MONTHS=36  # 3-year chunks (fewer API calls)"
+	@echo "  make backfill CHUNK_MONTHS=12  # 1-year chunks (less memory)"
 	@echo "  make update LOOKBACK=6         # Fetch last 6 hours"
 	@echo "  make validate YEAR=2023        # Validate specific year"
 
@@ -51,13 +51,12 @@ format:
 STATES ?=
 START ?=
 END ?=
-CHUNK_MONTHS ?= 12
-PARALLEL ?= 1
+CHUNK_MONTHS ?= 24
 
 # Backfill to local parquet files
 # Logs are automatically saved to logs/backfill-{timestamp}.log
 backfill:
-	uv run python scripts/backfill.py $(if $(START),--start $(START)) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS) --parallel $(PARALLEL)
+	uv run python scripts/backfill.py $(if $(START),--start $(START)) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS)
 
 # Incremental update for hourly cron
 # Logs are automatically saved to logs/update-{timestamp}.log

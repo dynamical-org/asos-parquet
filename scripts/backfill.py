@@ -2,27 +2,21 @@
 """Full archive backfill to local parquet dataset.
 
 Fetches historical ASOS data and writes year-partitioned parquet files locally.
-Processing is chunked by month to limit memory usage. Each month is fetched
-and written to a part file, then merged with DuckDB streaming.
-
-Supports parallel year processing for faster backfills.
+Processing is chunked by configurable time periods to balance memory usage
+and API efficiency. Larger chunks = fewer API calls but more memory.
 
 Usage:
     python scripts/backfill.py                    # Full archive, all states
     python scripts/backfill.py --states CA,TX    # Specific states
     python scripts/backfill.py --start 2020-01-01  # Start from specific date
-    python scripts/backfill.py --chunk-months 3  # Process 3 months at a time
-    python scripts/backfill.py --parallel 3      # Process 3 years concurrently
+    python scripts/backfill.py --chunk-months 24 # 2-year chunks (fewer API calls)
 """
 
 import argparse
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
 
 import duckdb
 import pandas as pd
@@ -42,28 +36,7 @@ from asos_parquet.stations import fetch_all_stations
 
 # Constants
 LOG_DIR = Path("logs")
-CHUNK_MONTHS = 12  # Process full year at a time
-PARALLEL_YEARS = 1  # Default to sequential for backwards compatibility
-
-
-@dataclass
-class YearResult:
-    """Result from processing a single year."""
-
-    year: int
-    records: int
-    success: bool
-    error: str | None = None
-
-
-# Thread-safe print lock for parallel output
-print_lock = Lock()
-
-
-def safe_print(*args, **kwargs):
-    """Thread-safe print."""
-    with print_lock:
-        print(*args, **kwargs)
+CHUNK_MONTHS = 24  # Process 2 years at a time (fewer API calls)
 
 
 def setup_logging() -> Path:
@@ -130,109 +103,11 @@ def merge_partition_files(partition_dir: Path) -> Path | None:
     return data_file
 
 
-def process_year(
-    year: int,
-    stations: pd.DataFrame,
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp,
-    chunk_months: int,
-    show_progress: bool = True,
-) -> YearResult:
-    """Process a single year of data.
-
-    Args:
-        year: Year to process
-        stations: DataFrame with station metadata
-        start_date: Overall start date (may be mid-year)
-        end_date: Overall end date (may be mid-year)
-        chunk_months: Months per chunk
-        show_progress: Whether to show Rich progress display
-
-    Returns:
-        YearResult with records count and status
-    """
-    try:
-        year_start = max(start_date, pd.Timestamp(f"{year}-01-01", tz="UTC"))
-        year_end = min(end_date, pd.Timestamp(f"{year}-12-31", tz="UTC"))
-
-        # Filter to stations that existed during this period
-        active_stations = stations[stations["archive_begin"] <= year_end]
-
-        safe_print(f"\n[{year}] Processing: {year_start.date()} to {year_end.date()}")
-        safe_print(f"[{year}] Active stations: {len(active_stations)}")
-        logging.info(f"Processing year {year}: {len(active_stations)} stations")
-
-        if active_stations.empty:
-            safe_print(f"[{year}] No active stations, skipping...")
-            return YearResult(year=year, records=0, success=True)
-
-        # Process in monthly chunks to limit memory usage
-        year_records = 0
-        chunk_start = year_start
-
-        while chunk_start <= year_end:
-            # Calculate chunk end (chunk_months months, but not past year_end)
-            chunk_end = chunk_start + pd.DateOffset(months=chunk_months) - timedelta(days=1)
-            chunk_end = min(chunk_end, year_end)
-
-            month_label = chunk_start.strftime("%b")
-            if chunk_months > 1:
-                month_label = f"{chunk_start.strftime('%b')}-{chunk_end.strftime('%b')}"
-
-            # Fetch this chunk
-            observations = fetch_observations_batch(
-                active_stations,
-                chunk_start,
-                chunk_end + timedelta(days=1),  # End is exclusive
-                show_progress=show_progress,
-                description=f"{year} {month_label}",
-            )
-
-            if observations.empty:
-                safe_print(f"[{year}] {month_label}: no data")
-                logging.info(f"  {year} {month_label}: no data")
-            else:
-                chunk_records = len(observations)
-                year_records += chunk_records
-                safe_print(f"[{year}] {month_label}: {chunk_records:,} records")
-                logging.info(f"  {year} {month_label}: {chunk_records:,} records")
-
-                # Write to local partition (creates part-*.parquet file)
-                write_partition(observations, DEFAULT_DATASET_PATH)
-
-                # Free memory after writing
-                del observations
-
-            # Move to next chunk
-            chunk_start = chunk_end + timedelta(days=1)
-
-        if year_records == 0:
-            safe_print(f"[{year}] No data for year")
-            return YearResult(year=year, records=0, success=True)
-
-        # Merge all part files into single data.parquet using DuckDB streaming
-        partition_dir = DEFAULT_DATASET_PATH / f"year={year}"
-        safe_print(f"[{year}] Merging part files...", end=" ", flush=True)
-        merge_partition_files(partition_dir)
-        safe_print("done")
-
-        safe_print(f"[{year}] Saved: {partition_dir}/data.parquet ({year_records:,} records)")
-        logging.info(f"Saved year={year}: {year_records:,} records")
-
-        return YearResult(year=year, records=year_records, success=True)
-
-    except Exception as e:
-        logging.error(f"Error processing year {year}: {e}")
-        safe_print(f"[{year}] ERROR: {e}")
-        return YearResult(year=year, records=0, success=False, error=str(e))
-
-
 def run_backfill(
     states: list[str] | None = None,
     start_date: pd.Timestamp | None = None,
     end_date: pd.Timestamp | None = None,
     chunk_months: int = CHUNK_MONTHS,
-    parallel_years: int = PARALLEL_YEARS,
 ) -> None:
     """Run full archive backfill to local parquet files.
 
@@ -240,8 +115,7 @@ def run_backfill(
         states: List of state codes. Defaults to all US states.
         start_date: Start date for backfill
         end_date: End date for backfill (defaults to yesterday)
-        chunk_months: Number of months to process at a time (limits memory usage)
-        parallel_years: Number of years to process concurrently
+        chunk_months: Number of months to process at a time (larger = fewer API calls)
     """
     # Set up logging to file
     log_file = setup_logging()
@@ -258,7 +132,6 @@ def run_backfill(
         end_date = pd.Timestamp.now("UTC").normalize() - timedelta(days=1)
 
     if start_date is None:
-        # Default to a reasonable start (full archive would be ~1928 but that's huge)
         start_date = pd.Timestamp("2020-01-01", tz="UTC")
         print(f"No start date specified, using {start_date.date()}")
 
@@ -268,12 +141,12 @@ def run_backfill(
     print(f"  States: {len(states)} ({', '.join(states[:5])}{'...' if len(states) > 5 else ''})")
     print(f"  Date range: {start_date.date()} to {end_date.date()}")
     print(f"  Years: {len(years)} ({years[0]}-{years[-1]})")
-    print(f"  Parallel years: {parallel_years}")
+    print(f"  Chunk size: {chunk_months} months")
     print(f"  Output: {DEFAULT_DATASET_PATH}")
     print()
 
     logging.info(f"Configuration: {len(states)} states, {start_date.date()} to {end_date.date()}")
-    logging.info(f"Parallel years: {parallel_years}")
+    logging.info(f"Chunk size: {chunk_months} months")
 
     # Fetch station metadata
     print(f"Fetching station metadata for {len(states)} states...")
@@ -284,63 +157,87 @@ def run_backfill(
         print("No stations found. Exiting.")
         return
 
-    # Process years (parallel or sequential)
-    results: list[YearResult] = []
+    # Process in chunks (may span multiple years)
+    total_records = 0
+    years_with_data: set[int] = set()
+    chunk_start = start_date
 
-    # Use Rich progress only for sequential processing (parallel would overlap)
-    show_rich_progress = parallel_years == 1
+    while chunk_start <= end_date:
+        # Calculate chunk end
+        chunk_end = chunk_start + pd.DateOffset(months=chunk_months) - timedelta(days=1)
+        chunk_end = min(chunk_end, end_date)
 
-    if parallel_years == 1:
-        # Sequential processing
-        for year in years:
-            result = process_year(
-                year, stations, start_date, end_date, chunk_months, show_rich_progress
-            )
-            results.append(result)
-    else:
-        # Parallel processing
-        print(f"\nProcessing {len(years)} years with {parallel_years} workers...")
-        with ThreadPoolExecutor(max_workers=parallel_years) as executor:
-            futures = {
-                executor.submit(
-                    process_year,
-                    year,
-                    stations,
-                    start_date,
-                    end_date,
-                    chunk_months,
-                    show_rich_progress,
-                ): year
-                for year in years
-            }
+        # Build description
+        if chunk_start.year == chunk_end.year:
+            desc = f"{chunk_start.year} {chunk_start.strftime('%b')}-{chunk_end.strftime('%b')}"
+        else:
+            desc = f"{chunk_start.strftime('%Y-%b')} to {chunk_end.strftime('%Y-%b')}"
 
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
+        # Filter to stations that existed during this period
+        active_stations = stations[stations["archive_begin"] <= chunk_end]
 
-    # Sort results by year for consistent output
-    results.sort(key=lambda r: r.year)
+        print(f"\n{'='*60}")
+        print(f"Chunk: {chunk_start.date()} to {chunk_end.date()}")
+        print(f"Active stations: {len(active_stations)}")
+        print(f"{'='*60}")
 
-    # Summary
-    total_records = sum(r.records for r in results)
-    successful = [r for r in results if r.success and r.records > 0]
-    failed = [r for r in results if not r.success]
+        logging.info(f"Processing chunk {chunk_start.date()} to {chunk_end.date()}: {len(active_stations)} stations")
+
+        if active_stations.empty:
+            print("No active stations, skipping...")
+            chunk_start = chunk_end + timedelta(days=1)
+            continue
+
+        # Fetch this chunk
+        observations = fetch_observations_batch(
+            active_stations,
+            chunk_start,
+            chunk_end + timedelta(days=1),  # End is exclusive
+            show_progress=True,
+            description=desc,
+        )
+
+        if observations.empty:
+            print("No data returned")
+            logging.info(f"  {desc}: no data")
+        else:
+            chunk_records = len(observations)
+            total_records += chunk_records
+            print(f"Fetched {chunk_records:,} records")
+            logging.info(f"  {desc}: {chunk_records:,} records")
+
+            # Write to year partitions (handles multi-year chunks automatically)
+            written = write_partition(observations, DEFAULT_DATASET_PATH)
+            for year in written:
+                years_with_data.add(year)
+                print(f"  Wrote year={year}: {written[year].name}")
+
+            # Free memory
+            del observations
+
+        # Move to next chunk
+        chunk_start = chunk_end + timedelta(days=1)
+
+    # Merge all years that received data
+    print(f"\nMerging partitions...")
+    for year in sorted(years_with_data):
+        partition_dir = DEFAULT_DATASET_PATH / f"year={year}"
+        print(f"  Merging year={year}...", end=" ", flush=True)
+        merge_partition_files(partition_dir)
+        print("done")
+        logging.info(f"Merged year={year}")
 
     print(f"\n{'='*60}")
     print(f"Backfill complete!")
     print(f"  Total records: {total_records:,}")
-    print(f"  Successful years: {len(successful)}")
-    if failed:
-        print(f"  Failed years: {[r.year for r in failed]}")
+    print(f"  Years written: {sorted(years_with_data)}")
     print(f"  Output location: {DEFAULT_DATASET_PATH}")
     print(f"{'='*60}")
 
     logging.info("=" * 60)
     logging.info("BACKFILL COMPLETE")
     logging.info(f"Total records: {total_records:,}")
-    logging.info(f"Successful years: {len(successful)}")
-    if failed:
-        logging.error(f"Failed years: {[r.year for r in failed]}")
+    logging.info(f"Years: {sorted(years_with_data)}")
     logging.info("=" * 60)
 
 
@@ -367,13 +264,7 @@ def main():
         "--chunk-months",
         type=int,
         default=CHUNK_MONTHS,
-        help=f"Months to process at a time (default: {CHUNK_MONTHS}, lower = less memory)",
-    )
-    parser.add_argument(
-        "--parallel",
-        type=int,
-        default=PARALLEL_YEARS,
-        help=f"Years to process concurrently (default: {PARALLEL_YEARS}, higher = faster but more memory)",
+        help=f"Months to process at a time (default: {CHUNK_MONTHS}, higher = fewer API calls)",
     )
 
     args = parser.parse_args()
@@ -387,7 +278,6 @@ def main():
         start_date=start_date,
         end_date=end_date,
         chunk_months=args.chunk_months,
-        parallel_years=args.parallel,
     )
 
 
