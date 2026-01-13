@@ -44,7 +44,7 @@ CHECKPOINT_FILE = Path("data/backfill_r2_checkpoint.json")
 LOG_DIR = Path("logs")
 R2_BUCKET = "dev"
 R2_PREFIX = "asos"
-CHUNK_MONTHS = 6  # Process this many months at a time (semi-annual chunks)
+CHUNK_MONTHS = 12  # Process full year at a time
 
 
 def setup_logging() -> Path:
