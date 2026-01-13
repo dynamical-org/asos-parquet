@@ -13,6 +13,7 @@ dependencies = [
     "boto3>=1.34.0",
     "python-dotenv>=1.0.0",
     "duckdb>=1.4.3",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
