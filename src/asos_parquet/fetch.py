@@ -122,27 +122,6 @@ class LiveProgressDisplay:
 
         return table
 
-    def build_display(self) -> str:
-        """Build the full display output."""
-        lines = []
-
-        if self.description:
-            lines.append(f"[bold]{self.description}[/bold]")
-
-        # Progress summary
-        pct = self.completed / self.total * 100 if self.total > 0 else 0
-        lines.append(
-            f"Progress: {self.completed}/{self.total} ({pct:.0f}%) "
-            f"| [green]OK: {self.successful}[/] | [red]Failed: {self.failed}[/]"
-        )
-
-        # Warnings (if any)
-        with self.lock:
-            for warning in self.warnings[-3:]:  # Show last 3
-                lines.append(f"[yellow]{warning}[/yellow]")
-
-        return "\n".join(lines)
-
 
 def build_observation_url(
     station_id: str,
