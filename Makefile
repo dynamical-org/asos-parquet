@@ -26,7 +26,7 @@ help:
 	@echo "Examples:"
 	@echo "  make backfill-r2 START=2020-01-01"
 	@echo "  make backfill-r2 STATES=CA,TX START=2024-01-01"
-	@echo "  make backfill-r2 CHUNK_MONTHS=3  # Use more memory, run faster"
+	@echo "  make backfill-r2 CHUNK_MONTHS=1  # Monthly chunks (less memory)"
 	@echo "  make validate YEAR=2023          # Validate specific year"
 
 # Setup
@@ -48,7 +48,7 @@ format:
 STATES ?=
 START ?=
 END ?=
-CHUNK_MONTHS ?= 1
+CHUNK_MONTHS ?= 3
 
 # R2 backfill (resumes automatically if no START specified)
 # Logs are automatically saved to logs/backfill-{timestamp}.log
