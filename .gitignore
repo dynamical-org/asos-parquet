@@ -4,6 +4,9 @@
 # Data files
 data/
 
+# Logs
+logs/
+
 # Python
 __pycache__/
 *.py[cod]

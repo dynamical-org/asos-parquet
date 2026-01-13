@@ -146,6 +146,7 @@ def fetch_observations_batch(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
     show_progress: bool = True,
+    progress_interval: int = 0,
 ) -> pd.DataFrame:
     """Fetch observations for multiple stations concurrently.
 
@@ -153,13 +154,15 @@ def fetch_observations_batch(
         stations: DataFrame with station metadata (must have 'station' and 'state' columns)
         start_date: Start timestamp
         end_date: End timestamp
-        show_progress: Whether to show progress bar
+        show_progress: Whether to show full progress bar
+        progress_interval: If > 0 and show_progress=False, print inline progress every N stations
 
     Returns:
         Combined DataFrame with all observations
     """
     all_observations: list[pd.DataFrame] = []
     station_list = stations[["station", "state"]].drop_duplicates().to_dict("records")
+    total = len(station_list)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
         futures = {
@@ -175,12 +178,13 @@ def fetch_observations_batch(
 
         successful = 0
         failed = 0
+        completed = 0
 
         iterator = as_completed(futures)
         if show_progress:
             iterator = tqdm(
                 iterator,
-                total=len(futures),
+                total=total,
                 desc="Fetching observations",
                 miniters=1,
                 mininterval=0.1,
@@ -188,6 +192,8 @@ def fetch_observations_batch(
 
         for future in iterator:
             station_id = futures[future]
+            completed += 1
+
             try:
                 df = future.result()
                 if df is not None and not df.empty:
@@ -196,8 +202,18 @@ def fetch_observations_batch(
                 else:
                     failed += 1
             except Exception as e:
-                print(f"[warning] {station_id}: {e}")
+                print(f"\n[warning] {station_id}: {e}")
                 failed += 1
+
+            # Inline progress when not using progress bar
+            if not show_progress and progress_interval > 0:
+                if completed % progress_interval == 0 or completed == total:
+                    pct = completed / total * 100
+                    print(f"\r  {completed}/{total} stations ({pct:.0f}%)", end="", flush=True)
+
+    # Finish inline progress with newline
+    if not show_progress and progress_interval > 0:
+        print()  # newline after inline progress
 
     if show_progress:
         print(f"Fetch complete: {successful} successful, {failed} failed/empty")

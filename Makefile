@@ -1,4 +1,4 @@
-.PHONY: install test lint format backfill-r2 query clean serve help
+.PHONY: install test lint format backfill-r2 validate query clean serve help
 
 # Default target
 help:
@@ -10,6 +10,7 @@ help:
 	@echo ""
 	@echo "Data:"
 	@echo "  make backfill-r2      Backfill historical data to R2 (resumes automatically)"
+	@echo "  make validate         Validate R2 data for gaps and quality issues"
 	@echo "  make query            Run example queries against R2 data"
 	@echo "  make clear-r2         Clear all data from R2 bucket"
 	@echo ""
@@ -26,6 +27,7 @@ help:
 	@echo "  make backfill-r2 START=2020-01-01"
 	@echo "  make backfill-r2 STATES=CA,TX START=2024-01-01"
 	@echo "  make backfill-r2 CHUNK_MONTHS=3  # Use more memory, run faster"
+	@echo "  make validate YEAR=2023          # Validate specific year"
 
 # Setup
 install:
@@ -49,11 +51,24 @@ END ?=
 CHUNK_MONTHS ?= 1
 
 # R2 backfill (resumes automatically if no START specified)
+# Logs are saved to logs/backfill-{timestamp}.log
 backfill-r2:
+	@mkdir -p logs
 ifdef START
-	uv run python scripts/backfill_r2.py --start $(START) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS)
+	uv run python scripts/backfill_r2.py --start $(START) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS) 2>&1 | tee logs/backfill-$$(date +%Y%m%d-%H%M%S).log
 else
-	uv run python scripts/backfill_r2.py --resume --chunk-months $(CHUNK_MONTHS)
+	uv run python scripts/backfill_r2.py --resume --chunk-months $(CHUNK_MONTHS) 2>&1 | tee logs/backfill-$$(date +%Y%m%d-%H%M%S).log
+endif
+
+# Validate R2 data for gaps and quality issues
+# Logs are saved to logs/validate-{timestamp}.log
+YEAR ?=
+validate:
+	@mkdir -p logs
+ifdef YEAR
+	uv run python scripts/validate_r2.py --year $(YEAR) --verbose 2>&1 | tee logs/validate-$$(date +%Y%m%d-%H%M%S).log
+else
+	uv run python scripts/validate_r2.py --verbose 2>&1 | tee logs/validate-$$(date +%Y%m%d-%H%M%S).log
 endif
 
 # Run example queries
@@ -62,7 +77,7 @@ query:
 
 # Maintenance
 clean:
-	rm -rf .pytest_cache __pycache__ .ruff_cache .coverage data/
+	rm -rf .pytest_cache __pycache__ .ruff_cache .coverage data/ logs/
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 clear-r2:

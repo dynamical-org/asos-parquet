@@ -431,6 +431,176 @@ def validate_station_count(
     )
 
 
+def validate_station_coverage(
+    gdf: gpd.GeoDataFrame,
+    expected_stations: pd.DataFrame,
+    year: int,
+) -> ValidationResult:
+    """Validate that expected stations have data.
+
+    Compares stations present in the data against stations that should have
+    been reporting during the given year (based on archive_begin metadata).
+
+    Args:
+        gdf: GeoDataFrame with observation data
+        expected_stations: DataFrame with station metadata (must have 'station' and 'archive_begin')
+        year: The year being validated
+
+    Returns:
+        ValidationResult with missing station details
+    """
+    if "station" not in gdf.columns:
+        return ValidationResult(
+            name="station_coverage",
+            passed=False,
+            message="No 'station' column found",
+        )
+
+    # Filter to stations that should have data for this year
+    year_start = pd.Timestamp(f"{year}-01-01", tz="UTC")
+    year_end = pd.Timestamp(f"{year}-12-31", tz="UTC")
+
+    active_stations = expected_stations[
+        (expected_stations["archive_begin"] <= year_end)
+    ]["station"].unique()
+
+    # Get stations actually present in data
+    present_stations = set(gdf["station"].unique())
+    expected_set = set(active_stations)
+
+    missing = expected_set - present_stations
+    extra = present_stations - expected_set  # Stations in data but not in metadata
+
+    if missing:
+        missing_pct = len(missing) / len(expected_set) * 100
+        return ValidationResult(
+            name="station_coverage",
+            passed=missing_pct < 5,  # Allow up to 5% missing
+            message=f"{len(missing)} of {len(expected_set)} expected stations missing ({missing_pct:.1f}%)",
+            details={
+                "missing_stations": sorted(missing)[:50],  # Cap at 50 for readability
+                "missing_count": len(missing),
+                "expected_count": len(expected_set),
+                "present_count": len(present_stations),
+                "extra_count": len(extra),
+            },
+        )
+
+    return ValidationResult(
+        name="station_coverage",
+        passed=True,
+        message=f"All {len(expected_set)} expected stations present",
+        details={
+            "expected_count": len(expected_set),
+            "present_count": len(present_stations),
+        },
+    )
+
+
+def validate_temporal_completeness(
+    gdf: gpd.GeoDataFrame,
+    max_gap_hours: int = 48,
+    min_observations_per_day: int = 12,
+) -> ValidationResult:
+    """Validate temporal completeness of observations.
+
+    Checks for stations with significant gaps or low observation counts.
+    ASOS stations typically report hourly (24 obs/day), so fewer than
+    min_observations_per_day suggests missing data.
+
+    Args:
+        gdf: GeoDataFrame with observation data
+        max_gap_hours: Maximum allowed gap between observations (hours)
+        min_observations_per_day: Minimum expected observations per day
+
+    Returns:
+        ValidationResult with gap details
+    """
+    if "station" not in gdf.columns or "valid" not in gdf.columns:
+        return ValidationResult(
+            name="temporal_completeness",
+            passed=False,
+            message="Missing 'station' or 'valid' column",
+        )
+
+    # Calculate date range
+    date_range = (gdf["valid"].max() - gdf["valid"].min()).days + 1
+    if date_range <= 0:
+        return ValidationResult(
+            name="temporal_completeness",
+            passed=True,
+            message="Single day of data, skipping gap check",
+        )
+
+    # Check observation density per station
+    station_stats = gdf.groupby("station").agg(
+        obs_count=("valid", "count"),
+        min_time=("valid", "min"),
+        max_time=("valid", "max"),
+    )
+
+    # Calculate days covered and expected observations
+    station_stats["days"] = (
+        (station_stats["max_time"] - station_stats["min_time"]).dt.days + 1
+    )
+    station_stats["obs_per_day"] = station_stats["obs_count"] / station_stats["days"]
+
+    # Find stations with low observation density
+    sparse_stations = station_stats[
+        station_stats["obs_per_day"] < min_observations_per_day
+    ]
+
+    # Sample check for large gaps (expensive, so only check subset)
+    large_gaps = []
+    sample_stations = gdf["station"].unique()[:100]  # Check up to 100 stations
+
+    for station in sample_stations:
+        station_data = gdf[gdf["station"] == station].sort_values("valid")
+        if len(station_data) < 2:
+            continue
+
+        time_diffs = station_data["valid"].diff().dropna()
+        max_gap = time_diffs.max()
+
+        if max_gap > pd.Timedelta(hours=max_gap_hours):
+            large_gaps.append({
+                "station": station,
+                "max_gap_hours": max_gap.total_seconds() / 3600,
+            })
+
+    issues = []
+    if len(sparse_stations) > 0:
+        sparse_pct = len(sparse_stations) / len(station_stats) * 100
+        issues.append(f"{len(sparse_stations)} stations ({sparse_pct:.1f}%) with <{min_observations_per_day} obs/day")
+
+    if large_gaps:
+        issues.append(f"{len(large_gaps)} stations with gaps >{max_gap_hours}h")
+
+    if issues:
+        return ValidationResult(
+            name="temporal_completeness",
+            passed=len(sparse_stations) / len(station_stats) < 0.1,  # <10% sparse is OK
+            message="; ".join(issues),
+            details={
+                "sparse_stations": sparse_stations.index.tolist()[:20],
+                "sparse_count": len(sparse_stations),
+                "large_gap_stations": large_gaps[:20],
+                "total_stations": len(station_stats),
+                "median_obs_per_day": float(station_stats["obs_per_day"].median()),
+            },
+        )
+
+    return ValidationResult(
+        name="temporal_completeness",
+        passed=True,
+        message=f"Good temporal coverage: median {station_stats['obs_per_day'].median():.1f} obs/day",
+        details={
+            "total_stations": len(station_stats),
+            "median_obs_per_day": float(station_stats["obs_per_day"].median()),
+        },
+    )
+
+
 def validate_metric_imperial_consistency(gdf: gpd.GeoDataFrame) -> ValidationResult:
     """Validate that metric and imperial values are consistent."""
     issues = []
@@ -473,6 +643,8 @@ def validate_geoparquet(
     path: Path | str,
     min_records: int = 1,
     min_stations: int = 1,
+    expected_stations: pd.DataFrame | None = None,
+    year: int | None = None,
 ) -> ValidationReport:
     """Run all validation checks on a geoparquet file.
 
@@ -480,6 +652,8 @@ def validate_geoparquet(
         path: Path to the geoparquet file
         min_records: Minimum expected record count
         min_stations: Minimum expected station count
+        expected_stations: Optional station metadata for coverage validation
+        year: Year of data (required if expected_stations provided)
 
     Returns:
         ValidationReport with all check results
@@ -533,5 +707,10 @@ def validate_geoparquet(
         validate_station_count(gdf, min_stations),
         validate_metric_imperial_consistency(gdf),
     ])
+
+    # Gap validation (if station metadata provided)
+    if expected_stations is not None and year is not None:
+        report.results.append(validate_station_coverage(gdf, expected_stations, year))
+        report.results.append(validate_temporal_completeness(gdf))
 
     return report
