@@ -1,4 +1,4 @@
-.PHONY: install test lint format backfill-r2 update-r2 validate query clean serve help
+.PHONY: install test lint format backfill upload update validate query clean serve help
 
 # Default target
 help:
@@ -9,11 +9,11 @@ help:
 	@echo "  make install          Install dependencies"
 	@echo ""
 	@echo "Data:"
-	@echo "  make backfill-r2      Backfill historical data to R2 (resumes automatically)"
-	@echo "  make update-r2        Incremental update (for hourly cron)"
-	@echo "  make validate         Validate R2 data for gaps and quality issues"
-	@echo "  make query            Run example queries against R2 data"
-	@echo "  make clear-r2         Clear all data from R2 bucket"
+	@echo "  make backfill         Backfill historical data to local parquet files"
+	@echo "  make update           Incremental update (for hourly cron)"
+	@echo "  make upload           Upload local data to S3 (configure script first)"
+	@echo "  make validate         Validate data for gaps and quality issues"
+	@echo "  make query            Run example queries against data"
 	@echo ""
 	@echo "Development:"
 	@echo "  make serve            Serve viewer.html on localhost:3000"
@@ -25,11 +25,11 @@ help:
 	@echo "  make clean            Remove generated files"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make backfill-r2 START=2020-01-01"
-	@echo "  make backfill-r2 STATES=CA,TX START=2024-01-01"
-	@echo "  make backfill-r2 CHUNK_MONTHS=1  # Monthly chunks (less memory)"
-	@echo "  make update-r2 LOOKBACK=6        # Fetch last 6 hours"
-	@echo "  make validate YEAR=2023          # Validate specific year"
+	@echo "  make backfill START=2020-01-01"
+	@echo "  make backfill STATES=CA,TX START=2024-01-01"
+	@echo "  make backfill CHUNK_MONTHS=1  # Monthly chunks (less memory)"
+	@echo "  make update LOOKBACK=6        # Fetch last 6 hours"
+	@echo "  make validate YEAR=2023       # Validate specific year"
 
 # Setup
 install:
@@ -52,28 +52,28 @@ START ?=
 END ?=
 CHUNK_MONTHS ?= 12
 
-# R2 backfill (resumes automatically if no START specified)
+# Backfill to local parquet files
 # Logs are automatically saved to logs/backfill-{timestamp}.log
-backfill-r2:
-ifdef START
-	uv run python scripts/backfill_r2.py --start $(START) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS)
-else
-	uv run python scripts/backfill_r2.py --resume --chunk-months $(CHUNK_MONTHS)
-endif
+backfill:
+	uv run python scripts/backfill.py $(if $(START),--start $(START)) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS)
 
 # Incremental update for hourly cron
 # Logs are automatically saved to logs/update-{timestamp}.log
 LOOKBACK ?= 2
-update-r2:
-	uv run python scripts/update_r2.py --lookback $(LOOKBACK) $(if $(STATES),--states $(STATES))
+update:
+	uv run python scripts/update.py --lookback $(LOOKBACK) $(if $(STATES),--states $(STATES))
 
-# Validate R2 data for gaps and quality issues
+# Upload local data to S3 (configure scripts/upload_s3.sh first)
+upload:
+	./scripts/upload_s3.sh
+
+# Validate data for gaps and quality issues
 YEAR ?=
 validate:
 ifdef YEAR
-	uv run python scripts/validate_r2.py --year $(YEAR) --verbose
+	uv run python scripts/validate.py --year $(YEAR) --verbose
 else
-	uv run python scripts/validate_r2.py --verbose
+	uv run python scripts/validate.py --verbose
 endif
 
 # Run example queries
@@ -84,10 +84,6 @@ query:
 clean:
 	rm -rf .pytest_cache __pycache__ .ruff_cache .coverage data/ logs/
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-
-clear-r2:
-	@echo "Clearing all data from R2 bucket..."
-	@bash -c 'source .env && AWS_ACCESS_KEY_ID=$$R2_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$$R2_SECRET_ACCESS_KEY aws s3 rm s3://dev/asos --recursive --endpoint-url https://$$R2_ACCOUNT_ID.r2.cloudflarestorage.com'
 
 # Development
 serve:
