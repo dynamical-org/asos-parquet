@@ -56,11 +56,11 @@ def fetch_station_observations(
     end_date: pd.Timestamp,
     state: str | None = None,
 ) -> pd.DataFrame | None:
-    """Fetch observation data for a single station with retry on 503.
+    """Fetch observation data for a single station with retry on server errors.
 
-    Retries indefinitely on 503 errors (server overload) with exponential
-    backoff capped at MAX_BACKOFF seconds. This ensures no gaps in data
-    due to transient server issues.
+    Retries indefinitely on 500/503 errors (internal server error/overload)
+    with exponential backoff capped at MAX_BACKOFF seconds. This ensures no
+    gaps in data due to transient server issues.
 
     Args:
         station_id: ASOS station identifier
@@ -122,11 +122,13 @@ def fetch_station_observations(
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
                 return None
-            if e.response is not None and e.response.status_code == 503:
+            if e.response is not None and e.response.status_code in (500, 503):
+                # Retry on server errors (500 = internal error, 503 = overload)
                 # Exponential backoff capped at MAX_BACKOFF
                 wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+                status_code = e.response.status_code
                 if attempt == 0:
-                    print(f"[503] {station_id}: server overloaded, retrying...", end="", flush=True)
+                    print(f"[{status_code}] {station_id}: server error, retrying...", end="", flush=True)
                 elif attempt % 5 == 0:
                     # Periodic status update every 5 retries
                     print(f" (attempt {attempt + 1}, waiting {wait_time:.0f}s)", end="", flush=True)
