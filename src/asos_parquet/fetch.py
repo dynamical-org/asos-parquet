@@ -1,5 +1,6 @@
 """Observation data fetching from Iowa Mesonet."""
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from .config import (
     DATA_FIELDS,
@@ -246,19 +249,22 @@ def fetch_station_observations(
                 status_code = e.response.status_code
                 attempt += 1
 
+                # Log retry attempt
+                logger.warning(f"{station_id}: {status_code} error, retry {attempt} (waiting {wait_time:.0f}s)")
+
                 # Update status via callback or print
                 if status_callback:
                     status_callback(station_id, f"retry {attempt}", attempt)
-                else:
-                    if attempt == 1:
-                        print(f"[{status_code}] {station_id}: server error, retrying...", end="", flush=True)
-                    elif attempt % 5 == 0:
-                        print(f" (attempt {attempt}, waiting {wait_time:.0f}s)", end="", flush=True)
+                elif attempt == 1:
+                    print(f"[{status_code}] {station_id}: server error, retrying...", end="", flush=True)
+                elif attempt % 5 == 0:
+                    print(f" (attempt {attempt}, waiting {wait_time:.0f}s)", end="", flush=True)
 
                 time.sleep(wait_time)
                 continue
             raise
         except Exception as e:
+            logger.warning(f"{station_id}: {e}")
             if status_callback:
                 status_callback(station_id, "error", 0)
             else:
@@ -380,6 +386,7 @@ def _fetch_with_rich_display(
                     else:
                         progress.complete_request(station_id, success=False)
                 except Exception as e:
+                    logger.warning(f"{station_id}: {e}")
                     progress.add_warning(f"[warning] {station_id}: {e}")
                     progress.complete_request(station_id, success=False)
 
