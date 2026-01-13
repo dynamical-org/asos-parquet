@@ -48,7 +48,7 @@ format:
 STATES ?=
 START ?=
 END ?=
-CHUNK_MONTHS ?= 6
+CHUNK_MONTHS ?= 12
 
 # R2 backfill (resumes automatically if no START specified)
 # Logs are automatically saved to logs/backfill-{timestamp}.log
