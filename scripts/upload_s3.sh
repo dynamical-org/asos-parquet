@@ -51,6 +51,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+AWS_DRY_RUN_ARGS=()
+if [ -n "$DRY_RUN" ]; then
+    AWS_DRY_RUN_ARGS=("$DRY_RUN")
+fi
+
 # Validate configuration
 if [ -z "$S3_BUCKET" ]; then
     echo "Error: S3_BUCKET not set"
@@ -105,11 +110,11 @@ if [ -n "$YEAR" ]; then
     fi
 
     echo "Uploading year=$YEAR..."
-    aws "${AWS_ENDPOINT_ARGS[@]}" s3 cp $DRY_RUN "$DATA_FILE" "s3://$S3_BUCKET/$S3_PREFIX/year=$YEAR/data.parquet"
+    aws "${AWS_ENDPOINT_ARGS[@]}" s3 cp "${AWS_DRY_RUN_ARGS[@]}" "$DATA_FILE" "s3://$S3_BUCKET/$S3_PREFIX/year=$YEAR/data.parquet"
 else
     # Upload all partitions - only data.parquet files
     echo "Uploading all partitions..."
-    aws "${AWS_ENDPOINT_ARGS[@]}" s3 sync $DRY_RUN "$DATA_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
+    aws "${AWS_ENDPOINT_ARGS[@]}" s3 sync "${AWS_DRY_RUN_ARGS[@]}" "$DATA_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
         --exclude "*" \
         --include "*/data.parquet"
 fi
