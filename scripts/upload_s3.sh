@@ -23,8 +23,14 @@ fi
 
 # Defaults
 S3_PREFIX="${S3_PREFIX:-asos}"
+S3_ENDPOINT_URL="${S3_ENDPOINT_URL:-}"
 DRY_RUN=""
 YEAR=""
+
+AWS_ENDPOINT_ARGS=()
+if [ -n "$S3_ENDPOINT_URL" ]; then
+    AWS_ENDPOINT_ARGS=(--endpoint-url "$S3_ENDPOINT_URL")
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -53,10 +59,18 @@ if [ -z "$S3_BUCKET" ]; then
 fi
 
 # Check AWS credentials
-if ! aws sts get-caller-identity &>/dev/null; then
-    echo "Error: AWS credentials not configured"
-    echo "Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-    exit 1
+if [ -n "$S3_ENDPOINT_URL" ]; then
+    if ! aws "${AWS_ENDPOINT_ARGS[@]}" s3 ls "s3://$S3_BUCKET" &>/dev/null; then
+        echo "Error: S3-compatible credentials not configured"
+        echo "Check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and S3_ENDPOINT_URL"
+        exit 1
+    fi
+else
+    if ! aws sts get-caller-identity &>/dev/null; then
+        echo "Error: AWS credentials not configured"
+        echo "Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        exit 1
+    fi
 fi
 
 # Check local data exists
@@ -91,11 +105,11 @@ if [ -n "$YEAR" ]; then
     fi
 
     echo "Uploading year=$YEAR..."
-    aws s3 cp $DRY_RUN "$DATA_FILE" "s3://$S3_BUCKET/$S3_PREFIX/year=$YEAR/data.parquet"
+    aws "${AWS_ENDPOINT_ARGS[@]}" s3 cp $DRY_RUN "$DATA_FILE" "s3://$S3_BUCKET/$S3_PREFIX/year=$YEAR/data.parquet"
 else
     # Upload all partitions - only data.parquet files
     echo "Uploading all partitions..."
-    aws s3 sync $DRY_RUN "$DATA_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
+    aws "${AWS_ENDPOINT_ARGS[@]}" s3 sync $DRY_RUN "$DATA_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
         --exclude "*" \
         --include "*/data.parquet"
 fi
@@ -107,4 +121,4 @@ echo "Upload complete!"
 # Show what's in S3
 echo ""
 echo "S3 contents:"
-aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/" --recursive --human-readable | head -20
+aws "${AWS_ENDPOINT_ARGS[@]}" s3 ls "s3://$S3_BUCKET/$S3_PREFIX/" --recursive --human-readable | head -20

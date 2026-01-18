@@ -32,8 +32,14 @@ fi
 
 # Defaults
 S3_PREFIX="${S3_PREFIX:-asos}"
+S3_ENDPOINT_URL="${S3_ENDPOINT_URL:-}"
 LOOKBACK=2
 KEEP_LOCAL=""
+
+AWS_ENDPOINT_ARGS=()
+if [ -n "$S3_ENDPOINT_URL" ]; then
+    AWS_ENDPOINT_ARGS=(--endpoint-url "$S3_ENDPOINT_URL")
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -86,6 +92,9 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ASOS Update Started"
 echo "  Year:     $CURRENT_YEAR"
 echo "  Lookback: $LOOKBACK hours"
 echo "  S3:       s3://$S3_BUCKET/$S3_KEY"
+if [ -n "$S3_ENDPOINT_URL" ]; then
+    echo "  Endpoint: $S3_ENDPOINT_URL"
+fi
 echo "========================================"
 
 # Create local directory
@@ -94,7 +103,7 @@ mkdir -p "$PARTITION_DIR"
 # Step 1: Download existing data from S3 (if exists)
 echo ""
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading existing data from S3..."
-if aws s3 cp "s3://$S3_BUCKET/$S3_KEY" "$PARTITION_DIR/data.parquet" 2>/dev/null; then
+if aws "${AWS_ENDPOINT_ARGS[@]}" s3 cp "s3://$S3_BUCKET/$S3_KEY" "$PARTITION_DIR/data.parquet" 2>/dev/null; then
     EXISTING_SIZE=$(ls -lh "$PARTITION_DIR/data.parquet" | awk '{print $5}')
     echo "  Downloaded existing partition ($EXISTING_SIZE)"
 else
@@ -157,7 +166,7 @@ else:
     # Step 4: Upload to S3
     echo ""
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Uploading to S3..."
-    aws s3 cp "$PARTITION_DIR/data.parquet" "s3://$S3_BUCKET/$S3_KEY"
+    aws "${AWS_ENDPOINT_ARGS[@]}" s3 cp "$PARTITION_DIR/data.parquet" "s3://$S3_BUCKET/$S3_KEY"
 
     NEW_SIZE=$(ls -lh "$PARTITION_DIR/data.parquet" | awk '{print $5}')
     echo "  Uploaded year=$CURRENT_YEAR ($NEW_SIZE)"
