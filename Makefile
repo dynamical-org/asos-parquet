@@ -30,7 +30,8 @@ help:
 	@echo "  make backfill CHUNK_MONTHS=36  # 3-year chunks (fewer API calls)"
 	@echo "  make backfill CHUNK_MONTHS=12  # 1-year chunks (less memory)"
 	@echo "  make update LOOKBACK=6         # Fetch last 6 hours"
-	@echo "  make validate YEAR=2023        # Validate specific year"
+	@echo "  make validate YEAR=2023        # Validate specific year in S3"
+	@echo "  make validate LOCAL=data/asos  # Validate local data directory"
 
 # Setup
 install:
@@ -70,12 +71,9 @@ upload:
 
 # Validate data for gaps and quality issues
 YEAR ?=
+LOCAL ?=
 validate:
-ifdef YEAR
-	uv run python scripts/validate.py --year $(YEAR) --verbose
-else
-	uv run python scripts/validate.py --verbose
-endif
+	uv run python scripts/validate.py $(if $(LOCAL),--local $(LOCAL)) $(if $(YEAR),--year $(YEAR)) --verbose
 
 # Run example queries
 query:
