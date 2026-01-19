@@ -56,10 +56,10 @@ def setup_logging() -> Path:
 
 
 def merge_partition_files(partition_dir: Path) -> Path | None:
-    """Merge all parquet part files in a partition using DuckDB streaming.
+    """Merge all parquet part files in a partition into a GeoParquet file.
 
-    This avoids loading all files into memory at once by using DuckDB's
-    streaming COPY command.
+    Uses DuckDB for efficient reading/merging, then writes with geopandas
+    to produce proper GeoParquet with geo metadata.
 
     Args:
         partition_dir: Directory containing part-*.parquet files
@@ -67,34 +67,44 @@ def merge_partition_files(partition_dir: Path) -> Path | None:
     Returns:
         Path to merged data.parquet file, or None if no files
     """
+    import geopandas as gpd
+    from shapely.geometry import Point
+
     part_files = list(partition_dir.glob("part-*.parquet"))
+    data_file = partition_dir / "data.parquet"
+
     if not part_files:
         # Check if data.parquet already exists
-        data_file = partition_dir / "data.parquet"
         return data_file if data_file.exists() else None
 
-    if len(part_files) == 1:
-        # Single file - just rename it
-        data_file = partition_dir / "data.parquet"
+    if len(part_files) == 1 and not data_file.exists():
+        # Single file, no existing data - just rename it
         part_files[0].rename(data_file)
         return data_file
 
-    # Multiple files - use DuckDB to stream-merge
-    # This reads and writes in chunks, avoiding full memory load
-    glob_pattern = str(partition_dir / "part-*.parquet")
-    data_file = partition_dir / "data.parquet"
+    # Merge files with DuckDB (efficient for large datasets), write as GeoParquet
+    glob_pattern = str(partition_dir / "*.parquet")  # Include data.parquet if exists
 
     conn = duckdb.connect()
     try:
-        # Use COPY to stream data through without loading all into memory
-        conn.execute(f"""
-            COPY (
-                SELECT * FROM read_parquet('{glob_pattern}')
-                ORDER BY station, valid
-            ) TO '{data_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
+        df = conn.execute(f"""
+            SELECT DISTINCT * FROM read_parquet('{glob_pattern}')
+            ORDER BY station, valid
+        """).fetchdf()
     finally:
         conn.close()
+
+    # Convert to GeoDataFrame
+    geometry = [
+        Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
+        for lon, lat in zip(df["longitude"], df["latitude"])
+    ]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+
+    # Write as GeoParquet (atomic via temp file)
+    tmp_file = data_file.with_suffix(".parquet.tmp")
+    gdf.to_parquet(tmp_file, compression="zstd", index=False)
+    tmp_file.rename(data_file)
 
     # Remove part files after successful merge
     for f in part_files:

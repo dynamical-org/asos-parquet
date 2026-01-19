@@ -115,7 +115,10 @@ if [ "$PART_COUNT" -gt 0 ]; then
 
     uv run python -c "
 import duckdb
+import geopandas as gpd
+import pandas as pd
 from pathlib import Path
+from shapely.geometry import Point
 
 partition_dir = Path('$PARTITION_DIR')
 part_files = list(partition_dir.glob('part-*.parquet'))
@@ -129,22 +132,26 @@ elif len(part_files) == 1 and not has_existing:
     part_files[0].rename(data_file)
     print(f'  Created data.parquet from single part file')
 else:
-    # Merge existing + new, deduplicate by (station, valid)
+    # Merge existing + new with DuckDB, write as GeoParquet
     glob_pattern = str(partition_dir / '*.parquet')
     conn = duckdb.connect()
-    conn.execute(f'''
-        COPY (
-            SELECT * FROM (
-                SELECT DISTINCT ON (station, valid) *
-                FROM read_parquet('{glob_pattern}')
-                ORDER BY station, valid
-            )
-        ) TO '{data_file}.tmp' (FORMAT PARQUET, COMPRESSION ZSTD)
-    ''')
+    df = conn.execute(f'''
+        SELECT DISTINCT * FROM read_parquet('{glob_pattern}')
+        ORDER BY station, valid
+    ''').fetchdf()
     conn.close()
 
-    # Atomic replace
-    Path(f'{data_file}.tmp').rename(data_file)
+    # Convert to GeoDataFrame
+    geometry = [
+        Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
+        for lon, lat in zip(df['longitude'], df['latitude'])
+    ]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+
+    # Write as GeoParquet (atomic)
+    tmp_file = data_file.with_suffix('.parquet.tmp')
+    gdf.to_parquet(tmp_file, compression='zstd', index=False)
+    tmp_file.rename(data_file)
 
     # Remove part files
     for f in part_files:
