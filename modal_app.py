@@ -16,9 +16,7 @@ Cost estimate (hourly runs):
 
 import logging
 import os
-import subprocess
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from pathlib import Path
 
 import modal
@@ -29,7 +27,6 @@ app = modal.App("asos-parquet-update")
 # Image with all dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git")
     .pip_install(
         "geopandas>=1.0.0",
         "pandas>=2.0.0",
@@ -38,9 +35,14 @@ image = (
         "tqdm>=4.66.0",
         "shapely>=2.0.0",
         "boto3>=1.34.0",
-        "duckdb>=1.4.3",
         "rich>=13.0.0",
     )
+)
+
+# Mount local source code
+src_mount = modal.Mount.from_local_dir(
+    local_path=Path(__file__).parent / "src",
+    remote_path="/root/src",
 )
 
 # Configure logging
@@ -51,144 +53,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def fetch_all_stations(states: list[str], online_only: bool = True):
-    """Fetch station metadata from Iowa Mesonet."""
-    import pandas as pd
-    import requests
-
-    all_stations = []
-    for state in states:
-        url = f"https://mesonet.agron.iastate.edu/geojson/network/{state}_ASOS.geojson"
-        try:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-
-            for feature in data.get("features", []):
-                props = feature.get("properties", {})
-                coords = feature.get("geometry", {}).get("coordinates", [None, None])
-
-                station = {
-                    "station": props.get("sid", ""),
-                    "name": props.get("sname", ""),
-                    "state": state,
-                    "longitude": coords[0],
-                    "latitude": coords[1],
-                    "elevation": props.get("elevation"),
-                    "online": props.get("online", False),
-                }
-                all_stations.append(station)
-        except Exception as e:
-            logger.warning(f"Failed to fetch stations for {state}: {e}")
-
-    df = pd.DataFrame(all_stations)
-    if online_only and not df.empty:
-        df = df[df["online"] == True]
-    return df
-
-
-def fetch_station_observations(
-    station_id: str,
-    start_date,
-    end_date,
-    state: str,
-) -> "pd.DataFrame | None":
-    """Fetch observations for a single station."""
-    import pandas as pd
-    import requests
-    from io import StringIO
-
-    DATA_FIELDS = [
-        "tmpf", "dwpf", "relh", "drct", "sknt", "gust", "alti", "mslp",
-        "vsby", "p01i", "metar", "skyc1", "skyc2", "skyc3", "skyc4",
-        "skyl1", "skyl2", "skyl3", "skyl4", "wxcodes", "ice_accretion_1hr",
-        "ice_accretion_3hr", "ice_accretion_6hr", "peak_wind_gust",
-        "peak_wind_drct", "peak_wind_time", "feel", "snowdepth",
-        "tmpc", "dwpc", "p01m",
-    ]
-
-    sts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-    ets = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-    data_params = "&".join(f"data={field}" for field in DATA_FIELDS)
-
-    url = (
-        f"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-        f"?station={station_id}&sts={sts}&ets={ets}"
-        f"&{data_params}&tz=UTC&format=onlycomma&latlon=yes&elev=no&missing=empty"
-    )
-
-    try:
-        resp = requests.get(url, timeout=120)
-        resp.raise_for_status()
-
-        if "No results found" in resp.text or len(resp.text.strip()) < 50:
-            return None
-
-        df = pd.read_csv(StringIO(resp.text), low_memory=False)
-        if df.empty or "valid" not in df.columns:
-            return None
-
-        df["valid"] = pd.to_datetime(df["valid"], format="%Y-%m-%d %H:%M", utc=True)
-        df["state"] = state
-
-        if "lon" in df.columns:
-            df = df.rename(columns={"lon": "longitude", "lat": "latitude"})
-
-        numeric_cols = [
-            "tmpf", "tmpc", "dwpf", "dwpc", "relh", "drct",
-            "sknt", "gust", "alti", "mslp", "vsby", "p01i", "p01m",
-            "longitude", "latitude",
-        ]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        if "tmpf" in df.columns:
-            df = df[df["tmpf"].notna()]
-
-        return df if not df.empty else None
-
-    except Exception as e:
-        logger.warning(f"{station_id}: {e}")
-        return None
-
-
-def fetch_observations_batch(stations, start_date, end_date):
-    """Fetch observations for multiple stations concurrently."""
-    import pandas as pd
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    station_list = stations[["station", "state"]].drop_duplicates().to_dict("records")
-    all_observations = []
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(
-                fetch_station_observations,
-                row["station"],
-                start_date,
-                end_date,
-                row["state"],
-            ): row
-            for row in station_list
-        }
-
-        for future in as_completed(futures):
-            try:
-                df = future.result()
-                if df is not None and not df.empty:
-                    all_observations.append(df)
-            except Exception as e:
-                row = futures[future]
-                logger.warning(f"{row['station']}: {e}")
-
-    if not all_observations:
-        return pd.DataFrame()
-    return pd.concat(all_observations, ignore_index=True)
-
-
 @app.function(
     image=image,
+    mounts=[src_mount],
     secrets=[modal.Secret.from_name("aws-asos")],
     timeout=1800,  # 30 minutes max
     schedule=modal.Cron("5 * * * *"),  # Run at minute 5 of every hour
@@ -204,20 +71,17 @@ def update_asos_data(lookback_hours: int = 2):
     3. Merges new data with existing
     4. Uploads back to S3
     """
+    import sys
+    sys.path.insert(0, "/root/src")
+
     import boto3
-    import duckdb
     import geopandas as gpd
     import pandas as pd
-    from shapely.geometry import Point
 
-    # US state codes
-    US_STATES = [
-        "AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DE", "FL", "GA",
-        "HI", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD",
-        "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH",
-        "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC",
-        "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY",
-    ]
+    from asos_parquet.config import US_STATES
+    from asos_parquet.fetch import fetch_observations_batch
+    from asos_parquet.load import merge_observations, observations_to_geoparquet
+    from asos_parquet.stations import fetch_all_stations
 
     # Configuration from environment
     s3_bucket = os.environ.get("S3_BUCKET")
@@ -248,10 +112,12 @@ def update_asos_data(lookback_hours: int = 2):
     s3 = boto3.client("s3")
 
     # Step 1: Download existing data from S3 (if exists)
+    existing_gdf = None
     logger.info("Downloading existing data from S3...")
     try:
         s3.download_file(s3_bucket, s3_key, str(data_file))
-        logger.info(f"Downloaded existing partition ({data_file.stat().st_size / 1024 / 1024:.1f} MB)")
+        existing_gdf = gpd.read_parquet(data_file)
+        logger.info(f"Downloaded existing partition ({len(existing_gdf):,} records)")
     except s3.exceptions.ClientError as e:
         if e.response["Error"]["Code"] == "404":
             logger.info(f"No existing data for year={current_year} (starting fresh)")
@@ -273,6 +139,7 @@ def update_asos_data(lookback_hours: int = 2):
         stations,
         pd.Timestamp(lookback_start),
         pd.Timestamp(now),
+        show_progress=False,  # No terminal in Modal
     )
 
     if observations.empty:
@@ -281,63 +148,21 @@ def update_asos_data(lookback_hours: int = 2):
 
     logger.info(f"Fetched {len(observations):,} observations")
 
-    # Step 4: Write new observations to part file
-    part_file = partition_dir / f"part-{now.strftime('%Y%m%d%H%M%S')}.parquet"
+    # Step 4: Merge with existing data
+    merged_gdf = merge_observations(existing_gdf, observations)
+    logger.info(f"Merged data: {len(merged_gdf):,} total records")
 
-    # Convert to GeoDataFrame
-    geometry = [
-        Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
-        for lon, lat in zip(observations["longitude"], observations["latitude"])
-    ]
-    gdf = gpd.GeoDataFrame(observations, geometry=geometry, crs="EPSG:4326")
-    gdf.to_parquet(part_file, compression="zstd", index=False)
-    logger.info(f"Wrote part file: {part_file.name}")
+    # Step 5: Write to local file
+    tmp_file = data_file.with_suffix(".parquet.tmp")
+    merged_gdf.to_parquet(tmp_file, compression="zstd", index=False)
+    tmp_file.rename(data_file)
+    logger.info(f"Wrote {data_file.name}")
 
-    # Step 5: Merge all parquet files
-    part_files = list(partition_dir.glob("part-*.parquet"))
-    has_existing = data_file.exists()
-
-    if part_files:
-        logger.info(f"Merging {len(part_files)} part files...")
-
-        if len(part_files) == 1 and not has_existing:
-            # First data for this year - just rename
-            part_files[0].rename(data_file)
-            logger.info("Created data.parquet from single part file")
-        else:
-            # Merge with DuckDB
-            glob_pattern = str(partition_dir / "*.parquet")
-            conn = duckdb.connect()
-            df = conn.execute(f"""
-                SELECT DISTINCT * FROM read_parquet('{glob_pattern}')
-                ORDER BY station, valid
-            """).fetchdf()
-            conn.close()
-
-            # Convert to GeoDataFrame
-            geometry = [
-                Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
-                for lon, lat in zip(df["longitude"], df["latitude"])
-            ]
-            merged_gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
-
-            # Write as GeoParquet (atomic)
-            tmp_file = data_file.with_suffix(".parquet.tmp")
-            merged_gdf.to_parquet(tmp_file, compression="zstd", index=False)
-            tmp_file.rename(data_file)
-
-            # Remove part files
-            for f in part_files:
-                f.unlink()
-
-            action = "Merged with existing" if has_existing else "Merged"
-            logger.info(f"{action} data.parquet ({len(part_files)} part files)")
-
-        # Step 6: Upload to S3
-        logger.info("Uploading to S3...")
-        s3.upload_file(str(data_file), s3_bucket, s3_key)
-        file_size = data_file.stat().st_size / 1024 / 1024
-        logger.info(f"Uploaded year={current_year} ({file_size:.1f} MB)")
+    # Step 6: Upload to S3
+    logger.info("Uploading to S3...")
+    s3.upload_file(str(data_file), s3_bucket, s3_key)
+    file_size = data_file.stat().st_size / 1024 / 1024
+    logger.info(f"Uploaded year={current_year} ({file_size:.1f} MB)")
 
     logger.info("=" * 60)
     logger.info("ASOS UPDATE COMPLETE")
@@ -346,7 +171,8 @@ def update_asos_data(lookback_hours: int = 2):
     return {
         "status": "success",
         "observations": len(observations),
-        "file_size_mb": round(data_file.stat().st_size / 1024 / 1024, 2),
+        "total_records": len(merged_gdf),
+        "file_size_mb": round(file_size, 2),
     }
 
 
@@ -358,5 +184,4 @@ def main(lookback: int = 2):
 
 
 if __name__ == "__main__":
-    # For local testing with modal run
     main()

@@ -13,11 +13,13 @@ ASOS Parquet is a data pipeline that fetches historical and near-real-time ASOS 
 make install              # Install all dependencies (uses uv)
 
 # Data pipeline
-make backfill START=2020-01-01                    # Backfill from date
-make backfill STATES=CA,TX CHUNK_MONTHS=24        # Specific states, 2-year chunks
-make update LOOKBACK=6                            # Incremental update (last N hours)
-make upload                                       # Upload to S3 (configure script first)
-make validate YEAR=2023                           # Validate specific year
+make load                           # Load all years (1940-present) with progress tracking
+make load YEAR=2023                 # Load specific year
+make load START_YEAR=2000           # Load from specific year
+make load RESUME=1                  # Resume from progress.json
+make upload                         # Upload to S3 (configure script first)
+make validate                       # Validate all local data
+make validate YEAR=2023             # Validate specific year
 
 # Development
 make test                 # Run all tests
@@ -31,28 +33,32 @@ uv run pytest tests/test_validation.py::TestValidateSchema -v  # Run single test
 
 ### Data Flow
 ```
-Iowa Mesonet API  →  fetch.py  →  partitioned.py  →  data/asos/year=YYYY/data.parquet
-                                                              ↓
-                                                     upload_s3.sh  →  S3
+Iowa Mesonet API  →  fetch.py  →  load.py  →  data/asos/year=YYYY/data.parquet
+                                                        ↓
+                                               upload_s3.sh  →  S3
+                                                        ↓
+                                               Modal (hourly)  →  S3 updates
 ```
 
 ### Module Responsibilities
 
 - **`src/asos_parquet/fetch.py`**: Concurrent HTTP fetching from Iowa Mesonet with exponential backoff retry, Rich progress display for terminal, tqdm fallback for piped output
-- **`src/asos_parquet/partitioned.py`**: Year-partitioned GeoParquet I/O with Hive-style naming (`year=YYYY`), handles multi-year chunks by splitting data into appropriate partitions
+- **`src/asos_parquet/load.py`**: Core loading functions - year-by-year loading, observation merging, GeoParquet conversion
+- **`src/asos_parquet/progress.py`**: Progress tracking for resumable year-by-year loading (persisted to `data/progress.json`)
+- **`src/asos_parquet/partitioned.py`**: Year-partitioned GeoParquet reading with Hive-style naming (`year=YYYY`)
 - **`src/asos_parquet/stations.py`**: Station metadata fetching from Mesonet GeoJSON endpoints
 - **`src/asos_parquet/validation.py`**: Comprehensive validation suite (schema, physical bounds, temporal completeness, station coverage, metric/imperial consistency)
-- **`src/asos_parquet/r2.py`**: Legacy R2 upload operations (prefer `scripts/upload_s3.sh`)
-- **`src/asos_parquet/parquet.py`**: Single-file GeoParquet operations (legacy, prefer partitioned.py)
 - **`src/asos_parquet/config.py`**: API endpoints, rate limits, data fields, US state codes
 
 ### Key Scripts
 
-- **`scripts/backfill.py`**: Full historical backfill with configurable chunk sizes, DuckDB-based partition merging
-- **`scripts/update.py`**: Incremental updates (fetches recent observations, writes part files)
-- **`scripts/cron-update.sh`**: Cron wrapper that runs update, merges partitions, uploads to S3 (with locking)
+- **`scripts/load.py`**: Year-by-year historical loading with progress tracking and validation
+- **`scripts/validate.py`**: Data validation for local partitions
 - **`scripts/upload_s3.sh`**: S3 sync with `--year` and `--dry-run` support
-- **`scripts/validate.py`**: Data validation for gap detection
+
+### Modal Deployment
+
+- **`modal_app.py`**: Serverless hourly updates - downloads current year from S3, fetches new observations, merges, uploads back
 
 ### Partitioning Strategy
 
@@ -77,26 +83,20 @@ Rate limiting is defined in `config.py`:
 
 ## Deployment
 
-See `deploy/README.md` for full server deployment guide.
-
-**Architecture:** The server needs no local backfill - it downloads the current year from S3, merges new observations, and uploads back. Only ~500MB temp space required.
+See `deploy/README.md` for Modal deployment guide.
 
 **Quick start:**
 ```bash
-# Local machine: backfill and upload to S3
-make backfill START=1928-01-01
-./scripts/upload_s3.sh
+# Local machine: load and upload to S3
+make load                    # Full historical load (1940-present)
+./scripts/upload_s3.sh       # Upload to S3
 
-# Server (serveserve.local): just install and set up cron
-git clone <repo> /opt/asos-parquet && cd /opt/asos-parquet
-make install
-cp .env.example .env && nano .env  # Set S3_BUCKET, AWS creds
-crontab deploy/crontab.example
+# Deploy Modal for hourly updates
+pip install modal
+modal setup
+modal secret create aws-asos AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=xxx AWS_DEFAULT_REGION=us-west-2 S3_BUCKET=your-bucket
+modal deploy modal_app.py
 ```
-
-**Cron scripts:**
-- `scripts/cron-update.sh`: Downloads current year from S3 → fetches new obs → merges → uploads (with locking, cleans up local files)
-- `scripts/upload_s3.sh`: Manual S3 sync (supports `--year` and `--dry-run`)
 
 ## Code Patterns
 
