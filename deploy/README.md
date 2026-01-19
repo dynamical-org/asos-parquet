@@ -1,8 +1,78 @@
 # Deployment Guide
 
-Deploy ASOS Parquet to a local server for continuous data updates.
+Deploy ASOS Parquet for continuous data updates. Two options available:
 
-## Prerequisites
+1. **Modal (recommended)** - Serverless, $0/month (free tier), zero maintenance
+2. **Self-hosted server** - Traditional cron on your own server
+
+---
+
+## Option 1: Modal (Recommended)
+
+Modal is a serverless platform that runs Python functions in the cloud. The free tier ($30/month credits) covers this workload entirely.
+
+### Estimated Monthly Cost
+
+| Resource | Usage | Cost |
+|----------|-------|------|
+| CPU (1 core) | ~10 min × 720 runs | ~$5.60 |
+| Memory (2GB) | ~10 min × 720 runs | ~$1.90 |
+| **Total** | | **~$7.50** |
+
+With the **$30/month free tier**, this costs **$0/month**.
+
+### Setup
+
+```bash
+# 1. Install Modal CLI
+pip install modal
+
+# 2. Authenticate (opens browser)
+modal setup
+
+# 3. Create secrets with your AWS credentials
+modal secret create aws-asos \
+    AWS_ACCESS_KEY_ID=your_access_key \
+    AWS_SECRET_ACCESS_KEY=your_secret_key \
+    AWS_DEFAULT_REGION=us-east-1 \
+    S3_BUCKET=your-bucket-name \
+    S3_PREFIX=asos
+
+# 4. Deploy (runs hourly at minute 5)
+modal deploy modal_app.py
+```
+
+### Testing
+
+```bash
+# Run once manually (without waiting for schedule)
+modal run modal_app.py --lookback 2
+
+# View logs
+modal app logs asos-parquet-update
+
+# Check deployment status
+modal app list
+```
+
+### Updating
+
+```bash
+# Redeploy after code changes
+modal deploy modal_app.py
+```
+
+### Monitoring
+
+View runs and logs in the Modal dashboard: https://modal.com/apps
+
+---
+
+## Option 2: Self-Hosted Server
+
+Traditional deployment to your own server with cron.
+
+### Prerequisites
 
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv) package manager
@@ -10,7 +80,7 @@ Deploy ASOS Parquet to a local server for continuous data updates.
 - AWS credentials with S3 read/write access
 - ~500MB temp disk space (downloads one year at a time)
 
-## Architecture
+### Architecture
 
 The update script works directly with S3 - no local backfill storage needed:
 
