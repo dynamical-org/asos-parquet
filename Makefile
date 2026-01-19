@@ -1,4 +1,4 @@
-.PHONY: install test lint format backfill upload update validate query clean serve help
+.PHONY: install test lint format load upload validate query clean serve help
 
 # Default target
 help:
@@ -9,8 +9,7 @@ help:
 	@echo "  make install          Install dependencies"
 	@echo ""
 	@echo "Data:"
-	@echo "  make backfill         Backfill historical data to local parquet files"
-	@echo "  make update           Incremental update (for hourly cron)"
+	@echo "  make load             Load historical data year by year (1940-present)"
 	@echo "  make upload           Upload local data to S3 (configure script first)"
 	@echo "  make validate         Validate data for gaps and quality issues"
 	@echo "  make query            Run example queries against data"
@@ -25,13 +24,10 @@ help:
 	@echo "  make clean            Remove generated files"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make backfill START=2000-01-01"
-	@echo "  make backfill STATES=CA,TX START=2024-01-01"
-	@echo "  make backfill CHUNK_MONTHS=36  # 3-year chunks (fewer API calls)"
-	@echo "  make backfill CHUNK_MONTHS=12  # 1-year chunks (less memory)"
-	@echo "  make update LOOKBACK=6         # Fetch last 6 hours"
-	@echo "  make validate YEAR=2023        # Validate specific year in S3"
-	@echo "  make validate LOCAL=data/asos  # Validate local data directory"
+	@echo "  make load YEAR=2023            # Load single year"
+	@echo "  make load START_YEAR=2000      # Load from specific year"
+	@echo "  make load RESUME=1             # Resume from progress.json"
+	@echo "  make validate YEAR=2023        # Validate specific year"
 
 # Setup
 install:
@@ -49,31 +45,23 @@ format:
 	uv run ruff check --fix src/ scripts/ tests/
 
 # Variables
-STATES ?=
-START ?=
-END ?=
-CHUNK_MONTHS ?= 36
+YEAR ?=
+START_YEAR ?=
+RESUME ?=
 
-# Backfill to local parquet files
-# Logs are automatically saved to logs/backfill-{timestamp}.log
-backfill:
-	uv run python scripts/backfill.py $(if $(START),--start $(START)) $(if $(END),--end $(END)) $(if $(STATES),--states $(STATES)) --chunk-months $(CHUNK_MONTHS)
-
-# Incremental update for hourly cron
-# Logs are automatically saved to logs/update-{timestamp}.log
-LOOKBACK ?= 2
-update:
-	uv run python scripts/update.py --lookback $(LOOKBACK) $(if $(STATES),--states $(STATES))
+# Load historical data year by year
+# Progress is tracked in data/progress.json
+# Logs are automatically saved to logs/load-{timestamp}.log
+load:
+	uv run python scripts/load.py $(if $(YEAR),--year $(YEAR)) $(if $(START_YEAR),--start-year $(START_YEAR)) $(if $(RESUME),--resume)
 
 # Upload local data to S3 (configure scripts/upload_s3.sh first)
 upload:
 	./scripts/upload_s3.sh
 
 # Validate data for gaps and quality issues
-YEAR ?=
-LOCAL ?=
 validate:
-	uv run python scripts/validate.py $(if $(LOCAL),--local $(LOCAL)) $(if $(YEAR),--year $(YEAR)) --verbose
+	uv run python scripts/validate.py $(if $(YEAR),--year $(YEAR)) --verbose
 
 # Run example queries
 query:

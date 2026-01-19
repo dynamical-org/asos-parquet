@@ -6,13 +6,13 @@ Run with: pytest tests/test_integration.py -v
 
 import pytest
 
-from asos_parquet.config import DEFAULT_PARQUET_PATH
+import pandas as pd
+
 from asos_parquet.fetch import fetch_observations_batch, fetch_station_observations
-from asos_parquet.parquet import df_to_geodataframe, get_parquet_info, write_geoparquet
+from asos_parquet.load import observations_to_geoparquet
+from asos_parquet.partitioned import DEFAULT_DATASET_PATH
 from asos_parquet.stations import fetch_all_stations, fetch_network_stations
 from asos_parquet.validation import validate_geoparquet
-
-import pandas as pd
 
 
 class TestStationFetching:
@@ -88,11 +88,11 @@ class TestGeoparquetCreation:
         df = fetch_observations_batch(stations, start, end, show_progress=False)
 
         # Convert to GeoDataFrame
-        gdf = df_to_geodataframe(df)
+        gdf = observations_to_geoparquet(df)
 
         # Write to file
         path = tmp_path / "test.parquet"
-        write_geoparquet(gdf, path)
+        gdf.to_parquet(path, compression="zstd", index=False)
 
         # Validate
         report = validate_geoparquet(path)
@@ -108,38 +108,18 @@ class TestGeoparquetCreation:
         assert geometry_result.passed, f"Geometry validation failed: {geometry_result.message}"
         assert timestamps_result.passed, f"Timestamp validation failed: {timestamps_result.message}"
 
-    def test_parquet_info(self, tmp_path):
-        """Test getting parquet file info."""
-        # Create a small test file
-        stations = fetch_network_stations("CA").head(3)
-        start = pd.Timestamp("2024-12-01", tz="UTC")
-        end = pd.Timestamp("2024-12-02", tz="UTC")
-
-        df = fetch_observations_batch(stations, start, end, show_progress=False)
-        gdf = df_to_geodataframe(df)
-
-        path = tmp_path / "test.parquet"
-        write_geoparquet(gdf, path)
-
-        info = get_parquet_info(path)
-
-        assert info["exists"] is True
-        assert info["record_count"] > 0
-        assert info["station_count"] >= 1
-        assert "min_date" in info
-        assert "max_date" in info
-
 
 @pytest.mark.skipif(
-    not DEFAULT_PARQUET_PATH.exists(),
-    reason="No existing parquet file to validate",
+    not (DEFAULT_DATASET_PATH / "year=2024" / "data.parquet").exists(),
+    reason="No existing parquet data to validate",
 )
 class TestExistingData:
     """Tests that validate an existing geoparquet file."""
 
     def test_validate_existing_file(self):
         """Validate the existing geoparquet file."""
-        report = validate_geoparquet(DEFAULT_PARQUET_PATH)
+        path = DEFAULT_DATASET_PATH / "year=2024" / "data.parquet"
+        report = validate_geoparquet(path)
 
         print(report)
 
