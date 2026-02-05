@@ -160,15 +160,15 @@
   <div class="controls">
     <div class="control-group">
       <label>Start Date</label>
-      <input type="date" id="startDate" value="1938-01-01">
+      <input type="date" id="startDate">
     </div>
     <div class="control-group">
       <label>End Date</label>
-      <input type="date" id="endDate" value="1940-12-31">
+      <input type="date" id="endDate">
     </div>
     <div class="control-group">
       <label>Station</label>
-      <input type="text" id="stationId" value="BNA" style="width: 80px; text-transform: uppercase;">
+      <input type="text" id="stationId" value="ORD" style="width: 80px; text-transform: uppercase;">
     </div>
     <div class="control-group">
       <label>&nbsp;</label>
@@ -200,58 +200,82 @@
     const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm');
     const Plot = await import('https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.13/+esm');
 
-    const R2_BASE_URL = 'https://pub-edb100793f1249388da0cf71a4a2430b.r2.dev/asos';
+    // Use local data served from project root (run: python -m http.server 8000)
+    // For R2/S3, use: 'https://pub-edb100793f1249388da0cf71a4a2430b.r2.dev/asos'
+    const DATA_BASE_URL = './data/asos';
 
     let db = null;
     let conn = null;
 
-    // Example queries
-    const EXAMPLE_QUERIES = {
-      'bna_1938_1940': {
-        label: 'Nashville (BNA) 1938-1940',
-        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
-FROM read_parquet([
-  '${R2_BASE_URL}/year=1938/data.parquet',
-  '${R2_BASE_URL}/year=1939/data.parquet',
-  '${R2_BASE_URL}/year=1940/data.parquet'
-])
+    // Date helpers
+    function formatDate(date) {
+      return date.toISOString().split('T')[0];
+    }
+
+    function getDefaultDates() {
+      const now = new Date();
+      const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const start = new Date(end);
+      start.setMonth(start.getMonth() - 3);
+      return { start: formatDate(start), end: formatDate(end) };
+    }
+
+    const defaultDates = getDefaultDates();
+    const currentYear = new Date().getFullYear();
+    const lastYear = currentYear - 1;
+
+    // Generate example queries dynamically based on current date
+    // Note: Only current year (2026) is continuously updated on R2 via Modal
+    function generateExampleQueries() {
+      const { start, end } = defaultDates;
+
+      // For the default query, only use current year to avoid missing partition errors
+      // (Historical years need to be manually uploaded to R2)
+      const currentYearStart = `${currentYear}-01-01`;
+
+      return {
+        'default_3mo': {
+          label: `${currentYear} YTD - Chicago (ORD)`,
+          query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${DATA_BASE_URL}/year=${currentYear}/data.parquet')
+WHERE station = 'ORD'
+ORDER BY valid`
+        },
+        'last_30_days': {
+          label: `Last 30 days - Chicago (ORD)`,
+          query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${DATA_BASE_URL}/year=${currentYear}/data.parquet')
+WHERE station = 'ORD'
+  AND valid >= '${formatDate(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))}'
+ORDER BY valid`
+        },
+        'multi_station_recent': {
+          label: `Compare cities - Last 30 days`,
+          query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${DATA_BASE_URL}/year=${currentYear}/data.parquet')
+WHERE station IN ('ORD', 'LAX', 'JFK', 'DEN')
+  AND valid >= '${formatDate(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))}'
+ORDER BY station, valid`
+        },
+        'historical_2024': {
+          label: 'Full year - Denver (DEN) 2024',
+          query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${DATA_BASE_URL}/year=2024/data.parquet')
+WHERE station = 'DEN'
+ORDER BY valid`
+        },
+        'historical_1940': {
+          label: 'Historical - Nashville 1940',
+          query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
+FROM read_parquet('${DATA_BASE_URL}/year=1940/data.parquet')
 WHERE station = 'BNA'
 ORDER BY valid`
-      },
-      'chicago_1940': {
-        label: 'Chicago (ORD) 1940',
-        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
-FROM read_parquet('${R2_BASE_URL}/year=1940/data.parquet')
-WHERE station = 'ORD'
-ORDER BY valid`
-      },
-      'winter_1940': {
-        label: 'Chicago winter Jan-Feb 1940',
-        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
-FROM read_parquet('${R2_BASE_URL}/year=1940/data.parquet')
-WHERE station = 'ORD'
-  AND valid >= '1940-01-01' AND valid < '1940-03-01'
-ORDER BY valid`
-      },
-      'multi_station_summer': {
-        label: 'Compare cities - Summer 1939',
-        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
-FROM read_parquet('${R2_BASE_URL}/year=1939/data.parquet')
-WHERE station IN ('BNA', 'ORD', 'LAX')
-  AND valid >= '1939-06-01' AND valid < '1939-09-01'
-ORDER BY station, valid`
-      },
-      'hurricane_season': {
-        label: 'Miami hurricane season 1940',
-        query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
-FROM read_parquet('${R2_BASE_URL}/year=1940/data.parquet')
-WHERE station = 'MIA'
-  AND valid >= '1940-08-01' AND valid < '1940-11-01'
-ORDER BY valid`
-      }
-    };
+        }
+      };
+    }
 
-    const DEFAULT_QUERY = EXAMPLE_QUERIES['bna_1938_1940'].query;
+    const EXAMPLE_QUERIES = generateExampleQueries();
+    const DEFAULT_QUERY = EXAMPLE_QUERIES['default_3mo'].query;
 
     // Generate partition URLs for a date range
     function generatePartitionUrls(startDate, endDate) {
@@ -259,7 +283,7 @@ ORDER BY valid`
       const startYear = new Date(startDate).getFullYear();
       const endYear = new Date(endDate).getFullYear();
       for (let year = startYear; year <= endYear; year++) {
-        urls.push(`'${R2_BASE_URL}/year=${year}/data.parquet'`);
+        urls.push(`'${DATA_BASE_URL}/year=${year}/data.parquet'`);
       }
       return urls;
     }
@@ -567,8 +591,32 @@ ORDER BY valid`;
         updateStatus(`Loaded ${data.length.toLocaleString()} records`, 'success');
 
       } catch (error) {
-        updateStatus(`Query error: ${error.message}`, 'error');
-        console.error(error);
+        // DuckDB-WASM errors are often opaque WebAssembly exceptions
+        let errorMsg = error.message || String(error);
+
+        // Try to extract useful info from WebAssembly exceptions
+        if (errorMsg.includes('WebAssembly') || errorMsg.includes('[object')) {
+          // Check if it's likely a file access issue
+          const urlMatches = query.match(/https?:\/\/[^\s'")]+/g);
+          if (urlMatches) {
+            errorMsg = `WebAssembly error (likely file access issue). Check browser console (F12) for details.\n\nURLs in query:\n${urlMatches.join('\n')}`;
+
+            // Try to fetch URLs to diagnose
+            console.group('🔍 Diagnosing parquet URLs...');
+            for (const url of urlMatches) {
+              try {
+                const resp = await fetch(url, { method: 'HEAD' });
+                console.log(`${resp.ok ? '✅' : '❌'} ${url} - ${resp.status} ${resp.statusText}`);
+              } catch (e) {
+                console.log(`❌ ${url} - ${e.message} (CORS or network error)`);
+              }
+            }
+            console.groupEnd();
+          }
+        }
+
+        updateStatus(`Query error: ${errorMsg}`, 'error');
+        console.error('Full error:', error);
       } finally {
         document.getElementById('runQueryBtn').disabled = false;
       }
@@ -588,8 +636,10 @@ ORDER BY valid`;
       }
     });
 
-    // Initialize on load
-    parseQueryToInputs(DEFAULT_QUERY); // Sync inputs with default
+    // Initialize on load - use current year (only year continuously updated on R2)
+    document.getElementById('startDate').value = `${currentYear}-01-01`;
+    document.getElementById('endDate').value = defaultDates.end;
+    parseQueryToInputs(DEFAULT_QUERY); // Sync station from default query
     initDuckDB();
   </script>
 </body>

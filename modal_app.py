@@ -5,7 +5,10 @@ merge them with existing data in S3, and upload back.
 
 Setup:
     1. Install modal: pip install modal
-    2. Create secrets: modal secret create aws-asos AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=xxx AWS_DEFAULT_REGION=us-west-2 S3_BUCKET=your-bucket
+    2. Create secrets:
+       modal secret create aws-asos \\
+         AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=xxx \\
+         AWS_DEFAULT_REGION=us-west-2 S3_BUCKET=your-bucket
     3. Deploy: modal deploy modal_app.py
 
 Cost estimate (hourly runs):
@@ -77,15 +80,17 @@ def update_asos_data(lookback_hours: int = 2):
     import boto3
     import geopandas as gpd
     import pandas as pd
+    from botocore.exceptions import ClientError
 
     from asos_parquet.config import US_STATES
     from asos_parquet.fetch import fetch_observations_batch
-    from asos_parquet.load import merge_observations, observations_to_geoparquet
+    from asos_parquet.load import merge_observations
     from asos_parquet.stations import fetch_all_stations
 
     # Configuration from environment
     s3_bucket = os.environ.get("S3_BUCKET")
     s3_prefix = os.environ.get("S3_PREFIX", "asos")
+    s3_endpoint = os.environ.get("AWS_ENDPOINT_URL")  # For R2 compatibility
 
     if not s3_bucket:
         raise ValueError("S3_BUCKET environment variable not set")
@@ -108,8 +113,12 @@ def update_asos_data(lookback_hours: int = 2):
     data_file = partition_dir / "data.parquet"
     s3_key = f"{s3_prefix}/year={current_year}/data.parquet"
 
-    # Initialize S3 client
-    s3 = boto3.client("s3")
+    # Initialize S3 client (with optional R2 endpoint)
+    s3_kwargs = {}
+    if s3_endpoint:
+        s3_kwargs["endpoint_url"] = s3_endpoint
+        logger.info(f"Using custom endpoint: {s3_endpoint}")
+    s3 = boto3.client("s3", **s3_kwargs)
 
     # Step 1: Download existing data from S3 (if exists)
     existing_gdf = None
@@ -118,8 +127,9 @@ def update_asos_data(lookback_hours: int = 2):
         s3.download_file(s3_bucket, s3_key, str(data_file))
         existing_gdf = gpd.read_parquet(data_file)
         logger.info(f"Downloaded existing partition ({len(existing_gdf):,} records)")
-    except s3.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "404":
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code in ("404", "NoSuchKey"):
             logger.info(f"No existing data for year={current_year} (starting fresh)")
         else:
             raise

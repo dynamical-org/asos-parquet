@@ -25,6 +25,12 @@ fi
 S3_PREFIX="${S3_PREFIX:-asos}"
 DRY_RUN=""
 YEAR=""
+ENDPOINT_ARG=""
+
+# Set endpoint for R2 if configured
+if [ -n "$AWS_ENDPOINT_URL" ]; then
+    ENDPOINT_ARG="--endpoint-url $AWS_ENDPOINT_URL"
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -52,11 +58,13 @@ if [ -z "$S3_BUCKET" ]; then
     exit 1
 fi
 
-# Check AWS credentials
-if ! aws sts get-caller-identity &>/dev/null; then
-    echo "Error: AWS credentials not configured"
-    echo "Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-    exit 1
+# Check AWS credentials (skip for R2 which doesn't support STS)
+if [ -z "$AWS_ENDPOINT_URL" ]; then
+    if ! aws sts get-caller-identity &>/dev/null; then
+        echo "Error: AWS credentials not configured"
+        echo "Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        exit 1
+    fi
 fi
 
 # Check local data exists
@@ -91,11 +99,11 @@ if [ -n "$YEAR" ]; then
     fi
 
     echo "Uploading year=$YEAR..."
-    aws s3 cp $DRY_RUN "$DATA_FILE" "s3://$S3_BUCKET/$S3_PREFIX/year=$YEAR/data.parquet"
+    aws s3 cp $ENDPOINT_ARG $DRY_RUN "$DATA_FILE" "s3://$S3_BUCKET/$S3_PREFIX/year=$YEAR/data.parquet"
 else
     # Upload all partitions - only data.parquet files
     echo "Uploading all partitions..."
-    aws s3 sync $DRY_RUN "$DATA_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
+    aws s3 sync $ENDPOINT_ARG $DRY_RUN "$DATA_DIR" "s3://$S3_BUCKET/$S3_PREFIX/" \
         --exclude "*" \
         --include "*/data.parquet"
 fi
@@ -107,4 +115,4 @@ echo "Upload complete!"
 # Show what's in S3
 echo ""
 echo "S3 contents:"
-aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/" --recursive --human-readable | head -20
+aws s3 ls $ENDPOINT_ARG "s3://$S3_BUCKET/$S3_PREFIX/" --recursive --human-readable | head -20
