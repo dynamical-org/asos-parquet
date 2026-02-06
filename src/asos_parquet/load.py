@@ -10,7 +10,6 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-from shapely.geometry import Point
 
 from .fetch import fetch_observations_batch
 from .partitioned import DEFAULT_DATASET_PATH
@@ -31,6 +30,9 @@ class LoadResult:
 def observations_to_geoparquet(df: pd.DataFrame) -> gpd.GeoDataFrame:
     """Convert observations DataFrame to GeoDataFrame.
 
+    Uses vectorized gpd.points_from_xy for memory-efficient geometry
+    creation (C-level array vs millions of Python Point objects).
+
     Args:
         df: DataFrame with longitude/latitude columns
 
@@ -40,20 +42,23 @@ def observations_to_geoparquet(df: pd.DataFrame) -> gpd.GeoDataFrame:
     if df.empty:
         return gpd.GeoDataFrame()
 
-    # Create Point geometries
-    geometry = [
-        Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
-        for lon, lat in zip(df["longitude"], df["latitude"])
-    ]
-
     # Ensure station is string
     if "station" in df.columns:
-        df = df.copy()
         df["station"] = df["station"].astype(str)
 
     # Sort by station then timestamp for optimal predicate pushdown
     df = df.sort_values(["station", "valid"])
 
+    # Mask rows with missing coordinates so we don't create POINT (nan nan)
+    valid_coords = df["longitude"].notna() & df["latitude"].notna()
+
+    # Initialize geometry with nulls, then fill only valid rows with Points
+    geometry = pd.Series([None] * len(df), index=df.index, dtype="object")
+    if valid_coords.any():
+        geometry.loc[valid_coords] = gpd.points_from_xy(
+            df.loc[valid_coords, "longitude"],
+            df.loc[valid_coords, "latitude"],
+        )
     return gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
 
