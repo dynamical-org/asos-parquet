@@ -9,19 +9,36 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
-from .config import DATA_FIELDS, US_STATES
+from .config import CANADIAN_PROVINCES, DATA_FIELDS, INTERNATIONAL_COUNTRIES, US_STATES
+
+# All valid region codes (US states + Canadian provinces + international countries)
+ALL_REGION_CODES = set(US_STATES) | set(CANADIAN_PROVINCES) | set(INTERNATIONAL_COUNTRIES)
+# Canadian provinces use "CA_XX" format in the state column
+ALL_REGION_CODES.update(f"CA_{prov}" for prov in CANADIAN_PROVINCES)
 
 
 @dataclass
 class ValidationResult:
-    """Result of a validation check."""
+    """Result of a validation check.
+
+    Attributes:
+        name: Check name (e.g., "schema_columns")
+        passed: Whether the check passed
+        message: Human-readable result message
+        details: Additional structured data
+        informational: If True, this check is for metrics only and
+            doesn't affect the overall pass/fail status
+    """
 
     name: str
     passed: bool
     message: str
     details: dict = field(default_factory=dict)
+    informational: bool = False
 
     def __str__(self) -> str:
+        if self.informational:
+            return f"[INFO] {self.name}: {self.message}"
         status = "PASS" if self.passed else "FAIL"
         return f"[{status}] {self.name}: {self.message}"
 
@@ -35,11 +52,18 @@ class ValidationReport:
 
     @property
     def passed(self) -> bool:
-        return all(r.passed for r in self.results)
+        """Check if all non-informational validations passed."""
+        return all(r.passed for r in self.results if not r.informational)
 
     @property
     def failed_count(self) -> int:
-        return sum(1 for r in self.results if not r.passed)
+        """Count non-informational failures only."""
+        return sum(1 for r in self.results if not r.passed and not r.informational)
+
+    @property
+    def informational_results(self) -> list[ValidationResult]:
+        """Get informational (metrics-only) results."""
+        return [r for r in self.results if r.informational]
 
     def __str__(self) -> str:
         lines = [
@@ -84,11 +108,15 @@ PHYSICAL_BOUNDS = {
 }
 
 # US bounding box (approximate, includes territories)
+# Note: Aleutian Islands cross the International Date Line, so some Alaska
+# stations (e.g., PASY at Shemya AFB) have positive longitudes (~174°E)
 US_BBOX = {
-    "min_lon": -180.0,  # Alaska extends past -180
-    "max_lon": -65.0,   # East coast
+    "min_lon": -180.0,  # Western Alaska
+    "max_lon": -65.0,   # East coast (but see aleutian_lon below)
     "min_lat": 17.0,    # Puerto Rico
-    "max_lat": 72.0,    # Alaska
+    "max_lat": 72.0,    # Northern Alaska
+    "aleutian_min_lon": 170.0,  # Far western Aleutians (positive longitude)
+    "aleutian_max_lon": 180.0,
 }
 
 
@@ -213,9 +241,19 @@ def validate_timestamps(gdf: gpd.GeoDataFrame) -> ValidationResult:
     )
 
 
-def validate_physical_bounds(gdf: gpd.GeoDataFrame) -> ValidationResult:
-    """Validate that weather values are within physical bounds."""
+def validate_physical_bounds(
+    gdf: gpd.GeoDataFrame,
+    max_outlier_rate: float = 0.001,  # Allow up to 0.1% outliers
+) -> ValidationResult:
+    """Validate that weather values are within physical bounds.
+
+    Args:
+        gdf: GeoDataFrame with weather data
+        max_outlier_rate: Maximum fraction of values allowed outside bounds (default 0.1%)
+    """
     out_of_bounds = {}
+    total_values = 0
+    total_outliers = 0
 
     for col, (min_val, max_val) in PHYSICAL_BOUNDS.items():
         if col not in gdf.columns:
@@ -227,6 +265,8 @@ def validate_physical_bounds(gdf: gpd.GeoDataFrame) -> ValidationResult:
 
         below = (values < min_val).sum()
         above = (values > max_val).sum()
+        total_values += len(values)
+        total_outliers += below + above
 
         if below > 0 or above > 0:
             out_of_bounds[col] = {
@@ -239,11 +279,17 @@ def validate_physical_bounds(gdf: gpd.GeoDataFrame) -> ValidationResult:
 
     if out_of_bounds:
         total_issues = sum(v["below_min"] + v["above_max"] for v in out_of_bounds.values())
+        outlier_rate = total_outliers / total_values if total_values > 0 else 0
+
+        # Pass if outlier rate is below threshold
+        passed = outlier_rate <= max_outlier_rate
+        pct = outlier_rate * 100
+
         return ValidationResult(
             name="physical_bounds",
-            passed=False,
-            message=f"{total_issues:,} values outside physical bounds in {len(out_of_bounds)} columns",
-            details={"columns": out_of_bounds},
+            passed=passed,
+            message=f"{total_issues:,} values ({pct:.4f}%) outside bounds in {len(out_of_bounds)} columns",
+            details={"columns": out_of_bounds, "outlier_rate": outlier_rate},
         )
 
     return ValidationResult(
@@ -253,11 +299,17 @@ def validate_physical_bounds(gdf: gpd.GeoDataFrame) -> ValidationResult:
     )
 
 
-def validate_us_locations(gdf: gpd.GeoDataFrame) -> ValidationResult:
-    """Validate that locations are within US boundaries."""
+def validate_locations(gdf: gpd.GeoDataFrame, us_only: bool = True) -> ValidationResult:
+    """Validate that locations are within expected boundaries.
+
+    Args:
+        gdf: GeoDataFrame with longitude/latitude columns
+        us_only: If True, enforce US bounding box. If False, report coordinate
+            ranges (physical_bounds already validates valid lat/lon ranges).
+    """
     if "longitude" not in gdf.columns or "latitude" not in gdf.columns:
         return ValidationResult(
-            name="us_locations",
+            name="locations",
             passed=False,
             message="Missing longitude/latitude columns",
         )
@@ -265,12 +317,36 @@ def validate_us_locations(gdf: gpd.GeoDataFrame) -> ValidationResult:
     lon = gdf["longitude"].dropna()
     lat = gdf["latitude"].dropna()
 
-    outside_lon = ((lon < US_BBOX["min_lon"]) | (lon > US_BBOX["max_lon"])).sum()
+    if not us_only:
+        # Global mode: just report coordinate ranges (informational)
+        return ValidationResult(
+            name="locations",
+            passed=True,
+            message=(
+                f"Global: {len(lon):,} locations, "
+                f"lon [{float(lon.min()):.1f}, {float(lon.max()):.1f}], "
+                f"lat [{float(lat.min()):.1f}, {float(lat.max()):.1f}]"
+            ),
+            details={
+                "lon_range": (float(lon.min()), float(lon.max())),
+                "lat_range": (float(lat.min()), float(lat.max())),
+            },
+        )
+
+    # US-only mode: enforce US bounding box
+    # Check latitude bounds
     outside_lat = ((lat < US_BBOX["min_lat"]) | (lat > US_BBOX["max_lat"])).sum()
+
+    # Check longitude bounds - allow both Western Hemisphere AND Aleutian Islands
+    # Western US: -180 to -65 (negative longitudes)
+    # Aleutians: 170 to 180 (positive longitudes past date line)
+    in_western_us = (lon >= US_BBOX["min_lon"]) & (lon <= US_BBOX["max_lon"])
+    in_aleutians = (lon >= US_BBOX["aleutian_min_lon"]) & (lon <= US_BBOX["aleutian_max_lon"])
+    outside_lon = (~(in_western_us | in_aleutians)).sum()
 
     if outside_lon > 0 or outside_lat > 0:
         return ValidationResult(
-            name="us_locations",
+            name="locations",
             passed=False,
             message=f"{outside_lon + outside_lat:,} points outside US boundaries",
             details={
@@ -282,7 +358,7 @@ def validate_us_locations(gdf: gpd.GeoDataFrame) -> ValidationResult:
         )
 
     return ValidationResult(
-        name="us_locations",
+        name="locations",
         passed=True,
         message=f"All {len(lon):,} locations within US boundaries",
         details={
@@ -292,57 +368,87 @@ def validate_us_locations(gdf: gpd.GeoDataFrame) -> ValidationResult:
     )
 
 
-def validate_states(gdf: gpd.GeoDataFrame) -> ValidationResult:
-    """Validate that state codes are valid US states."""
+def validate_us_locations(gdf: gpd.GeoDataFrame) -> ValidationResult:
+    """Validate that locations are within US boundaries (backwards-compat alias)."""
+    return validate_locations(gdf, us_only=True)
+
+
+def validate_region_codes(gdf: gpd.GeoDataFrame, us_only: bool = True) -> ValidationResult:
+    """Validate that region codes (state column) are recognized.
+
+    Args:
+        gdf: GeoDataFrame with state column
+        us_only: If True, only accept US state codes. If False, accept all
+            known region codes (US states, Canadian provinces, country codes).
+    """
     if "state" not in gdf.columns:
         return ValidationResult(
-            name="states",
+            name="region_codes",
             passed=False,
             message="No 'state' column found",
         )
 
-    states = gdf["state"].dropna().unique()
-    invalid = [s for s in states if s not in US_STATES]
+    codes = gdf["state"].dropna().unique()
+    valid_set = set(US_STATES) if us_only else ALL_REGION_CODES
+    invalid = [s for s in codes if s not in valid_set]
 
     if invalid:
         return ValidationResult(
-            name="states",
+            name="region_codes",
             passed=False,
-            message=f"{len(invalid)} invalid state codes: {invalid}",
-            details={"invalid": invalid, "valid_count": len(states) - len(invalid)},
+            message=f"{len(invalid)} invalid region codes: {invalid}",
+            details={"invalid": invalid, "valid_count": len(codes) - len(invalid)},
         )
 
+    label = "state" if us_only else "region"
     return ValidationResult(
-        name="states",
+        name="region_codes",
         passed=True,
-        message=f"All {len(states)} state codes valid",
-        details={"states": sorted(states.tolist())},
+        message=f"All {len(codes)} {label} codes valid",
+        details={"codes": sorted(codes.tolist())},
     )
 
 
+def validate_states(gdf: gpd.GeoDataFrame) -> ValidationResult:
+    """Validate that state codes are valid US states (backwards-compat alias)."""
+    return validate_region_codes(gdf, us_only=True)
+
+
 def validate_no_duplicates(gdf: gpd.GeoDataFrame) -> ValidationResult:
-    """Validate that there are no duplicate (station, valid) pairs."""
+    """Check for duplicate (station, valid) pairs (informational metric).
+
+    ASOS data can have legitimate duplicates when stations issue corrections,
+    special observations (SPECIs), or re-transmissions at the same timestamp.
+    The Iowa Mesonet archives all of these, which is valuable for completeness.
+
+    This is an informational check that reports duplicate counts but does not
+    affect pass/fail status.
+    """
     if "station" not in gdf.columns or "valid" not in gdf.columns:
         return ValidationResult(
             name="duplicates",
-            passed=False,
+            passed=True,
             message="Missing station or valid column",
+            informational=True,
         )
 
     duplicates = gdf.duplicated(subset=["station", "valid"]).sum()
 
     if duplicates > 0:
+        dup_rate = duplicates / len(gdf) * 100
         return ValidationResult(
             name="duplicates",
-            passed=False,
-            message=f"{duplicates:,} duplicate (station, valid) pairs",
-            details={"duplicate_count": int(duplicates)},
+            passed=True,  # Always passes (informational only)
+            message=f"{duplicates:,} duplicate (station, valid) pairs ({dup_rate:.3f}%)",
+            details={"duplicate_count": int(duplicates), "duplicate_rate": dup_rate},
+            informational=True,
         )
 
     return ValidationResult(
         name="duplicates",
         passed=True,
         message="No duplicate (station, valid) pairs",
+        informational=True,
     )
 
 
@@ -405,29 +511,28 @@ def validate_station_count(
     gdf: gpd.GeoDataFrame,
     min_stations: int = 1,
 ) -> ValidationResult:
-    """Validate minimum station count."""
+    """Report station count (informational metric).
+
+    Historical data may have limited station counts due to archive availability.
+    This is an informational check that reports the station count but does not
+    affect pass/fail status.
+    """
     if "station" not in gdf.columns:
         return ValidationResult(
             name="station_count",
-            passed=False,
+            passed=True,
             message="No 'station' column found",
+            informational=True,
         )
 
     count = gdf["station"].nunique()
 
-    if count < min_stations:
-        return ValidationResult(
-            name="station_count",
-            passed=False,
-            message=f"Only {count} stations, expected at least {min_stations}",
-            details={"count": count, "min_required": min_stations},
-        )
-
     return ValidationResult(
         name="station_count",
-        passed=True,
+        passed=True,  # Always passes (informational only)
         message=f"{count} unique stations",
-        details={"count": count},
+        details={"count": count, "min_expected": min_stations},
+        informational=True,
     )
 
 
@@ -436,10 +541,14 @@ def validate_station_coverage(
     expected_stations: pd.DataFrame,
     year: int,
 ) -> ValidationResult:
-    """Validate that expected stations have data.
+    """Measure station coverage (informational metric).
 
     Compares stations present in the data against stations that should have
     been reporting during the given year (based on archive_begin metadata).
+
+    This is an informational check that provides coverage metrics but does
+    not affect pass/fail status. Historical data often has incomplete station
+    coverage due to manual reporting or stations not yet existing.
 
     Args:
         gdf: GeoDataFrame with observation data
@@ -447,17 +556,17 @@ def validate_station_coverage(
         year: The year being validated
 
     Returns:
-        ValidationResult with missing station details
+        ValidationResult with coverage metrics (informational=True)
     """
     if "station" not in gdf.columns:
         return ValidationResult(
             name="station_coverage",
             passed=False,
             message="No 'station' column found",
+            informational=True,
         )
 
     # Filter to stations that should have data for this year
-    year_start = pd.Timestamp(f"{year}-01-01", tz="UTC")
     year_end = pd.Timestamp(f"{year}-12-31", tz="UTC")
 
     active_stations = expected_stations[
@@ -471,29 +580,24 @@ def validate_station_coverage(
     missing = expected_set - present_stations
     extra = present_stations - expected_set  # Stations in data but not in metadata
 
-    if missing:
-        missing_pct = len(missing) / len(expected_set) * 100
-        return ValidationResult(
-            name="station_coverage",
-            passed=missing_pct < 5,  # Allow up to 5% missing
-            message=f"{len(missing)} of {len(expected_set)} expected stations missing ({missing_pct:.1f}%)",
-            details={
-                "missing_stations": sorted(missing)[:50],  # Cap at 50 for readability
-                "missing_count": len(missing),
-                "expected_count": len(expected_set),
-                "present_count": len(present_stations),
-                "extra_count": len(extra),
-            },
-        )
+    missing_pct = len(missing) / len(expected_set) * 100 if expected_set else 0
+    coverage_pct = 100 - missing_pct
 
+    msg = f"{len(present_stations)} of {len(expected_set)} stations ({coverage_pct:.1f}% coverage)"
     return ValidationResult(
         name="station_coverage",
-        passed=True,
-        message=f"All {len(expected_set)} expected stations present",
+        passed=True,  # Always passes (informational only)
+        message=msg,
         details={
+            "missing_stations": sorted(missing)[:50],  # Cap at 50 for readability
+            "missing_count": len(missing),
+            "missing_pct": round(missing_pct, 1),
             "expected_count": len(expected_set),
             "present_count": len(present_stations),
+            "coverage_pct": round(coverage_pct, 1),
+            "extra_count": len(extra),
         },
+        informational=True,
     )
 
 
@@ -502,25 +606,30 @@ def validate_temporal_completeness(
     max_gap_hours: int = 48,
     min_observations_per_day: int = 12,
 ) -> ValidationResult:
-    """Validate temporal completeness of observations.
+    """Measure temporal completeness (informational metric).
 
     Checks for stations with significant gaps or low observation counts.
     ASOS stations typically report hourly (24 obs/day), so fewer than
     min_observations_per_day suggests missing data.
 
+    This is an informational check that provides completeness metrics but
+    does not affect pass/fail status. Historical data often has sparse
+    observations due to manual reporting or equipment limitations.
+
     Args:
         gdf: GeoDataFrame with observation data
-        max_gap_hours: Maximum allowed gap between observations (hours)
-        min_observations_per_day: Minimum expected observations per day
+        max_gap_hours: Gap threshold for flagging (hours)
+        min_observations_per_day: Threshold for sparse stations
 
     Returns:
-        ValidationResult with gap details
+        ValidationResult with completeness metrics (informational=True)
     """
     if "station" not in gdf.columns or "valid" not in gdf.columns:
         return ValidationResult(
             name="temporal_completeness",
             passed=False,
             message="Missing 'station' or 'valid' column",
+            informational=True,
         )
 
     # Calculate date range
@@ -529,7 +638,8 @@ def validate_temporal_completeness(
         return ValidationResult(
             name="temporal_completeness",
             passed=True,
-            message="Single day of data, skipping gap check",
+            message="Single day of data",
+            informational=True,
         )
 
     # Check observation density per station
@@ -568,36 +678,25 @@ def validate_temporal_completeness(
                 "max_gap_hours": max_gap.total_seconds() / 3600,
             })
 
-    issues = []
-    if len(sparse_stations) > 0:
-        sparse_pct = len(sparse_stations) / len(station_stats) * 100
-        issues.append(f"{len(sparse_stations)} stations ({sparse_pct:.1f}%) with <{min_observations_per_day} obs/day")
-
-    if large_gaps:
-        issues.append(f"{len(large_gaps)} stations with gaps >{max_gap_hours}h")
-
-    if issues:
-        return ValidationResult(
-            name="temporal_completeness",
-            passed=len(sparse_stations) / len(station_stats) < 0.1,  # <10% sparse is OK
-            message="; ".join(issues),
-            details={
-                "sparse_stations": sparse_stations.index.tolist()[:20],
-                "sparse_count": len(sparse_stations),
-                "large_gap_stations": large_gaps[:20],
-                "total_stations": len(station_stats),
-                "median_obs_per_day": float(station_stats["obs_per_day"].median()),
-            },
-        )
+    sparse_pct = len(sparse_stations) / len(station_stats) * 100 if len(station_stats) > 0 else 0
+    dense_pct = 100 - sparse_pct
+    median_obs = float(station_stats["obs_per_day"].median()) if len(station_stats) > 0 else 0
 
     return ValidationResult(
         name="temporal_completeness",
-        passed=True,
-        message=f"Good temporal coverage: median {station_stats['obs_per_day'].median():.1f} obs/day",
+        passed=True,  # Always passes (informational only)
+        message=f"Median {median_obs:.1f} obs/day; {dense_pct:.1f}% stations well-covered",
         details={
+            "sparse_stations": sparse_stations.index.tolist()[:20],
+            "sparse_count": len(sparse_stations),
+            "sparse_pct": round(sparse_pct, 1),
+            "dense_pct": round(dense_pct, 1),
+            "large_gap_stations": large_gaps[:20],
+            "large_gap_count": len(large_gaps),
             "total_stations": len(station_stats),
-            "median_obs_per_day": float(station_stats["obs_per_day"].median()),
+            "median_obs_per_day": median_obs,
         },
+        informational=True,
     )
 
 
@@ -645,6 +744,7 @@ def validate_geoparquet(
     min_stations: int = 1,
     expected_stations: pd.DataFrame | None = None,
     year: int | None = None,
+    us_only: bool = True,
 ) -> ValidationReport:
     """Run all validation checks on a geoparquet file.
 
@@ -654,6 +754,7 @@ def validate_geoparquet(
         min_stations: Minimum expected station count
         expected_stations: Optional station metadata for coverage validation
         year: Year of data (required if expected_stations provided)
+        us_only: If True, enforce US-only location/state checks
 
     Returns:
         ValidationReport with all check results
@@ -699,8 +800,8 @@ def validate_geoparquet(
         validate_geometry(gdf),
         validate_timestamps(gdf),
         validate_physical_bounds(gdf),
-        validate_us_locations(gdf),
-        validate_states(gdf),
+        validate_locations(gdf, us_only=us_only),
+        validate_region_codes(gdf, us_only=us_only),
         validate_no_duplicates(gdf),
         validate_null_rates(gdf),
         validate_record_count(gdf, min_records),

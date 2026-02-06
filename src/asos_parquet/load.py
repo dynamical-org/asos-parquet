@@ -79,8 +79,17 @@ def merge_observations(
     # Convert new data to GeoDataFrame
     new_gdf = observations_to_geoparquet(new_df)
 
+    # Add year column derived from valid timestamp if missing
+    if "year" not in new_gdf.columns and "valid" in new_gdf.columns:
+        new_gdf["year"] = new_gdf["valid"].dt.year.astype("int32")
+
     if existing_gdf is None or existing_gdf.empty:
         return new_gdf
+
+    # Ensure existing data has year column with consistent type
+    if "year" in existing_gdf.columns:
+        existing_gdf = existing_gdf.copy()
+        existing_gdf["year"] = existing_gdf["year"].astype("int32")
 
     # Combine and deduplicate
     combined = pd.concat([existing_gdf, new_gdf], ignore_index=True)
@@ -119,7 +128,7 @@ def write_year_partition(
 
     # Write atomically via temp file
     tmp_path = output_path.with_suffix(".parquet.tmp")
-    gdf.to_parquet(tmp_path, compression="zstd", index=False)
+    gdf.to_parquet(tmp_path, compression="zstd", index=False, write_covering_bbox=True)
     tmp_path.rename(output_path)
 
     return output_path
@@ -242,6 +251,111 @@ def read_year_partition(
         return gpd.read_parquet(partition_path)
     except Exception:
         return None
+
+
+def update_year(
+    year: int,
+    stations: pd.DataFrame,
+    base_path: Path = DEFAULT_DATASET_PATH,
+    show_progress: bool = True,
+    min_lookback_hours: int = 2,
+) -> LoadResult:
+    """Incrementally update a year's data from the last observation.
+
+    Reads existing partition, finds the most recent timestamp, fetches
+    new observations from that point forward, and merges them.
+
+    Args:
+        year: Year to update
+        stations: DataFrame with station metadata
+        base_path: Base directory for partitions
+        show_progress: Whether to show fetch progress
+        min_lookback_hours: Minimum hours to look back (ensures no gaps)
+
+    Returns:
+        LoadResult with success status and statistics
+    """
+    now = pd.Timestamp.now("UTC")
+    current_year = now.year
+
+    if year != current_year:
+        # Non-current years should use full load, not incremental update
+        return load_year(year, stations, base_path, show_progress)
+
+    output_path = base_path / f"year={year}" / "data.parquet"
+
+    # Read existing data
+    existing_gdf = read_year_partition(year, base_path)
+
+    if existing_gdf is None or existing_gdf.empty:
+        # No existing data - do full year load
+        return load_year(year, stations, base_path, show_progress)
+
+    # Find most recent observation timestamp
+    max_timestamp = existing_gdf["valid"].max()
+
+    # Start from max_timestamp minus lookback buffer (ensures no gaps from
+    # late-arriving observations)
+    start_date = max_timestamp - timedelta(hours=min_lookback_hours)
+    end_date = now
+
+    # Filter to online stations for recent data
+    active_stations = stations[stations["archive_begin"] <= now].copy()
+
+    if active_stations.empty:
+        return LoadResult(
+            year=year,
+            records=len(existing_gdf),
+            stations=existing_gdf["station"].nunique(),
+            output_path=output_path,
+            success=True,
+            error=None,
+        )
+
+    try:
+        # Fetch new observations
+        observations = fetch_observations_batch(
+            active_stations,
+            start_date,
+            end_date + timedelta(seconds=1),
+            show_progress=show_progress,
+            description=f"Year {year} (updating from {max_timestamp.strftime('%Y-%m-%d %H:%M')})",
+        )
+
+        if observations.empty:
+            return LoadResult(
+                year=year,
+                records=len(existing_gdf),
+                stations=existing_gdf["station"].nunique(),
+                output_path=output_path,
+                success=True,
+                error=None,
+            )
+
+        # Merge with existing data
+        merged_gdf = merge_observations(existing_gdf, observations)
+
+        # Write to partition
+        output_path = write_year_partition(merged_gdf, year, base_path)
+
+        return LoadResult(
+            year=year,
+            records=len(merged_gdf),
+            stations=merged_gdf["station"].nunique(),
+            output_path=output_path,
+            success=True,
+            error=None,
+        )
+
+    except Exception as e:
+        return LoadResult(
+            year=year,
+            records=len(existing_gdf),
+            stations=existing_gdf["station"].nunique(),
+            output_path=output_path,
+            success=False,
+            error=str(e),
+        )
 
 
 def get_available_years(base_path: Path = DEFAULT_DATASET_PATH) -> list[int]:

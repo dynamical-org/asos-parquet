@@ -1,9 +1,9 @@
 # ASOS Surface Weather Observations
 
-**Status:** Updating
+**Status:** Updating hourly
 **Spatial Domain:** United States (50 states)
 **Spatial Resolution:** ~2,900 weather stations
-**Temporal Coverage:** 1928 to present
+**Temporal Coverage:** 1940 to present
 **Temporal Resolution:** Hourly (typically every 20-60 minutes)
 
 ## Overview
@@ -15,7 +15,7 @@ This dataset provides access to historical and near-real-time ASOS observations 
 ### Key Features
 
 - **Complete US Coverage**: All 50 states including Alaska and Hawaii
-- **Deep Historical Archive**: Observations dating back to 1928
+- **Deep Historical Archive**: Observations dating back to 1940
 - **Cloud-Native Format**: GeoParquet with Hive-style partitioning for efficient queries
 - **Geospatial Ready**: Point geometries included for spatial analysis and interpolation
 
@@ -26,11 +26,14 @@ This dataset provides access to historical and near-real-time ASOS observations 
 ```python
 import duckdb
 
-# Query temperature extremes from 2020
+# Connect and configure S3 access (see R2/S3 Configuration section)
 conn = duckdb.connect()
+# ... configure s3_endpoint, credentials ...
+
+# Query temperature extremes from 2020
 result = conn.execute("""
     SELECT station, valid, tmpf, dwpf
-    FROM read_parquet('s3://dev/asos/year=2020/data.parquet')
+    FROM read_parquet('s3://your-bucket/asos/year=2020/data.parquet')
     WHERE tmpf > 100
     ORDER BY tmpf DESC
     LIMIT 10
@@ -46,8 +49,18 @@ Access the interactive viewer at the dataset URL to explore data directly in you
 ### Endpoint
 
 ```
-s3://dev/asos/year={YYYY}/data.parquet
+s3://{YOUR_BUCKET}/asos/year={YYYY}/data.parquet
 ```
+
+Replace `{YOUR_BUCKET}` with your S3 or R2 bucket name. See [R2/S3 Configuration](#r2s3-configuration) for connection setup.
+
+### Update Frequency
+
+- **Current year**: Updated hourly (at minute 5 of each hour)
+- **Historical years**: Static after year ends
+- **Latency**: ~5-10 minutes after observation time
+
+Updates are performed via serverless functions that fetch recent observations from Iowa Mesonet, merge with existing data, and upload to S3.
 
 ### Partitioning Strategy
 
@@ -60,25 +73,25 @@ Data is partitioned by year using Hive-style naming (`year=YYYY`). This strategy
 ### Access Patterns
 
 **Single Year (recommended for most queries):**
-```python
-# Fast - directly accesses one file
-SELECT * FROM read_parquet('s3://dev/asos/year=2015/data.parquet')
+```sql
+-- Fast - directly accesses one file
+SELECT * FROM read_parquet('s3://your-bucket/asos/year=2015/data.parquet')
 ```
 
 **Multiple Specific Years:**
-```python
-# Explicit list - no glob overhead
+```sql
+-- Explicit list - no glob overhead
 SELECT * FROM read_parquet([
-    's3://dev/asos/year=2014/data.parquet',
-    's3://dev/asos/year=2015/data.parquet'
+    's3://your-bucket/asos/year=2014/data.parquet',
+    's3://your-bucket/asos/year=2015/data.parquet'
 ])
 ```
 
 **Multi-Year Range (use sparingly):**
-```python
-# Glob pattern - scans all partitions first, then filters
-# Only use when you genuinely need many years (climate normals, long-term trends)
-SELECT * FROM read_parquet('s3://dev/asos/year=*/data.parquet', hive_partitioning=true)
+```sql
+-- Glob pattern - scans all partitions first, then filters
+-- Only use when you genuinely need many years (climate normals, long-term trends)
+SELECT * FROM read_parquet('s3://your-bucket/asos/year=*/data.parquet', hive_partitioning=true)
 WHERE year BETWEEN 2010 AND 2020
 ```
 

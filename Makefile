@@ -1,33 +1,4 @@
-.PHONY: install test lint format load upload validate query clean serve help
-
-# Default target
-help:
-	@echo "ASOS Geoparquet - Available Commands"
-	@echo "====================================="
-	@echo ""
-	@echo "Setup:"
-	@echo "  make install          Install dependencies"
-	@echo ""
-	@echo "Data:"
-	@echo "  make load             Load historical data year by year (1940-present)"
-	@echo "  make upload           Upload local data to S3 (configure script first)"
-	@echo "  make validate         Validate data for gaps and quality issues"
-	@echo "  make query            Run example queries against data"
-	@echo ""
-	@echo "Development:"
-	@echo "  make serve            Serve viewer.html on localhost:3000"
-	@echo "  make test             Run tests"
-	@echo "  make lint             Check code with ruff"
-	@echo "  make format           Format code with ruff"
-	@echo ""
-	@echo "Maintenance:"
-	@echo "  make clean            Remove generated files"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make load YEAR=2023            # Load single year"
-	@echo "  make load START_YEAR=2000      # Load from specific year"
-	@echo "  make load RESUME=1             # Resume from progress.json"
-	@echo "  make validate YEAR=2023        # Validate specific year"
+.PHONY: install test lint format load upload validate clean deploy dev 
 
 # Setup
 install:
@@ -48,24 +19,40 @@ format:
 YEAR ?=
 START_YEAR ?=
 RESUME ?=
+UPDATE ?=
+NETWORKS ?=
+COUNTRIES ?=
 
 # Load historical data year by year
 # Progress is tracked in data/progress.json
 # Logs are automatically saved to logs/load-{timestamp}.log
+# With RESUME=1, current year does incremental update from last observation
 load:
-	uv run python scripts/load.py $(if $(YEAR),--year $(YEAR)) $(if $(START_YEAR),--start-year $(START_YEAR)) $(if $(RESUME),--resume)
+	uv run python scripts/load.py $(if $(YEAR),--year $(YEAR)) $(if $(START_YEAR),--start-year $(START_YEAR)) $(if $(RESUME),--resume) $(if $(NETWORKS),--networks $(NETWORKS)) $(if $(COUNTRIES),--countries $(COUNTRIES))
 
 # Upload local data to S3 (configure scripts/upload_s3.sh first)
 upload:
 	./scripts/upload_s3.sh
 
+# Deploy to Modal (reads credentials from .env)
+# Creates/updates Modal secret and deploys the scheduled function
+deploy:
+	@if [ ! -f .env ]; then echo "Error: .env file not found. Copy .env.example and fill in values."; exit 1; fi
+	@echo "Updating Modal secrets from .env..."
+	@set -a && source .env && set +a && \
+		uv run modal secret create aws-asos --force \
+			AWS_ACCESS_KEY_ID="$$AWS_ACCESS_KEY_ID" \
+			AWS_SECRET_ACCESS_KEY="$$AWS_SECRET_ACCESS_KEY" \
+			AWS_DEFAULT_REGION="$${AWS_DEFAULT_REGION:-us-east-1}" \
+			S3_BUCKET="$$S3_BUCKET" \
+			$${S3_PREFIX:+S3_PREFIX="$$S3_PREFIX"} \
+			$${AWS_ENDPOINT_URL:+AWS_ENDPOINT_URL="$$AWS_ENDPOINT_URL"}
+	@echo "Deploying to Modal..."
+	uv run modal deploy modal_app.py
+
 # Validate data for gaps and quality issues
 validate:
-	uv run python scripts/validate.py $(if $(YEAR),--year $(YEAR)) --verbose
-
-# Run example queries
-query:
-	uv run python scripts/query_example.py
+	uv run python scripts/validate.py $(if $(YEAR),--year $(YEAR)) $(if $(UPDATE),--update-progress) --verbose $(if $(filter global,$(NETWORKS)),--global)
 
 # Maintenance
 clean:
@@ -73,6 +60,6 @@ clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 # Development
-serve:
+dev:
 	@echo "Serving viewer at http://localhost:3000/viewer.html"
 	uv run python -m http.server 3000

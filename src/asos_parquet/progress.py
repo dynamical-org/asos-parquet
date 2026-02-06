@@ -29,6 +29,10 @@ class YearProgress:
     is_current_year: bool = False
     completed_at: str | None = None
     error: str | None = None
+    # Informational metrics (not pass/fail criteria)
+    station_coverage_pct: float | None = None
+    temporal_completeness_pct: float | None = None
+    median_obs_per_day: float | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -45,6 +49,13 @@ class YearProgress:
             d["completed_at"] = self.completed_at
         if self.error:
             d["error"] = self.error
+        # Include metrics if available
+        if self.station_coverage_pct is not None:
+            d["station_coverage_pct"] = self.station_coverage_pct
+        if self.temporal_completeness_pct is not None:
+            d["temporal_completeness_pct"] = self.temporal_completeness_pct
+        if self.median_obs_per_day is not None:
+            d["median_obs_per_day"] = self.median_obs_per_day
         return d
 
     @classmethod
@@ -59,6 +70,9 @@ class YearProgress:
             is_current_year=data.get("is_current_year", False),
             completed_at=data.get("completed_at"),
             error=data.get("error"),
+            station_coverage_pct=data.get("station_coverage_pct"),
+            temporal_completeness_pct=data.get("temporal_completeness_pct"),
+            median_obs_per_day=data.get("median_obs_per_day"),
         )
 
 
@@ -94,8 +108,11 @@ class LoadProgress:
         stations: int,
         validated: bool = False,
         validation_passed: bool = False,
+        station_coverage_pct: float | None = None,
+        temporal_completeness_pct: float | None = None,
+        median_obs_per_day: float | None = None,
     ) -> None:
-        """Mark a year as completed."""
+        """Mark a year as completed with optional metrics."""
         progress = self.get_year(year)
         progress.status = "completed"
         progress.records = records
@@ -104,6 +121,10 @@ class LoadProgress:
         progress.validation_passed = validation_passed
         progress.completed_at = datetime.now(timezone.utc).isoformat()
         progress.error = None
+        # Store informational metrics
+        progress.station_coverage_pct = station_coverage_pct
+        progress.temporal_completeness_pct = temporal_completeness_pct
+        progress.median_obs_per_day = median_obs_per_day
         self._touch()
 
     def mark_failed(self, year: int, error: str) -> None:

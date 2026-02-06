@@ -1,7 +1,14 @@
 """Modal deployment for ASOS data updates.
 
-Runs hourly to fetch recent ASOS observations from Iowa Mesonet,
-merge them with existing data in S3, and upload back.
+Runs twice per hour (:20 and :50) to fetch recent ASOS observations from
+Iowa Mesonet, merge them with existing data in S3, and upload back.
+
+Schedule rationale:
+    - METAR observations occur at :51-:56 of each hour
+    - IEM API has ~25-40 minute lag from observation to availability
+    - Running at :20 catches previous hour's METAR after it propagates
+    - Running at :50 provides redundancy and catches SPECI reports
+    - Worst-case latency: ~27 minutes (vs ~65 min with single :05 run)
 
 Setup:
     1. Install modal: pip install modal
@@ -11,10 +18,10 @@ Setup:
          AWS_DEFAULT_REGION=us-west-2 S3_BUCKET=your-bucket
     3. Deploy: modal deploy modal_app.py
 
-Cost estimate (hourly runs):
-    - ~$7-10/month (covered by $30 free tier)
-    - CPU: 1 core * 10 min * 720 runs = ~$5.60/month
-    - Memory: 2GB * 10 min * 720 runs = ~$1.90/month
+Cost estimate (twice-hourly runs with bulk fetch):
+    - ~$2-3/month (well within $30 free tier)
+    - CPU: 1 core * 2 min * 1440 runs = ~$1.90/month
+    - Memory: 2GB * 2 min * 1440 runs = ~$0.65/month
 """
 
 import logging
@@ -27,7 +34,7 @@ import modal
 # Modal app configuration
 app = modal.App("asos-parquet-update")
 
-# Image with all dependencies
+# Image with all dependencies and local source code
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -40,12 +47,7 @@ image = (
         "boto3>=1.34.0",
         "rich>=13.0.0",
     )
-)
-
-# Mount local source code
-src_mount = modal.Mount.from_local_dir(
-    local_path=Path(__file__).parent / "src",
-    remote_path="/root/src",
+    .add_local_python_source("asos_parquet")
 )
 
 # Configure logging
@@ -58,10 +60,9 @@ logger = logging.getLogger(__name__)
 
 @app.function(
     image=image,
-    mounts=[src_mount],
     secrets=[modal.Secret.from_name("aws-asos")],
-    timeout=1800,  # 30 minutes max
-    schedule=modal.Cron("5 * * * *"),  # Run at minute 5 of every hour
+    timeout=600,  # 10 minutes max (bulk fetch typically completes in ~2 min)
+    schedule=modal.Cron("20,50 * * * *"),  # Run at :20 and :50 past each hour
     cpu=1.0,
     memory=2048,
 )
@@ -74,15 +75,12 @@ def update_asos_data(lookback_hours: int = 2):
     3. Merges new data with existing
     4. Uploads back to S3
     """
-    import sys
-    sys.path.insert(0, "/root/src")
-
     import boto3
     import geopandas as gpd
     import pandas as pd
     from botocore.exceptions import ClientError
 
-    from asos_parquet.config import US_STATES
+    from asos_parquet.config import get_all_network_ids
     from asos_parquet.fetch import fetch_observations_batch
     from asos_parquet.load import merge_observations
     from asos_parquet.stations import fetch_all_stations
@@ -106,11 +104,10 @@ def update_asos_data(lookback_hours: int = 2):
     logger.info(f"S3: s3://{s3_bucket}/{s3_prefix}/year={current_year}/data.parquet")
     logger.info("=" * 60)
 
-    # Set up local paths
+    # Set up local paths (flat path avoids pyarrow Hive partition inference)
     data_dir = Path("/tmp/asos")
-    partition_dir = data_dir / f"year={current_year}"
-    partition_dir.mkdir(parents=True, exist_ok=True)
-    data_file = partition_dir / "data.parquet"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data_file = data_dir / "data.parquet"
     s3_key = f"{s3_prefix}/year={current_year}/data.parquet"
 
     # Initialize S3 client (with optional R2 endpoint)
@@ -135,8 +132,9 @@ def update_asos_data(lookback_hours: int = 2):
             raise
 
     # Step 2: Fetch station metadata
-    logger.info(f"Fetching station metadata for {len(US_STATES)} states...")
-    stations = fetch_all_stations(states=US_STATES, online_only=True)
+    networks = get_all_network_ids(us=True)
+    logger.info(f"Fetching station metadata for {len(networks)} networks...")
+    stations = fetch_all_stations(networks=networks, online_only=True)
     logger.info(f"Found {len(stations)} online stations")
 
     if stations.empty:

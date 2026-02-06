@@ -1,6 +1,18 @@
-"""Observation data fetching from Iowa Mesonet."""
+"""Observation data fetching from Iowa Mesonet.
+
+Supports two fetch strategies:
+1. Per-station fetching: Individual requests per station (legacy, more retries)
+2. Bulk fetching: Multiple stations per request (faster, adaptive chunking)
+
+The bulk strategy uses adaptive chunk sizing based on date range:
+- Longer ranges (months/years): Smaller chunks (100 stations) for manageable response sizes
+- Shorter ranges (days): Larger chunks (1500 stations) for fewer HTTP requests
+
+URL length limit (~8KB) caps chunks at ~1,800 stations regardless of date range.
+"""
 
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -11,6 +23,7 @@ import pandas as pd
 import requests
 from rich.console import Console
 from rich.live import Live
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
 from tqdm import tqdm
 
@@ -24,6 +37,12 @@ from .config import (
     REQUEST_TIMEOUT,
     RETRY_BACKOFF,
 )
+
+# Bulk fetching configuration
+MAX_URL_LENGTH = 7500  # Conservative limit below 8KB server limit
+MAX_STATIONS_PER_CHUNK = 1500  # Safe default under URL limit
+BULK_REQUEST_TIMEOUT = 300  # Bulk requests may take longer
+BULK_MAX_WORKERS = 3  # Concurrent bulk requests (conservative for rate limits)
 
 
 @dataclass
@@ -155,6 +174,157 @@ def build_observation_url(
     )
 
 
+def build_bulk_observation_url(
+    station_ids: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> str:
+    """Build URL for fetching multiple stations in one request.
+
+    Args:
+        station_ids: List of ASOS station identifiers
+        start_date: Start timestamp
+        end_date: End timestamp
+
+    Returns:
+        Formatted URL for bulk IEM ASOS API request
+    """
+    sts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ets = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    stations_param = ",".join(station_ids)
+    data_params = "&".join(f"data={field}" for field in DATA_FIELDS)
+
+    return (
+        f"{OBSERVATION_DATA_URL}"
+        f"?station={stations_param}"
+        f"&sts={sts}&ets={ets}"
+        f"&{data_params}"
+        f"&tz=UTC&format=onlycomma&latlon=yes&elev=no&missing=empty"
+    )
+
+
+def calculate_optimal_chunk_size(
+    num_stations: int,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> int:
+    """Calculate optimal chunk size based on date range.
+
+    Shorter date ranges can use larger chunks since response data is smaller.
+    URL length (~8KB limit) caps chunks at ~1,800 stations regardless.
+
+    Args:
+        num_stations: Total number of stations to fetch
+        start_date: Start timestamp
+        end_date: End timestamp
+
+    Returns:
+        Recommended stations per chunk
+    """
+    days = (end_date - start_date).days + 1
+
+    # Base chunk size on date range
+    # These values were determined experimentally
+    if days <= 1:
+        chunk_size = 1500  # 1 day: large chunks OK
+    elif days <= 7:
+        chunk_size = 1000  # 1 week: medium chunks
+    elif days <= 31:
+        chunk_size = 500   # 1 month: smaller chunks
+    elif days <= 90:
+        chunk_size = 200   # 3 months: even smaller
+    else:
+        chunk_size = 100   # Full year: small chunks for parallelism
+
+    # Never exceed URL length limit
+    return min(chunk_size, MAX_STATIONS_PER_CHUNK)
+
+
+def fetch_bulk_chunk(
+    station_ids: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    chunk_id: int = 0,
+) -> tuple[int, pd.DataFrame | None, str | None]:
+    """Fetch observations for multiple stations in one request.
+
+    Args:
+        station_ids: List of station IDs to fetch
+        start_date: Start timestamp
+        end_date: End timestamp
+        chunk_id: Identifier for this chunk (for logging)
+
+    Returns:
+        Tuple of (chunk_id, DataFrame or None, error message or None)
+    """
+    url = build_bulk_observation_url(station_ids, start_date, end_date)
+
+    attempt = 0
+    while True:
+        try:
+            response = requests.get(url, timeout=BULK_REQUEST_TIMEOUT)
+            response.raise_for_status()
+
+            # Check for empty response
+            if "No results found" in response.text or len(response.text.strip()) < 50:
+                return (chunk_id, None, None)
+
+            df = pd.read_csv(StringIO(response.text), low_memory=False)
+
+            if df.empty or "valid" not in df.columns:
+                return (chunk_id, None, None)
+
+            # Parse timestamp - use mixed format for robustness
+            df["valid"] = pd.to_datetime(df["valid"], format="mixed", utc=True)
+
+            # Rename lat/lon columns for consistency
+            if "lon" in df.columns:
+                df = df.rename(columns={"lon": "longitude", "lat": "latitude"})
+
+            # Convert numeric columns
+            numeric_cols = [
+                "tmpf", "tmpc", "dwpf", "dwpc", "relh", "drct",
+                "sknt", "gust", "alti", "mslp", "vsby", "p01i", "p01m",
+                "longitude", "latitude",
+            ]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            # Filter to full METAR observations only
+            if "tmpf" in df.columns:
+                df = df[df["tmpf"].notna()]
+
+            if df.empty:
+                return (chunk_id, None, None)
+
+            return (chunk_id, df, None)
+
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response else None
+
+            if status_code == 414:
+                # URL too long - this shouldn't happen with proper chunking
+                return (chunk_id, None, f"URL too long ({len(url)} chars)")
+
+            if status_code in (500, 503):
+                # Retry on server errors with exponential backoff
+                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+                attempt += 1
+                logger.warning(
+                    f"Chunk {chunk_id}: {status_code} error, retry {attempt} "
+                    f"(waiting {wait_time:.0f}s)"
+                )
+                time.sleep(wait_time)
+                continue
+
+            return (chunk_id, None, f"HTTP {status_code}")
+
+        except Exception as e:
+            return (chunk_id, None, str(e))
+
+
 def fetch_station_observations(
     station_id: str,
     start_date: pd.Timestamp,
@@ -266,20 +436,34 @@ def fetch_observations_batch(
     show_progress: bool = True,
     progress_interval: int = 0,
     description: str = "",
+    use_bulk: bool = True,
 ) -> pd.DataFrame:
-    """Fetch observations for multiple stations concurrently.
+    """Fetch observations for multiple stations.
+
+    By default uses bulk fetching (multiple stations per request) which is
+    significantly faster than per-station fetching. Set use_bulk=False to
+    use the legacy per-station approach.
 
     Args:
         stations: DataFrame with station metadata (must have 'station' and 'state' columns)
         start_date: Start timestamp
         end_date: End timestamp
-        show_progress: Whether to show progress (Rich live display if terminal, simple if piped)
+        show_progress: Whether to show progress
         progress_interval: If > 0 and show_progress=False, print inline progress every N stations
         description: Description to show in progress display
+        use_bulk: If True (default), use faster bulk multi-station fetching
 
     Returns:
         Combined DataFrame with all observations
     """
+    if use_bulk:
+        return fetch_observations_bulk(
+            stations, start_date, end_date,
+            show_progress=show_progress,
+            description=description,
+        )
+
+    # Legacy per-station fetching
     all_observations: list[pd.DataFrame] = []
     station_list = stations[["station", "state"]].drop_duplicates().to_dict("records")
     total = len(station_list)
@@ -295,6 +479,158 @@ def fetch_observations_batch(
             station_list, start_date, end_date, total,
             show_progress, progress_interval
         )
+
+
+def fetch_observations_bulk(
+    stations: pd.DataFrame,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    show_progress: bool = True,
+    description: str = "",
+    chunk_size: int | None = None,
+    max_workers: int | None = None,
+) -> pd.DataFrame:
+    """Fetch observations using bulk multi-station requests.
+
+    This is significantly faster than per-station fetching because it:
+    1. Makes fewer HTTP requests (chunks of stations instead of individual)
+    2. Uses parallel chunk fetching for throughput
+    3. Adapts chunk size based on date range
+
+    Args:
+        stations: DataFrame with station metadata (must have 'station' column,
+                  optionally 'state' for post-fetch mapping)
+        start_date: Start timestamp
+        end_date: End timestamp
+        show_progress: Whether to show progress
+        description: Description to show in progress display
+        chunk_size: Override automatic chunk size calculation
+        max_workers: Override default parallel workers (default: 3)
+
+    Returns:
+        Combined DataFrame with all observations
+    """
+    # Build station -> state mapping if state column exists
+    station_state_map = {}
+    if "state" in stations.columns:
+        station_state_map = stations.set_index("station")["state"].to_dict()
+
+    station_ids = stations["station"].unique().tolist()
+    num_stations = len(station_ids)
+
+    if num_stations == 0:
+        return pd.DataFrame()
+
+    # Calculate optimal chunk size if not specified
+    if chunk_size is None:
+        chunk_size = calculate_optimal_chunk_size(num_stations, start_date, end_date)
+
+    if max_workers is None:
+        max_workers = BULK_MAX_WORKERS
+
+    # Split stations into chunks
+    chunks = [
+        station_ids[i:i + chunk_size]
+        for i in range(0, num_stations, chunk_size)
+    ]
+    num_chunks = len(chunks)
+
+    logger.info(
+        f"Bulk fetch: {num_stations} stations in {num_chunks} chunks "
+        f"({chunk_size}/chunk, {max_workers} workers)"
+    )
+
+    console = Console()
+    all_observations: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    if show_progress and console.is_terminal:
+        # Rich progress display
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("[green]{task.fields[records]:,} records"),
+            console=console,
+        ) as progress:
+            if description:
+                progress.console.print(f"[bold]{description}[/bold]")
+
+            task = progress.add_task(
+                f"Fetching {num_stations} stations...",
+                total=num_chunks,
+                records=0,
+            )
+
+            total_records = 0
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        fetch_bulk_chunk, chunk, start_date, end_date, i
+                    ): i
+                    for i, chunk in enumerate(chunks)
+                }
+
+                for future in as_completed(futures):
+                    chunk_id, df, error = future.result()
+
+                    if error:
+                        errors.append(f"Chunk {chunk_id}: {error}")
+                        logger.warning(f"Chunk {chunk_id} failed: {error}")
+                    elif df is not None and not df.empty:
+                        all_observations.append(df)
+                        total_records += len(df)
+
+                    progress.update(task, advance=1, records=total_records)
+
+        if errors:
+            console.print(f"[yellow]Warnings: {len(errors)} chunk(s) had errors[/yellow]")
+
+    else:
+        # Simple progress (tqdm or silent)
+        completed = 0
+        total_records = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    fetch_bulk_chunk, chunk, start_date, end_date, i
+                ): i
+                for i, chunk in enumerate(chunks)
+            }
+
+            iterator = as_completed(futures)
+            if show_progress:
+                iterator = tqdm(iterator, total=num_chunks, desc="Fetching chunks")
+
+            for future in iterator:
+                chunk_id, df, error = future.result()
+                completed += 1
+
+                if error:
+                    errors.append(f"Chunk {chunk_id}: {error}")
+                    logger.warning(f"Chunk {chunk_id} failed: {error}")
+                elif df is not None and not df.empty:
+                    all_observations.append(df)
+                    total_records += len(df)
+
+        if show_progress:
+            print(f"Fetch complete: {total_records:,} records, {len(errors)} errors")
+
+    logger.info(f"Bulk fetch complete: {len(all_observations)} chunks with data")
+
+    if not all_observations:
+        return pd.DataFrame()
+
+    result = pd.concat(all_observations, ignore_index=True)
+
+    # Add state column if mapping is available
+    if station_state_map and "station" in result.columns:
+        result["state"] = result["station"].map(station_state_map)
+
+    return result
 
 
 def _fetch_with_rich_display(

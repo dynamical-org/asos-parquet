@@ -168,7 +168,7 @@
     </div>
     <div class="control-group">
       <label>Station</label>
-      <input type="text" id="stationId" value="ORD" style="width: 80px; text-transform: uppercase;">
+      <input type="text" id="stationId" value="BNA" style="width: 80px; text-transform: uppercase;">
     </div>
     <div class="control-group">
       <label>&nbsp;</label>
@@ -200,16 +200,24 @@
     const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm');
     const Plot = await import('https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.13/+esm');
 
-    // Use local data served from project root (run: python -m http.server 8000)
-    // For R2/S3, use: 'https://pub-edb100793f1249388da0cf71a4a2430b.r2.dev/asos'
-    const DATA_BASE_URL = './data/asos';
+    // Data hosted on Source Cooperative
+    const DATA_BASE_URL = 'https://data.source.coop/dynamical/asos-parquet';
 
     let db = null;
     let conn = null;
 
-    // Date helpers
+    // Date helpers - use local timezone, not UTC
     function formatDate(date) {
-      return date.toISOString().split('T')[0];
+      const y = date.getFullYear();
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      const d = String(date.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    // Parse YYYY-MM-DD without timezone shift
+    function parseDate(str) {
+      const [y, m, d] = str.split('-').map(Number);
+      return new Date(y, m - 1, d);
     }
 
     function getDefaultDates() {
@@ -225,7 +233,7 @@
     const lastYear = currentYear - 1;
 
     // Generate example queries dynamically based on current date
-    // Note: Only current year (2026) is continuously updated on R2 via Modal
+    // Note: Data is updated twice-hourly via Modal → Source Cooperative
     function generateExampleQueries() {
       const { start, end } = defaultDates;
 
@@ -234,18 +242,18 @@
       const currentYearStart = `${currentYear}-01-01`;
 
       return {
-        'default_3mo': {
-          label: `${currentYear} YTD - Chicago (ORD)`,
+        'default_ytd': {
+          label: `${currentYear} YTD - Nashville (BNA)`,
           query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
 FROM read_parquet('${DATA_BASE_URL}/year=${currentYear}/data.parquet')
-WHERE station = 'ORD'
+WHERE station = 'BNA'
 ORDER BY valid`
         },
         'last_30_days': {
-          label: `Last 30 days - Chicago (ORD)`,
+          label: `Last 30 days - Nashville (BNA)`,
           query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
 FROM read_parquet('${DATA_BASE_URL}/year=${currentYear}/data.parquet')
-WHERE station = 'ORD'
+WHERE station = 'BNA'
   AND valid >= '${formatDate(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))}'
 ORDER BY valid`
         },
@@ -253,15 +261,15 @@ ORDER BY valid`
           label: `Compare cities - Last 30 days`,
           query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
 FROM read_parquet('${DATA_BASE_URL}/year=${currentYear}/data.parquet')
-WHERE station IN ('ORD', 'LAX', 'JFK', 'DEN')
+WHERE station IN ('BNA', 'ORD', 'LAX', 'JFK')
   AND valid >= '${formatDate(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))}'
 ORDER BY station, valid`
         },
         'historical_2024': {
-          label: 'Full year - Denver (DEN) 2024',
+          label: 'Full year - Nashville (BNA) 2024',
           query: `SELECT valid, station, tmpf as temp_f, dwpf as dewpoint_f, p01i as precip_inches
 FROM read_parquet('${DATA_BASE_URL}/year=2024/data.parquet')
-WHERE station = 'DEN'
+WHERE station = 'BNA'
 ORDER BY valid`
         },
         'historical_1940': {
@@ -275,13 +283,13 @@ ORDER BY valid`
     }
 
     const EXAMPLE_QUERIES = generateExampleQueries();
-    const DEFAULT_QUERY = EXAMPLE_QUERIES['default_3mo'].query;
+    const DEFAULT_QUERY = EXAMPLE_QUERIES['default_ytd'].query;
 
     // Generate partition URLs for a date range
     function generatePartitionUrls(startDate, endDate) {
       const urls = [];
-      const startYear = new Date(startDate).getFullYear();
-      const endYear = new Date(endDate).getFullYear();
+      const startYear = parseDate(startDate).getFullYear();
+      const endYear = parseDate(endDate).getFullYear();
       for (let year = startYear; year <= endYear; year++) {
         urls.push(`'${DATA_BASE_URL}/year=${year}/data.parquet'`);
       }
@@ -539,12 +547,26 @@ ORDER BY valid`;
           tempChartContainer.replaceChildren(tempHeader, tempChart);
         }
 
-        // Create precipitation chart
+        // Create precipitation chart with adaptive binning
         const precipChartContainer = document.getElementById('precipChart');
-        const precipHeader = document.createElement('h3');
-        precipHeader.textContent = `Precipitation at ${stationLabel}`;
-
         const precipFilteredData = data.filter(d => d.precip_inches !== null && d.timestamp !== null);
+
+        // Choose bin interval based on date range
+        const daySpan = (maxDate - minDate) / (1000 * 60 * 60 * 24);
+        let precipInterval, intervalLabel;
+        if (daySpan <= 60) {
+          precipInterval = "day";
+          intervalLabel = "daily";
+        } else if (daySpan <= 365) {
+          precipInterval = "week";
+          intervalLabel = "weekly";
+        } else {
+          precipInterval = "month";
+          intervalLabel = "monthly";
+        }
+
+        const precipHeader = document.createElement('h3');
+        precipHeader.textContent = `Precipitation at ${stationLabel} (${intervalLabel})`;
 
         const precipChart = Plot.plot({
           width: 960,
@@ -561,7 +583,7 @@ ORDER BY valid`;
               {
                 x: "timestamp",
                 y: "precip_inches",
-                interval: "day",
+                interval: precipInterval,
                 fill: isMultiStation ? "station" : "#0077b6",
                 tip: true
               }
@@ -636,10 +658,11 @@ ORDER BY valid`;
       }
     });
 
-    // Initialize on load - use current year (only year continuously updated on R2)
+    // Initialize on load - set dates for current year to today
+    parseQueryToInputs(DEFAULT_QUERY); // Sync station from default query
+    // Override dates after parsing (parseQueryToInputs sets end to 12/31)
     document.getElementById('startDate').value = `${currentYear}-01-01`;
     document.getElementById('endDate').value = defaultDates.end;
-    parseQueryToInputs(DEFAULT_QUERY); // Sync station from default query
     initDuckDB();
   </script>
 </body>

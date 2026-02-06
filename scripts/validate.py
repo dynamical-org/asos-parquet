@@ -7,9 +7,10 @@ Checks each year partition for:
 - Data quality (schema, bounds, duplicates, etc.)
 
 Usage:
-    python scripts/validate.py              # Validate all years
-    python scripts/validate.py --year 2023  # Validate specific year
-    python scripts/validate.py -v           # Verbose output
+    python scripts/validate.py                    # Validate all years
+    python scripts/validate.py --year 2023        # Validate specific year
+    python scripts/validate.py -v                 # Verbose output
+    python scripts/validate.py --update-progress  # Update progress.json with results
 """
 
 import argparse
@@ -25,6 +26,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from asos_parquet.partitioned import DEFAULT_DATASET_PATH  # noqa: E402
+from asos_parquet.progress import load_progress, save_progress  # noqa: E402
 from asos_parquet.stations import fetch_all_stations  # noqa: E402
 from asos_parquet.validation import (  # noqa: E402
     ValidationReport,
@@ -50,6 +52,7 @@ def validate_year(
     base_path: Path,
     stations,
     verbose: bool = False,
+    us_only: bool = True,
 ) -> ValidationReport:
     """Validate a single year partition.
 
@@ -58,6 +61,7 @@ def validate_year(
         base_path: Base directory containing partitions
         stations: Station metadata for coverage validation
         verbose: If True, print detailed results
+        us_only: If True, enforce US-only location/state checks
 
     Returns:
         ValidationReport with all check results
@@ -83,6 +87,7 @@ def validate_year(
         min_stations=100,
         expected_stations=stations,
         year=year,
+        us_only=us_only,
     )
 
     if report.passed:
@@ -92,10 +97,32 @@ def validate_year(
 
     if verbose:
         for result in report.results:
-            status = "PASS" if result.passed else "FAIL"
-            print(f"    [{status}] {result.name}: {result.message}")
+            # ValidationResult.__str__ handles the formatting
+            print(f"    {result}")
 
     return report
+
+
+def extract_metrics(report: ValidationReport) -> dict:
+    """Extract metrics from a validation report for progress.json.
+
+    Returns:
+        Dict with station_coverage_pct, temporal_completeness_pct, median_obs_per_day
+    """
+    metrics = {
+        "station_coverage_pct": None,
+        "temporal_completeness_pct": None,
+        "median_obs_per_day": None,
+    }
+
+    for result in report.informational_results:
+        if result.name == "station_coverage":
+            metrics["station_coverage_pct"] = result.details.get("coverage_pct")
+        elif result.name == "temporal_completeness":
+            metrics["temporal_completeness_pct"] = result.details.get("dense_pct")
+            metrics["median_obs_per_day"] = result.details.get("median_obs_per_day")
+
+    return metrics
 
 
 def main():
@@ -116,7 +143,28 @@ def main():
         action="store_true",
         help="Show detailed validation results",
     )
+    parser.add_argument(
+        "--update-progress",
+        action="store_true",
+        help="Update progress.json with validation results",
+    )
+    parser.add_argument(
+        "--us-only",
+        action="store_true",
+        default=True,
+        help="Enforce US-only location/state checks (default: True)",
+    )
+    parser.add_argument(
+        "--global",
+        dest="global_mode",
+        action="store_true",
+        help="Use global validation (accept non-US locations and region codes)",
+    )
     args = parser.parse_args()
+
+    # --global overrides --us-only
+    if args.global_mode:
+        args.us_only = False
 
     base_path = Path(args.path)
 
@@ -151,7 +199,9 @@ def main():
     all_reports = []
     for year_str in years:
         year = int(year_str)
-        report = validate_year(year, base_path, stations, verbose=args.verbose)
+        report = validate_year(
+            year, base_path, stations, verbose=args.verbose, us_only=args.us_only
+        )
         all_reports.append(report)
 
     # Summary
@@ -172,8 +222,51 @@ def main():
             if not report.passed:
                 print(f"  {report.path}")
                 for result in report.results:
-                    if not result.passed:
+                    # Only show non-informational failures
+                    if not result.passed and not result.informational:
                         print(f"    - {result.name}: {result.message}")
+
+    # Show informational metrics summary if verbose
+    if args.verbose and all_reports:
+        print("\nInformational Metrics:")
+        for report in all_reports:
+            for result in report.informational_results:
+                year = report.path.split("year=")[-1].split("/")[0]
+                print(f"  year={year}: {result.name}: {result.message}")
+
+    # Update progress.json if requested
+    if args.update_progress:
+        print("\nUpdating progress.json...")
+        progress = load_progress()
+        updated_count = 0
+
+        for report in all_reports:
+            # Extract year from path
+            year_str = report.path.split("year=")[-1].split("/")[0]
+            year = int(year_str)
+
+            # Get existing progress for this year
+            year_progress = progress.get_year(year)
+
+            # Only update if year exists in progress (was previously loaded)
+            if year_progress.status == "pending" and year_progress.records == 0:
+                print(f"  Skipping year={year} (not in progress.json)")
+                continue
+
+            # Extract metrics from report
+            metrics = extract_metrics(report)
+
+            # Update validation fields
+            year_progress.validated = True
+            year_progress.validation_passed = report.passed
+            year_progress.station_coverage_pct = metrics["station_coverage_pct"]
+            year_progress.temporal_completeness_pct = metrics["temporal_completeness_pct"]
+            year_progress.median_obs_per_day = metrics["median_obs_per_day"]
+
+            updated_count += 1
+
+        save_progress(progress)
+        print(f"  Updated {updated_count} years in progress.json")
 
     return 0 if failed == 0 else 1
 

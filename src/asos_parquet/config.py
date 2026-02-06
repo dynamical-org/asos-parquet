@@ -4,6 +4,7 @@ from pathlib import Path
 
 # API endpoints
 STATION_METADATA_URL = "https://mesonet.agron.iastate.edu/geojson/network/{state}_ASOS.geojson"
+NETWORK_METADATA_URL = "https://mesonet.agron.iastate.edu/geojson/network/{network_id}.geojson"
 OBSERVATION_DATA_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 
 # Rate limiting
@@ -38,6 +39,42 @@ US_STATES = [
     "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC",
     "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY",
 ]
+
+# Canadian provinces with ASOS networks
+CANADIAN_PROVINCES = [
+    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT",
+]
+
+# International countries with ASOS networks (major countries for initial support)
+INTERNATIONAL_COUNTRIES = [
+    "AU", "BR", "CN", "DE", "FR", "GB", "IN", "JP", "KR", "MX", "NZ", "RU", "ZA",
+]
+
+
+def get_all_network_ids(
+    us: bool = True,
+    canada: bool = False,
+    countries: list[str] | None = None,
+) -> list[str]:
+    """Build network ID strings for Iowa Mesonet ASOS networks.
+
+    Args:
+        us: Include US state networks
+        canada: Include Canadian province networks
+        countries: List of country codes to include (e.g. ["AU", "GB"])
+
+    Returns:
+        List of network ID strings (e.g. ["CA_ASOS", "AU__ASOS", "CA_AB_ASOS"])
+    """
+    networks = []
+    if us:
+        networks.extend(f"{state}_ASOS" for state in US_STATES)
+    if canada:
+        networks.extend(f"CA_{prov}_ASOS" for prov in CANADIAN_PROVINCES)
+    if countries:
+        networks.extend(f"{cc}__ASOS" for cc in countries)
+    return networks
+
 
 # Output paths (relative to current working directory)
 DEFAULT_DATA_DIR = Path("data")

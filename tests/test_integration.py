@@ -20,7 +20,7 @@ class TestStationFetching:
 
     def test_fetch_single_state(self):
         """Fetch stations for a single state."""
-        stations = fetch_network_stations("CA")
+        stations = fetch_network_stations("CA_ASOS")
 
         assert len(stations) > 0
         assert "station" in stations.columns
@@ -30,15 +30,15 @@ class TestStationFetching:
 
     def test_fetch_all_states(self):
         """Fetch stations for multiple states."""
-        stations = fetch_all_stations(states=["CA", "NY"])
+        stations = fetch_all_stations(networks=["CA_ASOS", "NY_ASOS"])
 
         assert len(stations) > 0
         assert set(stations["state"].unique()) == {"CA", "NY"}
 
     def test_online_only_filter(self):
         """Test filtering for online stations only."""
-        all_stations = fetch_all_stations(states=["CA"])
-        online_stations = fetch_all_stations(states=["CA"], online_only=True)
+        all_stations = fetch_all_stations(networks=["CA_ASOS"])
+        online_stations = fetch_all_stations(networks=["CA_ASOS"], online_only=True)
 
         # Online stations should be subset
         assert len(online_stations) <= len(all_stations)
@@ -64,7 +64,7 @@ class TestObservationFetching:
 
     def test_fetch_batch(self):
         """Fetch observations for multiple stations."""
-        stations = fetch_network_stations("CA").head(3)
+        stations = fetch_network_stations("CA_ASOS").head(3)
         start = pd.Timestamp("2024-12-01", tz="UTC")
         end = pd.Timestamp("2024-12-02", tz="UTC")
 
@@ -81,7 +81,7 @@ class TestGeoparquetCreation:
     def test_create_valid_geoparquet(self, tmp_path):
         """Create a geoparquet from fetched data and validate it."""
         # Fetch a small amount of data
-        stations = fetch_network_stations("CA").head(5)
+        stations = fetch_network_stations("CA_ASOS").head(5)
         start = pd.Timestamp("2024-12-01", tz="UTC")
         end = pd.Timestamp("2024-12-02", tz="UTC")
 

@@ -5,22 +5,53 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
-from .config import MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT, STATION_METADATA_URL, US_STATES
+from .config import (
+    MAX_CONCURRENT_REQUESTS,
+    NETWORK_METADATA_URL,
+    REQUEST_TIMEOUT,
+    get_all_network_ids,
+)
 
 
-def fetch_network_stations(state: str) -> pd.DataFrame:
-    """Fetch station metadata for a single state's ASOS network.
+def _parse_network_id(network_id: str) -> tuple[str, str]:
+    """Derive region_code and country from a network ID string.
 
     Args:
-        state: Two-letter state code (e.g., 'CA', 'NY')
+        network_id: Network ID (e.g. "CA_ASOS", "AU__ASOS", "CA_AB_ASOS")
+
+    Returns:
+        Tuple of (region_code, country)
+    """
+    # Strip _ASOS suffix, then strip trailing underscores
+    region_code = network_id.removesuffix("_ASOS").rstrip("_")
+    # Determine country from pattern
+    if "__ASOS" in network_id:
+        # International: "AU__ASOS" -> country="AU"
+        country = region_code
+    elif network_id.startswith("CA_") and len(region_code) > 2:
+        # Canadian province: "CA_AB_ASOS" -> country="CA"
+        country = "CA"
+    else:
+        # US state: "CA_ASOS" -> country="US"
+        country = "US"
+    return region_code, country
+
+
+def fetch_network_stations(network_id: str) -> pd.DataFrame:
+    """Fetch station metadata for a single ASOS network.
+
+    Args:
+        network_id: Network ID string (e.g. 'CA_ASOS', 'AU__ASOS', 'CA_AB_ASOS')
 
     Returns:
         DataFrame with station metadata including coordinates and archive dates
     """
-    url = STATION_METADATA_URL.format(state=state)
+    url = NETWORK_METADATA_URL.format(network_id=network_id)
     response = requests.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     data = response.json()
+
+    region_code, country = _parse_network_id(network_id)
 
     rows = []
     for feature in data["features"]:
@@ -33,8 +64,8 @@ def fetch_network_stations(state: str) -> pd.DataFrame:
             "longitude": coords[0],
             "latitude": coords[1],
             "elevation": props.get("elevation"),
-            "state": state,
-            "country": "US",
+            "state": region_code,
+            "country": country,
             "archive_begin": props.get("archive_begin"),
             "archive_end": props.get("archive_end"),
             "online": props.get("online", False),
@@ -44,36 +75,36 @@ def fetch_network_stations(state: str) -> pd.DataFrame:
 
 
 def fetch_all_stations(
-    states: list[str] | None = None,
+    networks: list[str] | None = None,
     online_only: bool = False,
 ) -> pd.DataFrame:
-    """Fetch station metadata for all US ASOS networks.
+    """Fetch station metadata for ASOS networks.
 
     Args:
-        states: List of state codes to fetch. Defaults to all US states.
+        networks: List of network ID strings to fetch. Defaults to US-only networks.
         online_only: If True, only return currently online stations.
 
     Returns:
         DataFrame with all station metadata
     """
-    if states is None:
-        states = US_STATES
+    if networks is None:
+        networks = get_all_network_ids(us=True)
 
     all_stations: list[pd.DataFrame] = []
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS * 2) as executor:
         futures = {
-            executor.submit(fetch_network_stations, state): state
-            for state in states
+            executor.submit(fetch_network_stations, network_id): network_id
+            for network_id in networks
         }
         for future in as_completed(futures):
-            state = futures[future]
+            network_id = futures[future]
             try:
                 df = future.result()
                 if not df.empty:
                     all_stations.append(df)
             except Exception as e:
-                print(f"[warning] failed to fetch {state}_ASOS stations: {e}")
+                print(f"[warning] failed to fetch {network_id} stations: {e}")
 
     if not all_stations:
         return pd.DataFrame()
@@ -99,19 +130,19 @@ def fetch_all_stations(
 def get_stations_for_period(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
-    states: list[str] | None = None,
+    networks: list[str] | None = None,
 ) -> pd.DataFrame:
     """Get stations with data available in the given time period.
 
     Args:
         start_date: Start of period
         end_date: End of period
-        states: List of state codes. Defaults to all US states.
+        networks: List of network ID strings. Defaults to US-only networks.
 
     Returns:
         DataFrame of stations with overlapping archive ranges
     """
-    stations = fetch_all_stations(states=states)
+    stations = fetch_all_stations(networks=networks)
 
     if stations.empty:
         return stations

@@ -15,6 +15,7 @@ Usage:
 import argparse
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -27,8 +28,8 @@ load_dotenv()
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from asos_parquet.config import US_STATES  # noqa: E402
-from asos_parquet.load import load_year  # noqa: E402
+from asos_parquet.config import US_STATES, get_all_network_ids  # noqa: E402
+from asos_parquet.load import load_year, update_year  # noqa: E402
 from asos_parquet.partitioned import DEFAULT_DATASET_PATH  # noqa: E402
 from asos_parquet.progress import (  # noqa: E402
     DEFAULT_PROGRESS_PATH,
@@ -58,24 +59,36 @@ def setup_logging() -> Path:
     return log_file
 
 
+@dataclass
+class ValidationMetrics:
+    """Metrics extracted from validation for progress tracking."""
+
+    passed: bool
+    station_coverage_pct: float | None = None
+    temporal_completeness_pct: float | None = None
+    median_obs_per_day: float | None = None
+
+
 def validate_year_data(
     year: int,
     stations: pd.DataFrame,
     verbose: bool = False,
-) -> tuple[bool, bool]:
+    us_only: bool = True,
+) -> tuple[bool, ValidationMetrics | None]:
     """Validate a year's data file.
 
     Args:
         year: Year to validate
         stations: Station metadata for coverage check
         verbose: Whether to print detailed results
+        us_only: If True, enforce US-only location/state checks
 
     Returns:
-        Tuple of (was_validated, passed)
+        Tuple of (was_validated, metrics or None)
     """
     partition_path = DEFAULT_DATASET_PATH / f"year={year}" / "data.parquet"
     if not partition_path.exists():
-        return False, False
+        return False, None
 
     report = validate_geoparquet(
         partition_path,
@@ -83,14 +96,33 @@ def validate_year_data(
         min_stations=10,
         expected_stations=stations,
         year=year,
+        us_only=us_only,
     )
 
     if verbose:
         for result in report.results:
-            status = "PASS" if result.passed else "FAIL"
-            print(f"    [{status}] {result.name}: {result.message}")
+            print(f"    {result}")
 
-    return True, report.passed
+    # Extract informational metrics
+    station_coverage_pct = None
+    temporal_completeness_pct = None
+    median_obs_per_day = None
+
+    for result in report.informational_results:
+        if result.name == "station_coverage":
+            station_coverage_pct = result.details.get("coverage_pct")
+        elif result.name == "temporal_completeness":
+            temporal_completeness_pct = result.details.get("dense_pct")
+            median_obs_per_day = result.details.get("median_obs_per_day")
+
+    metrics = ValidationMetrics(
+        passed=report.passed,
+        station_coverage_pct=station_coverage_pct,
+        temporal_completeness_pct=temporal_completeness_pct,
+        median_obs_per_day=median_obs_per_day,
+    )
+
+    return True, metrics
 
 
 def run_load(
@@ -99,6 +131,7 @@ def run_load(
     resume: bool = False,
     validate: bool = True,
     verbose: bool = False,
+    networks: list[str] | None = None,
 ) -> int:
     """Run the year-by-year load process.
 
@@ -108,6 +141,7 @@ def run_load(
         resume: If True, skip completed years from progress.json
         validate: If True, run validation after each year
         verbose: If True, show detailed output
+        networks: List of network ID strings. Defaults to US-only.
 
     Returns:
         Exit code (0 for success, 1 for failure)
@@ -135,11 +169,14 @@ def run_load(
     progress = load_progress()
 
     if resume and year is None:
-        # Filter to incomplete years
+        # Filter to incomplete years, but always include current year for updates
         completed = progress.get_completed_years()
-        years_to_process = [y for y in years_to_process if y not in completed]
-        if completed:
-            print(f"Resuming: {len(completed)} years already completed")
+        completed_except_current = [y for y in completed if y != current_year]
+        years_to_process = [y for y in years_to_process if y not in completed_except_current]
+        if completed_except_current:
+            print(f"Resuming: {len(completed_except_current)} years already completed")
+        if current_year in years_to_process:
+            print(f"Will incrementally update current year ({current_year})")
         if not years_to_process:
             print("All years already completed!")
             return 0
@@ -148,14 +185,20 @@ def run_load(
     logging.info(f"Years to process: {years_to_process}")
 
     # Fetch station metadata
-    print(f"\nFetching station metadata for {len(US_STATES)} states...")
-    stations = fetch_all_stations(states=US_STATES, online_only=False)
+    if networks is None:
+        networks = get_all_network_ids(us=True)
+    print(f"\nFetching station metadata for {len(networks)} networks...")
+    stations = fetch_all_stations(networks=networks, online_only=False)
     print(f"Found {len(stations)} stations")
     logging.info(f"Found {len(stations)} stations")
 
     if stations.empty:
         print("No stations found. Exiting.")
         return 1
+
+    # Determine if we're US-only for validation
+    us_network_ids = {f"{s}_ASOS" for s in US_STATES}
+    us_only = all(nid in us_network_ids for nid in networks)
 
     # Process each year
     total_records = 0
@@ -173,14 +216,24 @@ def run_load(
             progress.mark_current_year(year)
         save_progress(progress)
 
-        # Load the year
-        logging.info(f"Loading year {year}")
-        result = load_year(
-            year,
-            stations,
-            base_path=DEFAULT_DATASET_PATH,
-            show_progress=True,
-        )
+        # Load or update the year
+        # For current year with --resume, do incremental update from last observation
+        if resume and year == current_year:
+            logging.info(f"Incrementally updating year {year}")
+            result = update_year(
+                year,
+                stations,
+                base_path=DEFAULT_DATASET_PATH,
+                show_progress=True,
+            )
+        else:
+            logging.info(f"Loading year {year}")
+            result = load_year(
+                year,
+                stations,
+                base_path=DEFAULT_DATASET_PATH,
+                show_progress=True,
+            )
 
         if result.success:
             print(f"Loaded {result.records:,} records from {result.stations} stations")
@@ -188,25 +241,33 @@ def run_load(
 
             # Validate if requested
             validated = False
-            validation_passed = False
+            metrics = None
             if validate and result.records > 0:
                 print("Validating...", end=" ", flush=True)
-                validated, validation_passed = validate_year_data(
-                    year, stations, verbose=verbose
+                validated, metrics = validate_year_data(
+                    year, stations, verbose=verbose, us_only=us_only
                 )
-                if validated:
-                    print("PASSED" if validation_passed else "FAILED")
-                    logging.info(f"Validation: {'PASSED' if validation_passed else 'FAILED'}")
+                if validated and metrics:
+                    print("PASSED" if metrics.passed else "FAILED")
+                    logging.info(f"Validation: {'PASSED' if metrics.passed else 'FAILED'}")
+                    if metrics.station_coverage_pct is not None:
+                        logging.info(f"  Station coverage: {metrics.station_coverage_pct:.1f}%")
+                    if metrics.temporal_completeness_pct is not None:
+                        pct = metrics.temporal_completeness_pct
+                        logging.info(f"  Temporal completeness: {pct:.1f}%")
                 else:
                     print("SKIPPED")
 
-            # Update progress
+            # Update progress with metrics
             progress.mark_completed(
                 year,
                 records=result.records,
                 stations=result.stations,
                 validated=validated,
-                validation_passed=validation_passed,
+                validation_passed=metrics.passed if metrics else False,
+                station_coverage_pct=metrics.station_coverage_pct if metrics else None,
+                temporal_completeness_pct=metrics.temporal_completeness_pct if metrics else None,
+                median_obs_per_day=metrics.median_obs_per_day if metrics else None,
             )
             save_progress(progress)
 
@@ -267,8 +328,34 @@ def main():
         action="store_true",
         help="Show detailed validation results",
     )
+    parser.add_argument(
+        "--networks",
+        choices=["us", "global", "us+ca"],
+        default="us",
+        help="Which networks to fetch (default: us)",
+    )
+    parser.add_argument(
+        "--countries",
+        type=str,
+        default="",
+        help="Comma-separated country codes to include (e.g. AU,GB,JP)",
+    )
 
     args = parser.parse_args()
+
+    # Build network list from args
+    countries = (
+        [c.strip().upper() for c in args.countries.split(",") if c.strip()]
+        if args.countries
+        else []
+    )
+    if args.networks == "global":
+        from asos_parquet.config import INTERNATIONAL_COUNTRIES
+        network_ids = get_all_network_ids(us=True, canada=True, countries=INTERNATIONAL_COUNTRIES)
+    elif args.networks == "us+ca":
+        network_ids = get_all_network_ids(us=True, canada=True, countries=countries)
+    else:
+        network_ids = get_all_network_ids(us=True, countries=countries)
 
     return run_load(
         year=args.year,
@@ -276,6 +363,7 @@ def main():
         resume=args.resume,
         validate=not args.no_validate,
         verbose=args.verbose,
+        networks=network_ids,
     )
 
 
