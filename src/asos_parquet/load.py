@@ -42,6 +42,9 @@ def observations_to_geoparquet(df: pd.DataFrame) -> gpd.GeoDataFrame:
     if df.empty:
         return gpd.GeoDataFrame()
 
+    # Copy to avoid mutating the input DataFrame
+    df = df.copy()
+
     # Ensure station is string
     if "station" in df.columns:
         df["station"] = df["station"].astype(str)

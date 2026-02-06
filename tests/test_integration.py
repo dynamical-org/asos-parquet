@@ -108,6 +108,40 @@ class TestGeoparquetCreation:
         assert geometry_result.passed, f"Geometry validation failed: {geometry_result.message}"
         assert timestamps_result.passed, f"Timestamp validation failed: {timestamps_result.message}"
 
+    def test_no_mutation_of_input_dataframe(self):
+        """Verify that observations_to_geoparquet doesn't mutate input DataFrame."""
+        # Create a simple test DataFrame
+        df = pd.DataFrame(
+            {
+                "station": [123, 456, 789],  # Numeric station IDs
+                "valid": pd.to_datetime(
+                    ["2024-01-01", "2024-01-02", "2024-01-03"], utc=True
+                ),
+                "longitude": [-122.0, -121.0, -120.0],
+                "latitude": [37.0, 38.0, 39.0],
+                "tmpf": [50.0, 55.0, 60.0],
+            }
+        )
+
+        # Store original values for comparison
+        original_station_values = df["station"].copy()
+        original_station_dtype = df["station"].dtype
+        original_index = df.index.copy()
+
+        # Call the function
+        gdf = observations_to_geoparquet(df)
+
+        # Verify input DataFrame was NOT mutated
+        assert df["station"].dtype == original_station_dtype, "Station dtype was mutated"
+        assert df["station"].equals(original_station_values), "Station values were mutated"
+        assert df.index.equals(original_index), "Index was mutated"
+
+        # Verify output GeoDataFrame has correct transformations
+        # Check that dtype is a string type (object or StringDtype)
+        assert pd.api.types.is_string_dtype(gdf["station"]), "Output station should be string type"
+        assert all(isinstance(x, str) for x in gdf["station"]), "All stations should be strings"
+        assert len(gdf) == 3, "Output should have same number of rows"
+
 
 @pytest.mark.skipif(
     not (DEFAULT_DATASET_PATH / "year=2024" / "data.parquet").exists(),
