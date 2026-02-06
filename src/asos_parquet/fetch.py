@@ -4,15 +4,15 @@ Supports two fetch strategies:
 1. Per-station fetching: Individual requests per station (legacy, more retries)
 2. Bulk fetching: Multiple stations per request (faster, adaptive chunking)
 
-The bulk strategy uses adaptive chunk sizing based on date range:
-- Longer ranges (months/years): Smaller chunks (100 stations) for manageable response sizes
-- Shorter ranges (days): Larger chunks (1500 stations) for fewer HTTP requests
+The bulk strategy splits work along two dimensions:
+- Stations: chunked into groups of ~1000 (URL length permitting)
+- Time: ranges > 31 days are split into monthly sub-requests
 
-URL length limit (~8KB) caps chunks at ~1,800 stations regardless of date range.
+This avoids server-side bottlenecks with large time ranges. Benchmarking
+showed 1000 stations x 1 month is ~10x faster than 100 stations x 1 year.
 """
 
 import logging
-import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -42,7 +42,7 @@ from .config import (
 MAX_URL_LENGTH = 7500  # Conservative limit below 8KB server limit
 MAX_STATIONS_PER_CHUNK = 1500  # Safe default under URL limit
 BULK_REQUEST_TIMEOUT = 300  # Bulk requests may take longer
-BULK_MAX_WORKERS = 3  # Concurrent bulk requests (conservative for rate limits)
+BULK_MAX_WORKERS = 5  # Concurrent bulk requests
 
 
 @dataclass
@@ -209,9 +209,12 @@ def calculate_optimal_chunk_size(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
 ) -> int:
-    """Calculate optimal chunk size based on date range.
+    """Calculate optimal stations per chunk based on date range.
 
-    Shorter date ranges can use larger chunks since response data is smaller.
+    Since long date ranges are split into monthly sub-requests by
+    fetch_observations_bulk, the effective per-request time window is
+    at most ~31 days, allowing large station chunks in all cases.
+
     URL length (~8KB limit) caps chunks at ~1,800 stations regardless.
 
     Args:
@@ -224,21 +227,53 @@ def calculate_optimal_chunk_size(
     """
     days = (end_date - start_date).days + 1
 
-    # Base chunk size on date range
-    # These values were determined experimentally
     if days <= 1:
-        chunk_size = 1500  # 1 day: large chunks OK
+        chunk_size = 1500  # 1 day: very large chunks OK
     elif days <= 7:
-        chunk_size = 1000  # 1 week: medium chunks
-    elif days <= 31:
-        chunk_size = 500   # 1 month: smaller chunks
-    elif days <= 90:
-        chunk_size = 200   # 3 months: even smaller
+        chunk_size = 1000  # 1 week: large chunks
     else:
-        chunk_size = 100   # Full year: small chunks for parallelism
+        # For anything longer, monthly splitting handles the time dimension.
+        # Use 1000 stations per chunk (URL ~4.5KB, well under 7.5KB limit).
+        chunk_size = 1000
 
     # Never exceed URL length limit
     return min(chunk_size, MAX_STATIONS_PER_CHUNK)
+
+
+def split_date_range_monthly(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Split a date range into monthly sub-periods.
+
+    For ranges <= 31 days, returns the original range as-is.
+    For longer ranges, splits on calendar month boundaries.
+
+    Args:
+        start_date: Start timestamp (tz-aware)
+        end_date: End timestamp (tz-aware)
+
+    Returns:
+        List of (start, end) timestamp pairs
+    """
+    if (end_date - start_date).days <= 31:
+        return [(start_date, end_date)]
+
+    periods = []
+    current = start_date
+    while current < end_date:
+        # Advance to the 1st of the next month
+        if current.month == 12:
+            month_end = pd.Timestamp(f"{current.year + 1}-01-01", tz=current.tz)
+        else:
+            month_end = pd.Timestamp(
+                f"{current.year}-{current.month + 1:02d}-01", tz=current.tz
+            )
+        period_end = min(month_end, end_date)
+        periods.append((current, period_end))
+        current = month_end
+
+    return periods
 
 
 def fetch_bulk_chunk(
@@ -529,14 +564,25 @@ def fetch_observations_bulk(
         max_workers = BULK_MAX_WORKERS
 
     # Split stations into chunks
-    chunks = [
+    station_chunks = [
         station_ids[i:i + chunk_size]
         for i in range(0, num_stations, chunk_size)
     ]
-    num_chunks = len(chunks)
+
+    # Split long date ranges into monthly sub-periods for faster server response
+    time_periods = split_date_range_monthly(start_date, end_date)
+
+    # Build task list: cross-product of station chunks × time periods
+    tasks: list[tuple[list[str], pd.Timestamp, pd.Timestamp]] = []
+    for stn_chunk in station_chunks:
+        for period_start, period_end in time_periods:
+            tasks.append((stn_chunk, period_start, period_end))
+
+    num_chunks = len(tasks)
 
     logger.info(
-        f"Bulk fetch: {num_stations} stations in {num_chunks} chunks "
+        f"Bulk fetch: {num_stations} stations in {len(station_chunks)} station chunks "
+        f"x {len(time_periods)} time periods = {num_chunks} tasks "
         f"({chunk_size}/chunk, {max_workers} workers)"
     )
 
@@ -568,9 +614,9 @@ def fetch_observations_bulk(
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
                     executor.submit(
-                        fetch_bulk_chunk, chunk, start_date, end_date, i
+                        fetch_bulk_chunk, stn_chunk, p_start, p_end, i
                     ): i
-                    for i, chunk in enumerate(chunks)
+                    for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
                 }
 
                 for future in as_completed(futures):
@@ -596,9 +642,9 @@ def fetch_observations_bulk(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
-                    fetch_bulk_chunk, chunk, start_date, end_date, i
+                    fetch_bulk_chunk, stn_chunk, p_start, p_end, i
                 ): i
-                for i, chunk in enumerate(chunks)
+                for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
             }
 
             iterator = as_completed(futures)
