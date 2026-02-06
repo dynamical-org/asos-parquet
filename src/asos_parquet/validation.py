@@ -9,10 +9,10 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
-from .config import CANADIAN_PROVINCES, DATA_FIELDS, INTERNATIONAL_COUNTRIES, US_STATES
+from .config import ALL_COUNTRIES, CANADIAN_PROVINCES, DATA_FIELDS, US_STATES
 
-# All valid region codes (US states + Canadian provinces + international countries)
-ALL_REGION_CODES = set(US_STATES) | set(CANADIAN_PROVINCES) | set(INTERNATIONAL_COUNTRIES)
+# All valid region codes (US states + Canadian provinces + international country codes)
+ALL_REGION_CODES = set(US_STATES) | set(CANADIAN_PROVINCES) | set(ALL_COUNTRIES)
 # Canadian provinces use "CA_XX" format in the state column
 ALL_REGION_CODES.update(f"CA_{prov}" for prov in CANADIAN_PROVINCES)
 

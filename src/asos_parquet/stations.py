@@ -88,7 +88,7 @@ def fetch_all_stations(
         DataFrame with all station metadata
     """
     if networks is None:
-        networks = get_all_network_ids(us=True)
+        networks = get_all_network_ids()
 
     all_stations: list[pd.DataFrame] = []
 

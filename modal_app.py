@@ -132,7 +132,7 @@ def update_asos_data(lookback_hours: int = 2):
             raise
 
     # Step 2: Fetch station metadata
-    networks = get_all_network_ids(us=True)
+    networks = get_all_network_ids()
     logger.info(f"Fetching station metadata for {len(networks)} networks...")
     stations = fetch_all_stations(networks=networks, online_only=True)
     logger.info(f"Found {len(stations)} online stations")

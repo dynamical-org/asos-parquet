@@ -186,7 +186,7 @@ def run_load(
 
     # Fetch station metadata
     if networks is None:
-        networks = get_all_network_ids(us=True)
+        networks = get_all_network_ids()
     print(f"\nFetching station metadata for {len(networks)} networks...")
     stations = fetch_all_stations(networks=networks, online_only=False)
     print(f"Found {len(stations)} stations")
@@ -329,16 +329,10 @@ def main():
         help="Show detailed validation results",
     )
     parser.add_argument(
-        "--networks",
-        choices=["us", "global", "us+ca"],
-        default="us",
-        help="Which networks to fetch (default: us)",
-    )
-    parser.add_argument(
         "--countries",
         type=str,
         default="",
-        help="Comma-separated country codes to include (e.g. AU,GB,JP)",
+        help="Comma-separated country codes to include (default: all). e.g. US,CA,AU,GB",
     )
 
     args = parser.parse_args()
@@ -347,15 +341,9 @@ def main():
     countries = (
         [c.strip().upper() for c in args.countries.split(",") if c.strip()]
         if args.countries
-        else []
+        else None  # None → ALL_COUNTRIES default
     )
-    if args.networks == "global":
-        from asos_parquet.config import INTERNATIONAL_COUNTRIES
-        network_ids = get_all_network_ids(us=True, canada=True, countries=INTERNATIONAL_COUNTRIES)
-    elif args.networks == "us+ca":
-        network_ids = get_all_network_ids(us=True, canada=True, countries=countries)
-    else:
-        network_ids = get_all_network_ids(us=True, countries=countries)
+    network_ids = get_all_network_ids(countries=countries)
 
     return run_load(
         year=args.year,
