@@ -540,7 +540,7 @@ def fetch_observations_bulk(
         show_progress: Whether to show progress
         description: Description to show in progress display
         chunk_size: Override automatic chunk size calculation
-        max_workers: Override default parallel workers (default: 3)
+        max_workers: Override default parallel workers (default: 5)
 
     Returns:
         Combined DataFrame with all observations
