@@ -115,4 +115,4 @@ echo "Upload complete!"
 # Show what's in S3
 echo ""
 echo "S3 contents:"
-aws s3 ls $ENDPOINT_ARG "s3://$S3_BUCKET/$S3_PREFIX/" --recursive --human-readable | head -20
+aws s3 ls $ENDPOINT_ARG "s3://$S3_BUCKET/$S3_PREFIX/" --recursive --human-readable 2>/dev/null | head -20
