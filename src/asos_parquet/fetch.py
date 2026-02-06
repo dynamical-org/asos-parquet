@@ -236,8 +236,8 @@ def calculate_optimal_chunk_size(
         # Use 1000 stations per chunk (URL ~4.5KB, well under 7.5KB limit).
         chunk_size = 1000
 
-    # Never exceed URL length limit
-    return min(chunk_size, MAX_STATIONS_PER_CHUNK)
+    # Never exceed URL length limit or total number of stations
+    return min(chunk_size, num_stations, MAX_STATIONS_PER_CHUNK)
 
 
 def split_date_range_monthly(
