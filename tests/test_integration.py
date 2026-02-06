@@ -4,9 +4,8 @@ These tests require network access and perform real data fetching.
 Run with: pytest tests/test_integration.py -v
 """
 
-import pytest
-
 import pandas as pd
+import pytest
 
 from asos_parquet.fetch import fetch_observations_batch, fetch_station_observations
 from asos_parquet.load import observations_to_geoparquet
