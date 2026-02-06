@@ -49,9 +49,16 @@ def observations_to_geoparquet(df: pd.DataFrame) -> gpd.GeoDataFrame:
     # Sort by station then timestamp for optimal predicate pushdown
     df = df.sort_values(["station", "valid"])
 
-    # Vectorized geometry creation — avoids 37M+ individual Python Point objects
-    geometry = gpd.points_from_xy(df["longitude"], df["latitude"])
+    # Mask rows with missing coordinates so we don't create POINT (nan nan)
+    valid_coords = df["longitude"].notna() & df["latitude"].notna()
 
+    # Initialize geometry with nulls, then fill only valid rows with Points
+    geometry = pd.Series([None] * len(df), index=df.index, dtype="object")
+    if valid_coords.any():
+        geometry.loc[valid_coords] = gpd.points_from_xy(
+            df.loc[valid_coords, "longitude"],
+            df.loc[valid_coords, "latitude"],
+        )
     return gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
 
