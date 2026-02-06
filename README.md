@@ -1,63 +1,85 @@
 # ASOS Parquet
 
-Historical and real-time US weather observations as cloud-native GeoParquet.
+Global airport weather observations (ASOS/AWOS) as cloud-native GeoParquet, updated hourly.
 
-[![Data Status](https://img.shields.io/badge/data-1940--present-green)](docs/README.md)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+**[Documentation & Interactive Query Builder →](https://dynamical.org/catalog/asos-parquet/)**
 
-## Overview
+## Use the data
 
-This project provides a complete data pipeline for [ASOS (Automated Surface Observing System)](https://www.weather.gov/asos/) weather observations:
+Data is hosted on [Source Cooperative](https://source.coop/) and accessible via HTTPS or S3 with no authentication required.
 
-- **~2,900 weather stations** across all 50 US states
-- **Hourly observations** from 1940 to present
-- **GeoParquet format** optimized for analytical queries
-- **Year-partitioned** for efficient time-range filtering
+Each year is a separate GeoParquet file following the pattern:
 
-Data is sourced from the [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/) and stored in S3-compatible cloud storage.
+```
+https://data.source.coop/dynamical/asos-parquet/year={YYYY}/data.parquet
+```
 
-## Quick Start
-
-### Query the Data
+### DuckDB (Python)
 
 ```python
 import duckdb
 
-# Configure S3 access (example with Cloudflare R2)
 conn = duckdb.connect()
-conn.execute("INSTALL httpfs; LOAD httpfs;")
-conn.execute("SET s3_endpoint = 'your-account.r2.cloudflarestorage.com';")
-conn.execute("SET s3_access_key_id = 'your-key';")
-conn.execute("SET s3_secret_access_key = 'your-secret';")
-conn.execute("SET s3_region = 'auto';")
 
-# Query temperature data from 2024
-result = conn.execute("""
-    SELECT station, valid, tmpf, dwpf, state
-    FROM read_parquet('s3://your-bucket/asos/year=2024/data.parquet')
-    WHERE state = 'CA' AND tmpf > 100
-    ORDER BY tmpf DESC
-    LIMIT 10
-""").fetchdf()
+conn.sql("""
+    SELECT station, valid, tmpf, dwpf, sknt, p01i
+    FROM 'https://data.source.coop/dynamical/asos-parquet/year=2025/data.parquet'
+    WHERE station = 'KJFK'
+      AND valid >= '2025-06-01'
+    ORDER BY valid
+""").show()
 ```
 
-### Build the Dataset Yourself
+### PyArrow
+
+```python
+import pyarrow.parquet as pq
+import pyarrow.fs as fs
+
+s3 = fs.S3FileSystem(region="us-east-2", anonymous=True)
+dataset = pq.ParquetDataset(
+    "data.source.coop/dynamical/asos-parquet/",
+    filesystem=s3,
+)
+table = dataset.read()
+df = table.to_pandas()
+```
+
+### DuckDB (CLI)
 
 ```bash
-# Install dependencies
-make install
-
-# Load historical data (1940-present)
-make load
-
-# Upload to S3
-./scripts/upload_s3.sh
-
-# Deploy hourly updates via Modal
-modal deploy modal_app.py
+duckdb -c "
+    SELECT station, valid, tmpf, dwpf
+    FROM 'https://data.source.coop/dynamical/asos-parquet/year=2024/data.parquet'
+    WHERE tmpf > 110
+    ORDER BY tmpf DESC
+    LIMIT 20
+"
 ```
 
-## Data Schema
+### Multi-year queries
+
+```sql
+SELECT *
+FROM read_parquet([
+    'https://data.source.coop/dynamical/asos-parquet/year=2023/data.parquet',
+    'https://data.source.coop/dynamical/asos-parquet/year=2024/data.parquet'
+])
+WHERE station = 'KORD'
+ORDER BY valid
+```
+
+## About the data
+
+- **Stations**: Global ASOS/AWOS airport stations
+- **Time range**: 1940 to present
+- **Resolution**: Hourly (METAR reports)
+- **Updates**: Hourly
+- **Format**: Year-partitioned GeoParquet (`year=YYYY/data.parquet`)
+
+Observations are sourced from the [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/) at Iowa State University with no resampling, interpolation, or quality-control filtering applied. Full details on schema, fields, data quality, and access patterns are in the [documentation](https://dynamical.org/catalog/asos-parquet/).
+
+### Key fields
 
 | Field | Description | Units |
 |-------|-------------|-------|
@@ -69,57 +91,36 @@ modal deploy modal_app.py
 | `drct` | Wind direction | degrees |
 | `sknt` | Wind speed | knots |
 | `gust` | Wind gust | knots |
+| `p01i` / `p01m` | 1-hour precipitation | inches / mm |
+| `alti` / `mslp` | Pressure | inHg / mb |
 | `vsby` | Visibility | miles |
-| `p01i` / `p01m` | 1-hour precip | inches / mm |
 | `geometry` | Station location | GeoParquet Point |
 
-See [docs/README.md](docs/README.md) for complete schema and usage patterns.
+## Build the dataset yourself
 
-## Project Structure
-
-```
-├── src/asos_parquet/     # Core library
-│   ├── fetch.py          # Iowa Mesonet API client
-│   ├── load.py           # Year-by-year loading
-│   ├── validation.py     # Data quality checks
-│   └── ...
-├── scripts/
-│   ├── load.py           # CLI for historical loading
-│   ├── validate.py       # CLI for validation
-│   └── upload_s3.sh      # S3 upload script
-├── modal_app.py          # Serverless hourly updates
-└── docs/README.md        # Data product documentation
-```
-
-## Commands
+This repo contains the full pipeline used to produce the hosted dataset.
 
 ```bash
-make load                    # Load all years (1940-present)
-make load YEAR=2024          # Load specific year
-make load RESUME=1           # Resume interrupted load
-make validate                # Validate local data
-make upload                  # Upload to S3
-make test                    # Run tests
+make install                     # Install dependencies (uses uv)
+make load                        # Load all years (1940-present)
+make load YEAR=2024              # Load a specific year
+make load RESUME=1               # Resume interrupted load
+make validate                    # Validate local data
 ```
 
-## Deployment
+See [CLAUDE.md](CLAUDE.md) for full developer reference including architecture, module responsibilities, and all available commands.
 
-The dataset updates hourly via [Modal](https://modal.com/) serverless functions. See [deploy/README.md](deploy/README.md) for setup instructions.
+### Deploy hourly updates
 
-**Cost**: ~$7.50/month (covered by Modal's $30 free tier)
+The dataset updates via [Modal](https://modal.com/) serverless functions. See [deploy/README.md](deploy/README.md) for setup.
 
-## Documentation
-
-- **[Data Product Guide](docs/README.md)** - Schema, access patterns, data quality
-- **[Deployment Guide](deploy/README.md)** - Modal setup for automated updates
-- **[CLAUDE.md](CLAUDE.md)** - Developer reference
+```bash
+modal deploy modal_app.py
+```
 
 ## Attribution
 
-- **Data Source**: [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/), Iowa State University
-- **Original Data**: NOAA/NWS/FAA (public domain)
-- **Processing**: [Dynamical](https://dynamical.org)
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
+- **Data source**: [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/), Iowa State University
+- **Original data**: NOAA / NWS / FAA (public domain)
+- **Processing**: [dynamical.org](https://dynamical.org)
+- **Hosting**: [Source Cooperative](https://source.coop/), a [Radiant Earth](https://radiant.earth/) initiative
