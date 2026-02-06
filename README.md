@@ -61,11 +61,12 @@ duckdb -c "
 
 ```sql
 SELECT *
-FROM read_parquet([
-    'https://data.source.coop/dynamical/asos-parquet/year=2023/data.parquet',
-    'https://data.source.coop/dynamical/asos-parquet/year=2024/data.parquet'
-])
-WHERE station = 'KORD'
+FROM read_parquet(
+    'https://data.source.coop/dynamical/asos-parquet/year=*/data.parquet',
+    hive_partitioning=true
+)
+WHERE year BETWEEN 2023 AND 2024
+  AND station = 'KORD'
 ORDER BY valid
 ```
 
