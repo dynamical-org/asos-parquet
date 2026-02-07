@@ -84,17 +84,8 @@ def merge_observations(
     # Convert new data to GeoDataFrame
     new_gdf = observations_to_geoparquet(new_df)
 
-    # Add year column derived from valid timestamp if missing
-    if "year" not in new_gdf.columns and "valid" in new_gdf.columns:
-        new_gdf["year"] = new_gdf["valid"].dt.year.astype("int32")
-
     if existing_gdf is None or existing_gdf.empty:
         return new_gdf
-
-    # Ensure existing data has year column with consistent type
-    if "year" in existing_gdf.columns:
-        existing_gdf = existing_gdf.copy()
-        existing_gdf["year"] = existing_gdf["year"].astype("int32")
 
     # Combine and deduplicate
     combined = pd.concat([existing_gdf, new_gdf], ignore_index=True)
