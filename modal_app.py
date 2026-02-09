@@ -82,7 +82,7 @@ def update_asos_data(lookback_hours: int = 2):
 
     from asos_parquet.config import get_all_network_ids
     from asos_parquet.fetch import fetch_observations_batch
-    from asos_parquet.load import merge_observations
+    from asos_parquet.load import enrich_with_station_metadata, merge_observations
     from asos_parquet.stations import fetch_all_stations
 
     # Configuration from environment
@@ -156,8 +156,9 @@ def update_asos_data(lookback_hours: int = 2):
 
     logger.info(f"Fetched {len(observations):,} observations")
 
-    # Step 4: Merge with existing data
+    # Step 4: Merge with existing data and enrich with station metadata
     merged_gdf = merge_observations(existing_gdf, observations)
+    merged_gdf = enrich_with_station_metadata(merged_gdf, stations)
     logger.info(f"Merged data: {len(merged_gdf):,} total records")
 
     # Step 5: Write to local file
