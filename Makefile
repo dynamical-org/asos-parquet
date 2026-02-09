@@ -1,4 +1,4 @@
-.PHONY: install test lint format load upload validate clean deploy dev 
+.PHONY: install test lint format load upload validate clean deploy dev examples
 
 # Setup
 install:
@@ -58,6 +58,14 @@ validate:
 clean:
 	rm -rf .pytest_cache __pycache__ .ruff_cache .coverage data/ logs/
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+# Examples
+examples:
+	uv run python examples/station_history.py
+	uv run python examples/coldest_temperature.py
+	uv run python examples/wind_rose.py
+	uv run python examples/summer_heatwave.py
+	uv run python examples/precipitation_ranking.py
 
 # Development
 dev:

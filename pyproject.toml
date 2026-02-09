@@ -23,6 +23,9 @@ dev = [
     "pytest-cov>=4.0.0",
     "modal>=0.64.0",
 ]
+examples = [
+    "matplotlib>=3.8.0",
+]
 
 [build-system]
 requires = ["hatchling"]
