@@ -14,59 +14,33 @@ Each year is a separate GeoParquet file following the pattern:
 https://data.source.coop/dynamical/asos-parquet/year={YYYY}/data.parquet
 ```
 
-### DuckDB (Python)
+### Full history for a station
+
+Query a station's complete record across all year partitions:
 
 ```python
 import duckdb
+from datetime import datetime
 
-conn = duckdb.connect()
+base = "https://data.source.coop/dynamical/asos-parquet"
+urls = [f"{base}/year={y}/data.parquet" for y in range(1940, datetime.now().year + 1)]
 
-conn.sql("""
-    SELECT station, valid, tmpf, dwpf, sknt, p01i
-    FROM 'https://data.source.coop/dynamical/asos-parquet/year=2025/data.parquet'
-    WHERE station = 'KJFK'
-      AND valid >= '2025-06-01'
+duckdb.execute("""
+    SELECT valid, tmpf, dwpf, sknt, p01i
+    FROM read_parquet(?, hive_partitioning=true)
+    WHERE station = 'JFK'
     ORDER BY valid
-""").show()
+""", [urls]).fetchdf()
 ```
 
-### PyArrow
+### Single year
 
-```python
-import pyarrow.parquet as pq
-import pyarrow.fs as fs
-
-s3 = fs.S3FileSystem(region="us-east-2", anonymous=True)
-dataset = pq.ParquetDataset(
-    "data.source.coop/dynamical/asos-parquet/",
-    filesystem=s3,
-)
-table = dataset.read()
-df = table.to_pandas()
-```
-
-### DuckDB (CLI)
-
-```bash
-duckdb -c "
-    SELECT station, valid, tmpf, dwpf
-    FROM 'https://data.source.coop/dynamical/asos-parquet/year=2024/data.parquet'
-    WHERE tmpf > 110
-    ORDER BY tmpf DESC
-    LIMIT 20
-"
-```
-
-### Multi-year queries
+Each year is also directly addressable:
 
 ```sql
-SELECT *
-FROM read_parquet(
-    'https://data.source.coop/dynamical/asos-parquet/year=*/data.parquet',
-    hive_partitioning=true
-)
-WHERE year BETWEEN 2023 AND 2024
-  AND station = 'KORD'
+SELECT station, valid, tmpf, dwpf
+FROM 'https://data.source.coop/dynamical/asos-parquet/year=2024/data.parquet'
+WHERE station = 'JFK'
 ORDER BY valid
 ```
 
@@ -84,7 +58,7 @@ Observations are sourced from the [Iowa Environmental Mesonet](https://mesonet.a
 
 | Field | Description | Units |
 |-------|-------------|-------|
-| `station` | ICAO identifier | e.g., KJFK |
+| `station` | ICAO identifier | e.g., JFK |
 | `valid` | Observation time (UTC) | timestamp |
 | `tmpf` / `tmpc` | Air temperature | °F / °C |
 | `dwpf` / `dwpc` | Dew point | °F / °C |
