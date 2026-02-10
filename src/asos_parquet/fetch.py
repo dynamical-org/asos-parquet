@@ -356,8 +356,19 @@ def fetch_bulk_chunk(
 
             return (chunk_id, None, f"HTTP {status_code}")
 
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # Connection-level failures — retry with backoff
+            wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+            attempt += 1
+            logger.warning(
+                f"Chunk {chunk_id}: {type(e).__name__}, retry {attempt} "
+                f"(waiting {wait_time:.0f}s)"
+            )
+            time.sleep(wait_time)
+            continue
+
         except Exception as e:
-            return (chunk_id, None, str(e))
+            return (chunk_id, None, f"{type(e).__name__}: {e}")
 
 
 def fetch_station_observations(

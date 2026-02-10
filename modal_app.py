@@ -82,7 +82,11 @@ def update_asos_data(lookback_hours: int = 2):
 
     from asos_parquet.config import get_all_network_ids
     from asos_parquet.fetch import fetch_observations_batch
-    from asos_parquet.load import enrich_with_station_metadata, merge_observations
+    from asos_parquet.load import (
+        enrich_with_station_metadata,
+        merge_observations,
+        write_year_partition,
+    )
     from asos_parquet.stations import fetch_all_stations
 
     # Configuration from environment
@@ -161,16 +165,14 @@ def update_asos_data(lookback_hours: int = 2):
     merged_gdf = enrich_with_station_metadata(merged_gdf, stations)
     logger.info(f"Merged data: {len(merged_gdf):,} total records")
 
-    # Step 5: Write to local file
-    tmp_file = data_file.with_suffix(".parquet.tmp")
-    merged_gdf.to_parquet(tmp_file, compression="zstd", index=False)
-    tmp_file.rename(data_file)
-    logger.info(f"Wrote {data_file.name}")
+    # Step 5: Write to local file (GeoParquet with covering bbox)
+    output_path = write_year_partition(merged_gdf, current_year, base_path=data_dir)
+    logger.info(f"Wrote {output_path.name}")
 
     # Step 6: Upload to S3
     logger.info("Uploading to S3...")
-    s3.upload_file(str(data_file), s3_bucket, s3_key)
-    file_size = data_file.stat().st_size / 1024 / 1024
+    s3.upload_file(str(output_path), s3_bucket, s3_key)
+    file_size = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Uploaded year={current_year} ({file_size:.1f} MB)")
 
     logger.info("=" * 60)
@@ -185,6 +187,89 @@ def update_asos_data(lookback_hours: int = 2):
     }
 
 
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("aws-asos")],
+    timeout=3600,  # 1 hour (full year × global stations, plus retry backoff)
+    cpu=1.0,
+    memory=4096,  # 4GB — year partitions are 200-400MB, processing peaks higher
+)
+def backfill_year(year: int):
+    """Load a full year of observations and upload to S3.
+
+    Fetches all observations for the given year from Iowa Mesonet,
+    writes a GeoParquet partition, and uploads to S3. Intended for
+    manual backfill of historical data.
+
+    Usage:
+        modal run modal_app.py::backfill --year 2022
+    """
+    import boto3
+
+    from asos_parquet.config import get_all_network_ids
+    from asos_parquet.load import load_year
+    from asos_parquet.stations import fetch_all_stations
+
+    s3_bucket = os.environ.get("S3_BUCKET")
+    s3_prefix = os.environ.get("S3_PREFIX", "asos")
+    s3_endpoint = os.environ.get("AWS_ENDPOINT_URL")
+
+    if not s3_bucket:
+        raise ValueError("S3_BUCKET environment variable not set")
+
+    logger.info("=" * 60)
+    logger.info(f"BACKFILL YEAR {year}")
+    logger.info(f"S3: s3://{s3_bucket}/{s3_prefix}/year={year}/data.parquet")
+    logger.info("=" * 60)
+
+    # Fetch all stations (including offline — they may have historical data)
+    networks = get_all_network_ids()
+    logger.info(f"Fetching station metadata for {len(networks)} networks...")
+    stations = fetch_all_stations(networks=networks, online_only=False)
+    logger.info(f"Found {len(stations)} stations")
+
+    if stations.empty:
+        logger.warning("No stations found")
+        return {"status": "no_stations", "year": year, "records": 0}
+
+    # Load full year to /tmp
+    data_dir = Path("/tmp/asos")
+    result = load_year(year, stations, base_path=data_dir, show_progress=False)
+
+    if not result.success:
+        logger.error(f"Load failed: {result.error}")
+        return {"status": "failed", "year": year, "error": result.error}
+
+    if result.records == 0:
+        logger.info(f"No observations for year {year}")
+        return {"status": "empty", "year": year, "records": 0}
+
+    logger.info(f"Loaded {result.records:,} records from {result.stations} stations")
+
+    # Upload to S3
+    s3_kwargs = {}
+    if s3_endpoint:
+        s3_kwargs["endpoint_url"] = s3_endpoint
+    s3 = boto3.client("s3", **s3_kwargs)
+
+    s3_key = f"{s3_prefix}/year={year}/data.parquet"
+    s3.upload_file(str(result.output_path), s3_bucket, s3_key)
+    file_size = result.output_path.stat().st_size / 1024 / 1024
+    logger.info(f"Uploaded year={year} ({file_size:.1f} MB)")
+
+    logger.info("=" * 60)
+    logger.info(f"BACKFILL YEAR {year} COMPLETE")
+    logger.info("=" * 60)
+
+    return {
+        "status": "success",
+        "year": year,
+        "records": result.records,
+        "stations": result.stations,
+        "file_size_mb": round(file_size, 2),
+    }
+
+
 @app.local_entrypoint()
 def main(lookback: int = 2):
     """Run update manually (for testing)."""
@@ -192,5 +277,12 @@ def main(lookback: int = 2):
     print(f"Result: {result}")
 
 
-if __name__ == "__main__":
-    main()
+@app.local_entrypoint()
+def backfill(year: int):
+    """Backfill a single year.
+
+    Usage:
+        modal run modal_app.py::backfill --year 2022
+    """
+    result = backfill_year.remote(year=year)
+    print(f"Result: {result}")
