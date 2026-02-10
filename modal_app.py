@@ -234,7 +234,7 @@ def backfill_year(year: int):
 
     # Load full year to /tmp
     data_dir = Path("/tmp/asos")
-    result = load_year(year, stations, base_path=data_dir, show_progress=False)
+    result = load_year(year, stations, base_path=data_dir, show_progress=True)
 
     if not result.success:
         logger.error(f"Load failed: {result.error}")

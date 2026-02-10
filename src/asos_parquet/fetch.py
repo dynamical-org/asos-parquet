@@ -673,6 +673,9 @@ def fetch_observations_bulk(
                     all_observations.append(df)
                     total_records += len(df)
 
+                chunk_records = f"{len(df):,} records" if df is not None and not df.empty else "empty"
+                logger.info(f"Chunk {completed}/{num_chunks}: {chunk_records} (total: {total_records:,})")
+
         if show_progress:
             print(f"Fetch complete: {total_records:,} records, {len(errors)} errors")
 
