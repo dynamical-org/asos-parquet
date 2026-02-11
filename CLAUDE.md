@@ -20,6 +20,8 @@ make load RESUME=1                  # Resume from progress.json
 make upload                         # Upload to S3 (configure script first)
 make validate                       # Validate all local data
 make validate YEAR=2023             # Validate specific year
+make validate-prod                  # Validate S3-hosted production data
+make validate-prod YEAR=2023        # Validate specific year on S3
 
 # Development
 make test                 # Run all tests
@@ -104,4 +106,5 @@ modal deploy modal_app.py
 - GeoParquet files use EPSG:4326 CRS with WKB-encoded Point geometries
 - Timestamps are always UTC-aware (`pd.Timestamp(..., tz="UTC")`)
 - Data fields include both imperial (tmpf, dwpf, p01i) and metric (tmpc, dwpc, p01m) units
+- Station metadata (name, elevation, country, state, county, wfo, tzname) is embedded in each observation row
 - Full METAR reports only (filtered by `tmpf IS NOT NULL` to exclude partial wind-only updates)

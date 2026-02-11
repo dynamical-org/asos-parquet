@@ -40,9 +40,9 @@ from .config import (
 
 # Bulk fetching configuration
 MAX_URL_LENGTH = 7500  # Conservative limit below 8KB server limit
-MAX_STATIONS_PER_CHUNK = 1500  # Safe default under URL limit
+MAX_STATIONS_PER_CHUNK = 1000  # Benchmarked: 1000 w/ 3 workers = 38k rec/s (vs 27k at 500)
 BULK_REQUEST_TIMEOUT = 300  # Bulk requests may take longer
-BULK_MAX_WORKERS = 5  # Concurrent bulk requests
+BULK_MAX_WORKERS = 3  # Stay under IEM's 6-cursor-per-subnet limit
 
 
 @dataclass
@@ -211,11 +211,9 @@ def calculate_optimal_chunk_size(
 ) -> int:
     """Calculate optimal stations per chunk based on date range.
 
-    Since long date ranges are split into monthly sub-requests by
-    fetch_observations_bulk, the effective per-request time window is
-    at most ~31 days, allowing large station chunks in all cases.
-
-    URL length (~8KB limit) caps chunks at ~1,800 stations regardless.
+    Kept small (500) so each server-side cursor finishes quickly.
+    The IEM server limits concurrent cursors per IP subnet to ~6,
+    so shorter-lived queries reduce the chance of 503 rejections.
 
     Args:
         num_stations: Total number of stations to fetch
@@ -225,19 +223,7 @@ def calculate_optimal_chunk_size(
     Returns:
         Recommended stations per chunk
     """
-    days = (end_date - start_date).days + 1
-
-    if days <= 1:
-        chunk_size = 1500  # 1 day: very large chunks OK
-    elif days <= 7:
-        chunk_size = 1000  # 1 week: large chunks
-    else:
-        # For anything longer, monthly splitting handles the time dimension.
-        # Use 1000 stations per chunk (URL ~4.5KB, well under 7.5KB limit).
-        chunk_size = 1000
-
-    # Never exceed URL length limit or total number of stations
-    return min(chunk_size, num_stations, MAX_STATIONS_PER_CHUNK)
+    return min(MAX_STATIONS_PER_CHUNK, num_stations)
 
 
 def split_date_range_monthly(
@@ -301,8 +287,20 @@ def fetch_bulk_chunk(
             response = requests.get(url, timeout=BULK_REQUEST_TIMEOUT)
             response.raise_for_status()
 
+            # Check for server error returned as 200 (IEM sometimes does this)
+            text = response.text.strip()
+            if text.startswith("ERROR:"):
+                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+                attempt += 1
+                logger.warning(
+                    f"Chunk {chunk_id}: server error in body ({text!r}), "
+                    f"retry {attempt} (waiting {wait_time:.0f}s)"
+                )
+                time.sleep(wait_time)
+                continue
+
             # Check for empty response
-            if "No results found" in response.text or len(response.text.strip()) < 50:
+            if "No results found" in text or len(text) < 50:
                 return (chunk_id, None, None)
 
             df = pd.read_csv(StringIO(response.text), low_memory=False)
@@ -343,12 +341,12 @@ def fetch_bulk_chunk(
                 # URL too long - this shouldn't happen with proper chunking
                 return (chunk_id, None, f"URL too long ({len(url)} chars)")
 
-            if status_code in (500, 503):
-                # Retry on server errors with exponential backoff
+            # Retry on server errors (5xx) or when response is unavailable
+            if status_code is None or status_code >= 500:
                 wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 attempt += 1
                 logger.warning(
-                    f"Chunk {chunk_id}: {status_code} error, retry {attempt} "
+                    f"Chunk {chunk_id}: HTTP {status_code} error, retry {attempt} "
                     f"(waiting {wait_time:.0f}s)"
                 )
                 time.sleep(wait_time)
@@ -630,8 +628,10 @@ def fetch_observations_bulk(
                     for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
                 }
 
+                completed = 0
                 for future in as_completed(futures):
                     chunk_id, df, error = future.result()
+                    completed += 1
 
                     if error:
                         errors.append(f"Chunk {chunk_id}: {error}")
@@ -639,6 +639,9 @@ def fetch_observations_bulk(
                     elif df is not None and not df.empty:
                         all_observations.append(df)
                         total_records += len(df)
+
+                    chunk_records = f"{len(df):,} records" if df is not None and not df.empty else "empty"
+                    logger.info(f"Chunk {completed}/{num_chunks}: {chunk_records} (total: {total_records:,})")
 
                     progress.update(task, advance=1, records=total_records)
 

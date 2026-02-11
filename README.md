@@ -69,6 +69,14 @@ Observations are sourced from the [Iowa Environmental Mesonet](https://mesonet.a
 | `p01i` / `p01m` | 1-hour precipitation | inches / mm |
 | `alti` / `mslp` | Pressure | inHg / mb |
 | `vsby` | Visibility | miles |
+| `name` | Station name | e.g., John F Kennedy Intl |
+| `elevation` | Station elevation | meters |
+| `state` | State/province code | e.g., NY |
+| `country` | Country code | e.g., US |
+| `county` | County name (US only) | e.g., Queens |
+| `wfo` | NWS Weather Forecast Office | e.g., OKX |
+| `tzname` | Station timezone | e.g., America/New_York |
+| `longitude` / `latitude` | Station coordinates | decimal degrees |
 | `geometry` | Station location | GeoParquet Point |
 
 ## Build the dataset yourself

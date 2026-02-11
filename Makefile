@@ -1,4 +1,4 @@
-.PHONY: install test lint format load upload validate clean deploy dev examples
+.PHONY: install test lint format load upload validate validate-prod clean deploy dev examples
 
 # Setup
 install:
@@ -53,6 +53,10 @@ deploy:
 # Validate data for gaps and quality issues
 validate:
 	uv run python scripts/validate.py $(if $(YEAR),--year $(YEAR)) $(if $(UPDATE),--update-progress) --verbose $(if $(filter global,$(NETWORKS)),--global)
+
+# Validate S3-hosted production data (reads S3_BUCKET/S3_PREFIX from .env)
+validate-prod:
+	uv run python scripts/validate_prod.py $(if $(YEAR),--year $(YEAR)) --verbose $(if $(filter global,$(NETWORKS)),--global) $(if $(SCHEMA_ONLY),--schema-only)
 
 # Maintenance
 clean:
