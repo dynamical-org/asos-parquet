@@ -33,6 +33,7 @@ from .config import (
     DATA_FIELDS,
     MAX_BACKOFF,
     MAX_CONCURRENT_REQUESTS,
+    MAX_RETRIES,
     OBSERVATION_DATA_URL,
     REQUEST_TIMEOUT,
     RETRY_BACKOFF,
@@ -290,11 +291,13 @@ def fetch_bulk_chunk(
             # Check for server error returned as 200 (IEM sometimes does this)
             text = response.text.strip()
             if text.startswith("ERROR:"):
-                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 attempt += 1
+                if attempt > MAX_RETRIES:
+                    return (chunk_id, None, f"Server error after {MAX_RETRIES} retries: {text!r}")
+                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 logger.warning(
                     f"Chunk {chunk_id}: server error in body ({text!r}), "
-                    f"retry {attempt} (waiting {wait_time:.0f}s)"
+                    f"retry {attempt}/{MAX_RETRIES} (waiting {wait_time:.0f}s)"
                 )
                 time.sleep(wait_time)
                 continue
@@ -343,10 +346,12 @@ def fetch_bulk_chunk(
 
             # Retry on server errors (5xx) or when response is unavailable
             if status_code is None or status_code >= 500:
-                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 attempt += 1
+                if attempt > MAX_RETRIES:
+                    return (chunk_id, None, f"HTTP {status_code} after {MAX_RETRIES} retries")
+                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 logger.warning(
-                    f"Chunk {chunk_id}: HTTP {status_code} error, retry {attempt} "
+                    f"Chunk {chunk_id}: HTTP {status_code} error, retry {attempt}/{MAX_RETRIES} "
                     f"(waiting {wait_time:.0f}s)"
                 )
                 time.sleep(wait_time)
@@ -356,10 +361,12 @@ def fetch_bulk_chunk(
 
         except (requests.ConnectionError, requests.Timeout) as e:
             # Connection-level failures — retry with backoff
-            wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
             attempt += 1
+            if attempt > MAX_RETRIES:
+                return (chunk_id, None, f"{type(e).__name__} after {MAX_RETRIES} retries")
+            wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
             logger.warning(
-                f"Chunk {chunk_id}: {type(e).__name__}, retry {attempt} "
+                f"Chunk {chunk_id}: {type(e).__name__}, retry {attempt}/{MAX_RETRIES} "
                 f"(waiting {wait_time:.0f}s)"
             )
             time.sleep(wait_time)

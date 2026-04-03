@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 @app.function(
     image=image,
     secrets=[modal.Secret.from_name("aws-asos")],
-    timeout=600,  # 10 minutes max (bulk fetch typically completes in ~2 min)
+    timeout=900,  # 15 minutes (global station fetch takes longer than US-only)
     schedule=modal.Cron("20,50 * * * *"),  # Run at :20 and :50 past each hour
     cpu=1.0,
     memory=2048,
