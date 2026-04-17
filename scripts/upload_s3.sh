@@ -23,6 +23,7 @@ fi
 
 # Defaults
 S3_PREFIX="${S3_PREFIX:-asos}"
+S3_PREFIX="${S3_PREFIX%/}"
 DRY_RUN=""
 YEAR=""
 ENDPOINT_ARG=""

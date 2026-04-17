@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 def _zulip_notify(topic: str, body: str) -> None:
-    email = os.environ.get("ZULIP_BOT_EMAIL", "")
-    key = os.environ.get("ZULIP_API_KEY", "")
+    email = os.environ.get("ZULIP_OPS_BOT_EMAIL", "")
+    key = os.environ.get("ZULIP_OPS_API_KEY", "")
     if not email or not key:
         return
     data = urllib.parse.urlencode({
@@ -84,7 +84,7 @@ def _backfill_year_impl(year: int):
     from asos_parquet.stations import fetch_all_stations
 
     s3_bucket = os.environ.get("ASOS_S3_BUCKET")
-    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos")
+    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos").strip("/")
     s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
