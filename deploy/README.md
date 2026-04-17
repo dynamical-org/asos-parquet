@@ -33,13 +33,14 @@ pip install modal
 # 2. Authenticate (opens browser)
 modal setup
 
-# 3. Create secrets with your AWS credentials
-modal secret create aws-asos \
-    AWS_ACCESS_KEY_ID=your_access_key \
-    AWS_SECRET_ACCESS_KEY=your_secret_key \
-    AWS_DEFAULT_REGION=us-east-1 \
-    S3_BUCKET=your-bucket-name \
-    S3_PREFIX=asos
+# 3. Create secrets with your AWS credentials (from source.coop)
+modal secret create source-coop-asos-s3 \
+    ASOS_AWS_ACCESS_KEY_ID=your_access_key \
+    ASOS_AWS_SECRET_ACCESS_KEY=your_secret_key \
+    ASOS_AWS_SESSION_TOKEN=your_session_token \
+    ASOS_AWS_DEFAULT_REGION=us-east-1 \
+    ASOS_S3_BUCKET=your-bucket-name \
+    ASOS_S3_PREFIX=asos
 
 # 4. Deploy (runs hourly at minute 5)
 modal deploy modal_app.py
@@ -105,5 +106,5 @@ curl -I https://mesonet.agron.iastate.edu/
 **AWS credentials error:**
 ```bash
 # Recreate the secret
-modal secret create aws-asos ...
+modal secret create source-coop-asos-s3 ...
 ```

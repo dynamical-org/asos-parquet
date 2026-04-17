@@ -40,13 +40,14 @@ deploy:
 	@if [ ! -f .env ]; then echo "Error: .env file not found. Copy .env.example and fill in values."; exit 1; fi
 	@echo "Updating Modal secrets from .env..."
 	@set -a && source .env && set +a && \
-		uv run modal secret create aws-asos --force \
-			AWS_ACCESS_KEY_ID="$$AWS_ACCESS_KEY_ID" \
-			AWS_SECRET_ACCESS_KEY="$$AWS_SECRET_ACCESS_KEY" \
-			AWS_DEFAULT_REGION="$${AWS_DEFAULT_REGION:-us-east-1}" \
-			S3_BUCKET="$$S3_BUCKET" \
-			$${S3_PREFIX:+S3_PREFIX="$$S3_PREFIX"} \
-			$${AWS_ENDPOINT_URL:+AWS_ENDPOINT_URL="$$AWS_ENDPOINT_URL"}
+		uv run modal secret create source-coop-asos-s3 --force \
+			ASOS_AWS_ACCESS_KEY_ID="$$ASOS_AWS_ACCESS_KEY_ID" \
+			ASOS_AWS_SECRET_ACCESS_KEY="$$ASOS_AWS_SECRET_ACCESS_KEY" \
+			ASOS_AWS_DEFAULT_REGION="$${ASOS_AWS_DEFAULT_REGION:-us-east-1}" \
+			ASOS_S3_BUCKET="$$ASOS_S3_BUCKET" \
+			$${ASOS_AWS_SESSION_TOKEN:+ASOS_AWS_SESSION_TOKEN="$$ASOS_AWS_SESSION_TOKEN"} \
+			$${ASOS_S3_PREFIX:+ASOS_S3_PREFIX="$$ASOS_S3_PREFIX"} \
+			$${ASOS_AWS_ENDPOINT_URL:+ASOS_AWS_ENDPOINT_URL="$$ASOS_AWS_ENDPOINT_URL"}
 	@echo "Deploying to Modal..."
 	uv run modal deploy modal_app.py
 

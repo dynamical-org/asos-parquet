@@ -13,9 +13,10 @@ Schedule rationale:
 Setup:
     1. Install modal: pip install modal
     2. Create secrets:
-       modal secret create aws-asos \\
-         AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=xxx \\
-         AWS_DEFAULT_REGION=us-west-2 S3_BUCKET=your-bucket
+       modal secret create source-coop-asos-s3 \\
+         ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx \\
+         ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
+         ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
     3. Deploy: modal deploy modal_app.py
 
 Cost estimate (twice-hourly runs with bulk fetch):
@@ -83,7 +84,7 @@ def _zulip_notify(topic: str, body: str) -> None:
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("aws-asos"), modal.Secret.from_name("zulip-ops")],
+    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops")],
     timeout=900,  # 15 minutes (global station fetch takes longer than US-only)
     schedule=modal.Cron("20,50 * * * *"),  # Run at :20 and :50 past each hour
     cpu=1.0,
@@ -121,12 +122,12 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     from asos_parquet.stations import fetch_all_stations
 
     # Configuration from environment
-    s3_bucket = os.environ.get("S3_BUCKET")
-    s3_prefix = os.environ.get("S3_PREFIX", "asos")
-    s3_endpoint = os.environ.get("AWS_ENDPOINT_URL")  # For R2 compatibility
+    s3_bucket = os.environ.get("ASOS_S3_BUCKET")
+    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos")
+    s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
-        raise ValueError("S3_BUCKET environment variable not set")
+        raise ValueError("ASOS_S3_BUCKET environment variable not set")
 
     now = datetime.now(timezone.utc)
     current_year = now.year
@@ -145,8 +146,13 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     data_file = data_dir / "data.parquet"
     s3_key = f"{s3_prefix}/year={current_year}/data.parquet"
 
-    # Initialize S3 client (with optional R2 endpoint)
-    s3_kwargs = {}
+    # Initialize S3 client with explicit credentials (prefixed to avoid boto3 env var collisions)
+    s3_kwargs = {
+        "aws_access_key_id": os.environ["ASOS_AWS_ACCESS_KEY_ID"],
+        "aws_secret_access_key": os.environ["ASOS_AWS_SECRET_ACCESS_KEY"],
+        "aws_session_token": os.environ.get("ASOS_AWS_SESSION_TOKEN"),
+        "region_name": os.environ.get("ASOS_AWS_DEFAULT_REGION"),
+    }
     if s3_endpoint:
         s3_kwargs["endpoint_url"] = s3_endpoint
         logger.info(f"Using custom endpoint: {s3_endpoint}")
@@ -220,7 +226,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("aws-asos"), modal.Secret.from_name("zulip-ops")],
+    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops")],
     timeout=3600,  # 1 hour (full year × global stations, plus retry backoff)
     cpu=1.0,
     memory=4096,  # 4GB — year partitions are 200-400MB, processing peaks higher
@@ -241,12 +247,12 @@ def _backfill_year_impl(year: int):
     from asos_parquet.load import load_year
     from asos_parquet.stations import fetch_all_stations
 
-    s3_bucket = os.environ.get("S3_BUCKET")
-    s3_prefix = os.environ.get("S3_PREFIX", "asos")
-    s3_endpoint = os.environ.get("AWS_ENDPOINT_URL")
+    s3_bucket = os.environ.get("ASOS_S3_BUCKET")
+    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos")
+    s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
-        raise ValueError("S3_BUCKET environment variable not set")
+        raise ValueError("ASOS_S3_BUCKET environment variable not set")
 
     logger.info("=" * 60)
     logger.info(f"BACKFILL YEAR {year}")
@@ -278,7 +284,12 @@ def _backfill_year_impl(year: int):
     logger.info(f"Loaded {result.records:,} records from {result.stations} stations")
 
     # Upload to S3
-    s3_kwargs = {}
+    s3_kwargs = {
+        "aws_access_key_id": os.environ["ASOS_AWS_ACCESS_KEY_ID"],
+        "aws_secret_access_key": os.environ["ASOS_AWS_SECRET_ACCESS_KEY"],
+        "aws_session_token": os.environ.get("ASOS_AWS_SESSION_TOKEN"),
+        "region_name": os.environ.get("ASOS_AWS_DEFAULT_REGION"),
+    }
     if s3_endpoint:
         s3_kwargs["endpoint_url"] = s3_endpoint
     s3 = boto3.client("s3", **s3_kwargs)

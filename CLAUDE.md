@@ -96,7 +96,7 @@ make load                    # Full historical load (1940-present)
 # Deploy Modal for hourly updates
 pip install modal
 modal setup
-modal secret create aws-asos AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=xxx AWS_DEFAULT_REGION=us-west-2 S3_BUCKET=your-bucket
+modal secret create source-coop-asos-s3 ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
 modal deploy modal_app.py
 ```
 

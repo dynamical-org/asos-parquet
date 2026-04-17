@@ -62,7 +62,7 @@ def _zulip_notify(topic: str, body: str) -> None:
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("aws-asos"), modal.Secret.from_name("zulip-ops")],
+    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops")],
     timeout=7200,
     cpu=1.0,
     memory=8192,
@@ -83,12 +83,12 @@ def _backfill_year_impl(year: int):
     from asos_parquet.load import load_year
     from asos_parquet.stations import fetch_all_stations
 
-    s3_bucket = os.environ.get("S3_BUCKET")
-    s3_prefix = os.environ.get("S3_PREFIX", "asos")
-    s3_endpoint = os.environ.get("AWS_ENDPOINT_URL")
+    s3_bucket = os.environ.get("ASOS_S3_BUCKET")
+    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos")
+    s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
-        raise ValueError("S3_BUCKET environment variable not set")
+        raise ValueError("ASOS_S3_BUCKET environment variable not set")
 
     logger.info("=" * 60)
     logger.info(f"BACKFILL YEAR {year}")
@@ -117,7 +117,12 @@ def _backfill_year_impl(year: int):
 
     logger.info(f"Loaded {result.records:,} records from {result.stations} stations")
 
-    s3_kwargs = {}
+    s3_kwargs = {
+        "aws_access_key_id": os.environ["ASOS_AWS_ACCESS_KEY_ID"],
+        "aws_secret_access_key": os.environ["ASOS_AWS_SECRET_ACCESS_KEY"],
+        "aws_session_token": os.environ.get("ASOS_AWS_SESSION_TOKEN"),
+        "region_name": os.environ.get("ASOS_AWS_DEFAULT_REGION"),
+    }
     if s3_endpoint:
         s3_kwargs["endpoint_url"] = s3_endpoint
     s3 = boto3.client("s3", **s3_kwargs)
