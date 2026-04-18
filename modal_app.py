@@ -28,6 +28,7 @@ Cost estimate (twice-hourly runs with bulk fetch):
 import base64
 import logging
 import os
+import json
 import traceback
 import urllib.parse
 import urllib.request
@@ -82,9 +83,31 @@ def _zulip_notify(topic: str, body: str) -> None:
         pass
 
 
+def _fire_failure_routine(function_name: str, tb: str) -> None:
+    token = os.environ.get("CLAUDE_ROUTINE_TOKEN", "")
+    if not token:
+        return
+    payload = json.dumps({
+        "repo": "asos-parquet",
+        "app": "asos-parquet-update",
+        "function": function_name,
+        "error": tb.splitlines()[-1] if tb else "",
+        "traceback": tb,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/claude_code/routines/trig_015yP25t6GqyPXXDQfUnu9aC/fire",
+        data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops")],
+    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops"), modal.Secret.from_name("claude-routine-trigger")],
     timeout=900,  # 15 minutes (global station fetch takes longer than US-only)
     schedule=modal.Cron("20,50 * * * *"),  # Run at :20 and :50 past each hour
     cpu=1.0,
@@ -103,6 +126,7 @@ def update_asos_data(lookback_hours: int = 2):
         return _update_asos_data_impl(lookback_hours)
     except BaseException as exc:
         _zulip_notify("asos-parquet", f"**update_asos_data failed**\n```\n{traceback.format_exc()}\n```")
+        _fire_failure_routine("update_asos_data", traceback.format_exc())
         raise
 
 
@@ -226,7 +250,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops")],
+    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops"), modal.Secret.from_name("claude-routine-trigger")],
     timeout=3600,  # 1 hour (full year × global stations, plus retry backoff)
     cpu=1.0,
     memory=4096,  # 4GB — year partitions are 200-400MB, processing peaks higher
@@ -237,6 +261,7 @@ def backfill_year(year: int):
         return _backfill_year_impl(year)
     except BaseException as exc:
         _zulip_notify("asos-parquet", f"**backfill_year({year}) failed**\n```\n{traceback.format_exc()}\n```")
+        _fire_failure_routine("backfill_year", traceback.format_exc())
         raise
 
 
