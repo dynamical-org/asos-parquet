@@ -7,12 +7,8 @@ Usage:
     uv run modal run modal_backfill.py::backfill --year 2022
 """
 
-import base64
 import logging
 import os
-import traceback
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import modal
@@ -41,39 +37,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _zulip_notify(topic: str, body: str) -> None:
-    email = os.environ.get("ZULIP_OPS_BOT_EMAIL", "")
-    key = os.environ.get("ZULIP_OPS_API_KEY", "")
-    if not email or not key:
-        return
-    data = urllib.parse.urlencode({
-        "type": "stream", "to": "ops", "topic": topic, "content": body,
-    }).encode()
-    req = urllib.request.Request(
-        "https://dynamical.zulipchat.com/api/v1/messages", data=data,
-    )
-    cred = base64.b64encode(f"{email}:{key}".encode()).decode()
-    req.add_header("Authorization", f"Basic {cred}")
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
-
-
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("zulip-ops")],
+    secrets=[modal.Secret.from_name("source-coop-asos-s3")],
     timeout=7200,
     cpu=1.0,
     memory=8192,
 )
 def backfill_year(year: int):
     """Load a full year of observations and upload to S3."""
-    try:
-        return _backfill_year_impl(year)
-    except BaseException as exc:
-        _zulip_notify("asos-parquet", f"**backfill_year({year}) failed**\n```\n{traceback.format_exc()}\n```")
-        raise
+    return _backfill_year_impl(year)
 
 
 def _backfill_year_impl(year: int):
