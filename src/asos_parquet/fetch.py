@@ -475,8 +475,6 @@ def fetch_station_observations(
             logger.warning(f"{station_id}: {e}")
             if status_callback:
                 status_callback(station_id, "error", 0)
-            else:
-                print(f"[warning] {station_id}: {e}")
             return None
 
 
@@ -863,7 +861,6 @@ def _fetch_simple(
                     empty += 1
             except Exception as e:
                 logger.error(f"{station_id} ({state}): {e}")
-                print(f"\n[error] {station_id}: {e}")
                 errors += 1
 
             # Inline progress when not using progress bar

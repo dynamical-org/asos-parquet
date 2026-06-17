@@ -5,10 +5,13 @@ interruption. Each year tracks its status, record counts, and validation state.
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 # Progress file location
 DEFAULT_PROGRESS_PATH = Path("data/progress.json")
@@ -212,7 +215,7 @@ def load_progress(path: Path = DEFAULT_PROGRESS_PATH) -> LoadProgress:
             data = json.load(f)
         return LoadProgress.from_dict(data)
     except (json.JSONDecodeError, KeyError) as e:
-        print(f"[warning] Failed to load progress file: {e}")
+        logger.warning(f"Failed to load progress file: {e}")
         return LoadProgress()
 
 

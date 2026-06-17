@@ -51,6 +51,7 @@ Iowa Mesonet API  →  fetch.py  →  load.py  →  data/asos/year=YYYY/data.par
 - **`src/asos_parquet/stations.py`**: Station metadata fetching from Mesonet GeoJSON endpoints
 - **`src/asos_parquet/validation.py`**: Comprehensive validation suite (schema, physical bounds, temporal completeness, station coverage, metric/imperial consistency)
 - **`src/asos_parquet/config.py`**: API endpoints, rate limits, data fields, US state codes
+- **`src/asos_parquet/obs.py`**: Better Stack observability — log streaming (Logtail), error tracking (Sentry SDK), and `flush()` for Modal. Env-guarded, so local runs and tests are no-ops without `BETTERSTACK_*` set
 
 ### Key Scripts
 
@@ -97,6 +98,7 @@ make load                    # Full historical load (1940-present)
 pip install modal
 modal setup
 modal secret create source-coop-asos-s3 ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
+modal secret create betterstack-asos-parquet BETTERSTACK_SOURCE_TOKEN=xxx BETTERSTACK_INGESTING_HOST=xxx BETTERSTACK_ERRORS_DSN=xxx BETTERSTACK_HEARTBEAT_URL=xxx
 modal deploy modal_app.py
 ```
 
