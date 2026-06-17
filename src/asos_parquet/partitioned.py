@@ -8,10 +8,13 @@ Yearly partitions minimize HTTP requests while maintaining reasonable file sizes
 Data is sorted by station then timestamp for efficient predicate pushdown.
 """
 
+import logging
 from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Directory structure
 DEFAULT_DATASET_PATH = Path("data/asos")
@@ -75,7 +78,7 @@ def read_dataset(
                 gdf = gpd.read_parquet(data_file)
                 gdfs.append(gdf)
             except Exception as e:
-                print(f"[warning] Failed to read {data_file}: {e}")
+                logger.warning(f"Failed to read {data_file}: {e}")
 
     if not gdfs:
         return gpd.GeoDataFrame()

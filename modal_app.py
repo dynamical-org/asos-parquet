@@ -17,6 +17,11 @@ Setup:
          ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx \\
          ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
          ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
+       modal secret create betterstack-asos-parquet \\
+         BETTERSTACK_SOURCE_TOKEN=xxx BETTERSTACK_INGESTING_HOST=xxx \\
+         BETTERSTACK_ERRORS_DSN=xxx BETTERSTACK_HEARTBEAT_URL=xxx
+       (log streaming + error tracking + uptime heartbeat; see obs.py. The
+        heartbeat URL comes from a Better Stack heartbeat created in the UI.)
     3. Deploy: modal deploy modal_app.py
 
 Cost estimate (twice-hourly runs with bulk fetch):
@@ -25,10 +30,9 @@ Cost estimate (twice-hourly runs with bulk fetch):
     - Memory: 2GB * 2 min * 1440 runs = ~$0.65/month
 """
 
+import contextlib
 import logging
 import os
-import json
-import traceback
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,43 +54,38 @@ image = (
         "shapely>=2.0.0",
         "boto3>=1.34.0",
         "rich>=13.0.0",
+        "logtail-python>=0.3.4",
+        "sentry-sdk>=2.63.0",
     )
     .add_local_python_source("asos_parquet")
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
-def _fire_failure_routine(function_name: str, tb: str) -> None:
-    token = os.environ.get("CLAUDE_ROUTINE_TOKEN", "")
-    if not token:
+def _heartbeat(*, failed: bool = False) -> None:
+    """Best-effort Better Stack heartbeat ping; monitoring must never break a run.
+
+    The URL comes from the betterstack-asos-parquet secret
+    (BETTERSTACK_HEARTBEAT_URL); when unset (local dev) this is a no-op. Pinging
+    the base URL reports success; appending /fail reports a failure. Configure
+    the heartbeat in Better Stack with a 1h period and 30m grace (the job runs
+    at :20 and :50 for redundancy).
+    """
+    url = os.environ.get("BETTERSTACK_HEARTBEAT_URL")
+    if not url:
         return
-    payload = json.dumps({
-        "repo": "asos-parquet",
-        "app": "asos-parquet-update",
-        "function": function_name,
-        "error": tb.splitlines()[-1] if tb else "",
-        "traceback": tb,
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/claude_code/routines/trig_015yP25t6GqyPXXDQfUnu9aC/fire",
-        data=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+    target = f"{url}/fail" if failed else url
+    with contextlib.suppress(Exception):
+        urllib.request.urlopen(target, timeout=10)
 
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("claude-routine-trigger")],
+    secrets=[
+        modal.Secret.from_name("source-coop-asos-s3"),
+        modal.Secret.from_name("betterstack-asos-parquet"),
+    ],
     timeout=900,  # 15 minutes (global station fetch takes longer than US-only)
     schedule=modal.Cron("20,50 * * * *"),  # Run at :20 and :50 past each hour
     cpu=1.0,
@@ -101,11 +100,20 @@ def update_asos_data(lookback_hours: int = 2):
     3. Merges new data with existing
     4. Uploads back to S3
     """
+    from asos_parquet import obs
+
+    obs.setup_logging()
+    obs.init_sentry()
     try:
-        return _update_asos_data_impl(lookback_hours)
-    except BaseException as exc:
-        _fire_failure_routine("update_asos_data", traceback.format_exc())
+        result = _update_asos_data_impl(lookback_hours)
+        _heartbeat()
+        return result
+    except BaseException:
+        logger.exception("update_asos_data failed")
+        _heartbeat(failed=True)
         raise
+    finally:
+        obs.flush()
 
 
 def _update_asos_data_impl(lookback_hours: int = 2):
@@ -135,12 +143,10 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     current_year = now.year
     lookback_start = now - timedelta(hours=lookback_hours)
 
-    logger.info("=" * 60)
-    logger.info("ASOS UPDATE STARTED")
-    logger.info(f"Time: {now.isoformat()}")
-    logger.info(f"Lookback: {lookback_hours} hours (since {lookback_start.isoformat()})")
-    logger.info(f"S3: s3://{s3_bucket}/{s3_prefix}/year={current_year}/data.parquet")
-    logger.info("=" * 60)
+    logger.info(
+        f"ASOS update started: lookback={lookback_hours}h (since {lookback_start.isoformat()}) "
+        f"→ s3://{s3_bucket}/{s3_prefix}/year={current_year}/data.parquet"
+    )
 
     # Set up local paths (flat path avoids pyarrow Hive partition inference)
     data_dir = Path("/tmp/asos")
@@ -214,9 +220,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     file_size = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Uploaded year={current_year} ({file_size:.1f} MB)")
 
-    logger.info("=" * 60)
-    logger.info("ASOS UPDATE COMPLETE")
-    logger.info("=" * 60)
+    logger.info("ASOS update complete")
 
     return {
         "status": "success",
@@ -228,18 +232,27 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("source-coop-asos-s3"), modal.Secret.from_name("claude-routine-trigger")],
+    secrets=[
+        modal.Secret.from_name("source-coop-asos-s3"),
+        modal.Secret.from_name("betterstack-asos-parquet"),
+    ],
     timeout=3600,  # 1 hour (full year × global stations, plus retry backoff)
     cpu=1.0,
     memory=4096,  # 4GB — year partitions are 200-400MB, processing peaks higher
 )
 def backfill_year(year: int):
     """Load a full year of observations and upload to S3."""
+    from asos_parquet import obs
+
+    obs.setup_logging()
+    obs.init_sentry()
     try:
         return _backfill_year_impl(year)
-    except BaseException as exc:
-        _fire_failure_routine("backfill_year", traceback.format_exc())
+    except BaseException:
+        logger.exception("backfill_year failed")
         raise
+    finally:
+        obs.flush()
 
 
 def _backfill_year_impl(year: int):
@@ -256,10 +269,7 @@ def _backfill_year_impl(year: int):
     if not s3_bucket:
         raise ValueError("ASOS_S3_BUCKET environment variable not set")
 
-    logger.info("=" * 60)
-    logger.info(f"BACKFILL YEAR {year}")
-    logger.info(f"S3: s3://{s3_bucket}/{s3_prefix}/year={year}/data.parquet")
-    logger.info("=" * 60)
+    logger.info(f"Backfill year {year} → s3://{s3_bucket}/{s3_prefix}/year={year}/data.parquet")
 
     # Fetch all stations (including offline — they may have historical data)
     networks = get_all_network_ids()
@@ -301,9 +311,7 @@ def _backfill_year_impl(year: int):
     file_size = result.output_path.stat().st_size / 1024 / 1024
     logger.info(f"Uploaded year={year} ({file_size:.1f} MB)")
 
-    logger.info("=" * 60)
-    logger.info(f"BACKFILL YEAR {year} COMPLETE")
-    logger.info("=" * 60)
+    logger.info(f"Backfill year {year} complete")
 
     return {
         "status": "success",

@@ -42,7 +42,14 @@ modal secret create source-coop-asos-s3 \
     ASOS_S3_BUCKET=your-bucket-name \
     ASOS_S3_PREFIX=asos
 
-# 4. Deploy (runs hourly at minute 5)
+# 4. Create the Better Stack observability secret (see Monitoring below)
+modal secret create betterstack-asos-parquet \
+    BETTERSTACK_SOURCE_TOKEN=your_source_token \
+    BETTERSTACK_INGESTING_HOST=sNNNN.us-east-9.betterstackdata.com \
+    BETTERSTACK_ERRORS_DSN=https://token@sNNNN.us-east-9.betterstackdata.com/NNNN \
+    BETTERSTACK_HEARTBEAT_URL=https://uptime.betterstack.com/api/v1/heartbeat/xxxx
+
+# 5. Deploy (runs at :20 and :50 each hour)
 modal deploy modal_app.py
 ```
 
@@ -69,6 +76,21 @@ modal deploy modal_app.py
 ## Monitoring
 
 View runs and logs in the Modal dashboard: https://modal.com/apps
+
+Observability is also streamed to [Better Stack](https://betterstack.com) (team
+`dynamical.org`), configured in `obs.py` and wired into each Modal function:
+
+- **Logs** — `INFO`+ log records stream to the `asos-parquet` source (Live tail).
+- **Errors** — unhandled exceptions are captured via the Sentry SDK into the
+  `asos-parquet` errors application.
+- **Uptime** — `update_asos_data` pings a Better Stack heartbeat on success and
+  `…/fail` on failure. Create the heartbeat in the Better Stack UI (suggested:
+  **1h period, 30m grace** — the job runs twice hourly for redundancy) and put
+  its URL in `BETTERSTACK_HEARTBEAT_URL`.
+
+All four `BETTERSTACK_*` values live in the `betterstack-asos-parquet` Modal
+secret. When they are unset (e.g. local `make load`), `obs.py` degrades to plain
+stdout logging with no network calls.
 
 ## How It Works
 

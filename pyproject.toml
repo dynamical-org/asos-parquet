@@ -14,6 +14,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "duckdb>=1.4.3",
     "rich>=13.0.0",
+    "logtail-python>=0.3.4",
+    "sentry-sdk>=2.63.0",
 ]
 
 [project.optional-dependencies]

@@ -1,5 +1,6 @@
 """Station metadata fetching from Iowa Mesonet."""
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -11,6 +12,8 @@ from .config import (
     REQUEST_TIMEOUT,
     get_all_network_ids,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_network_id(network_id: str) -> tuple[str, str]:
@@ -107,7 +110,7 @@ def fetch_all_stations(
                 if not df.empty:
                     all_stations.append(df)
             except Exception as e:
-                print(f"[warning] failed to fetch {network_id} stations: {e}")
+                logger.warning(f"failed to fetch {network_id} stations: {e}")
 
     if not all_stations:
         return pd.DataFrame()
