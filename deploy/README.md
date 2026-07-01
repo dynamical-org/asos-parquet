@@ -83,10 +83,12 @@ Observability is also streamed to [Better Stack](https://betterstack.com) (team
 - **Logs** — `INFO`+ log records stream to the `asos-parquet` source (Live tail).
 - **Errors** — unhandled exceptions are captured via the Sentry SDK into the
   `asos-parquet` errors application.
-- **Uptime** — `update_asos_data` pings a Better Stack heartbeat on success and
-  `…/fail` on failure. Create the heartbeat in the Better Stack UI (suggested:
-  **1h period, 30m grace** — the job runs twice hourly for redundancy) and put
-  its URL in `BETTERSTACK_HEARTBEAT_URL`.
+- **Uptime** — `update_asos_data` pings a Better Stack heartbeat on success.
+  It deliberately does not ping `…/fail`; missing-ping detection catches
+  sustained outages without paging on singleton upstream blips. Create the
+  heartbeat in the Better Stack UI (suggested: **30m period, 30m grace** — the
+  job runs twice hourly for redundancy) and put its URL in
+  `BETTERSTACK_HEARTBEAT_URL`.
 
 All four `BETTERSTACK_*` values live in the `betterstack-asos-parquet` Modal
 secret. When they are unset (e.g. local `make load`), `obs.py` degrades to plain
