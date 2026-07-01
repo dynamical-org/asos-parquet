@@ -63,21 +63,26 @@ image = (
 logger = logging.getLogger(__name__)
 
 
-def _heartbeat(*, failed: bool = False) -> None:
-    """Best-effort Better Stack heartbeat ping; monitoring must never break a run.
+def _heartbeat() -> None:
+    """Best-effort Better Stack success heartbeat ping; monitoring must never break a run.
 
     The URL comes from the betterstack-asos-parquet secret
-    (BETTERSTACK_HEARTBEAT_URL); when unset (local dev) this is a no-op. Pinging
-    the base URL reports success; appending /fail reports a failure. Configure
-    the heartbeat in Better Stack with a 1h period and 30m grace (the job runs
-    at :20 and :50 for redundancy).
+    (BETTERSTACK_HEARTBEAT_URL); when unset (local dev) this is a no-op.
+
+    We deliberately ping only on success and never post to /fail. The job runs
+    twice hourly (:20 and :50) for redundancy, and transient upstream errors
+    (Iowa Mesonet, source.coop S3) routinely self-heal on the next run — a /fail
+    ping would page the on-call for a blip that's already fixed by the time they
+    look. Instead we rely on Better Stack's missing-ping detection: with a 30m
+    period + 30m grace it alerts only after ~2 consecutive failed runs (a real
+    sustained outage), while every exception is still captured in Sentry via
+    logger.exception for debugging.
     """
     url = os.environ.get("BETTERSTACK_HEARTBEAT_URL")
     if not url:
         return
-    target = f"{url}/fail" if failed else url
     with contextlib.suppress(Exception):
-        urllib.request.urlopen(target, timeout=10)
+        urllib.request.urlopen(url, timeout=10)
 
 
 @app.function(
@@ -109,8 +114,9 @@ def update_asos_data(lookback_hours: int = 2):
         _heartbeat()
         return result
     except BaseException:
+        # No /fail ping: a single failed run self-heals on the next :20/:50 run.
+        # Sentry captures the traceback; missing-ping detection catches real outages.
         logger.exception("update_asos_data failed")
-        _heartbeat(failed=True)
         raise
     finally:
         obs.flush()
@@ -120,6 +126,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     import boto3
     import geopandas as gpd
     import pandas as pd
+    from botocore.config import Config
     from botocore.exceptions import ClientError
 
     from asos_parquet.config import get_all_network_ids
@@ -154,12 +161,15 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     data_file = data_dir / "data.parquet"
     s3_key = f"{s3_prefix}/year={current_year}/data.parquet"
 
-    # Initialize S3 client with explicit credentials (prefixed to avoid boto3 env var collisions)
+    # Initialize S3 client with explicit credentials (prefixed to avoid boto3 env var collisions).
+    # Adaptive retries absorb transient source.coop S3 errors (throttling, 5xx) so a
+    # momentary blip doesn't fail the whole run and page the on-call.
     s3_kwargs = {
         "aws_access_key_id": os.environ["ASOS_AWS_ACCESS_KEY_ID"],
         "aws_secret_access_key": os.environ["ASOS_AWS_SECRET_ACCESS_KEY"],
         "aws_session_token": os.environ.get("ASOS_AWS_SESSION_TOKEN"),
         "region_name": os.environ.get("ASOS_AWS_DEFAULT_REGION"),
+        "config": Config(retries={"max_attempts": 5, "mode": "adaptive"}),
     }
     if s3_endpoint:
         s3_kwargs["endpoint_url"] = s3_endpoint
@@ -257,6 +267,7 @@ def backfill_year(year: int):
 
 def _backfill_year_impl(year: int):
     import boto3
+    from botocore.config import Config
 
     from asos_parquet.config import get_all_network_ids
     from asos_parquet.load import load_year
@@ -301,6 +312,7 @@ def _backfill_year_impl(year: int):
         "aws_secret_access_key": os.environ["ASOS_AWS_SECRET_ACCESS_KEY"],
         "aws_session_token": os.environ.get("ASOS_AWS_SESSION_TOKEN"),
         "region_name": os.environ.get("ASOS_AWS_DEFAULT_REGION"),
+        "config": Config(retries={"max_attempts": 5, "mode": "adaptive"}),
     }
     if s3_endpoint:
         s3_kwargs["endpoint_url"] = s3_endpoint
