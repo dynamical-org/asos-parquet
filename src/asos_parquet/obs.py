@@ -70,9 +70,28 @@ def init_sentry() -> None:
 
 
 def flush() -> None:
-    """Push buffered logs and error events before Modal freezes the container."""
+    """Push buffered logs and error events before Modal freezes the container.
+
+    Also stops Logtail's background FlushWorker. It is a non-daemon thread with
+    no public stop API: it exits only after the thread that spawned it dies at
+    interpreter shutdown, and under Modal the spawning thread is the container's
+    main thread, which outlives every input. Left alone it lingers after the
+    function returns, Modal logs a "background thread(s) still running after
+    container exit" warning (which propagates from the modal-client logger back
+    through this very handler into Better Stack), and container teardown stalls
+    on the interpreter-shutdown join. `handler.flush()` has already drained the
+    queue synchronously, so stopping the worker loses nothing — the shutdown
+    drain it exists for is redundant here — and the handler re-spawns it on the
+    next emit(), so a reused warm container keeps streaming.
+    """
     import sentry_sdk
 
     sentry_sdk.flush()
     for handler in logging.getLogger().handlers:
         handler.flush()
+        worker = getattr(handler, "flush_thread", None)  # Logtail's FlushWorker
+        if worker is not None and worker.is_alive():
+            worker.should_run = False
+            # The worker re-checks should_run each step; a step lasts at most
+            # flush_interval (1s) once the queue is drained.
+            worker.join(timeout=2)
