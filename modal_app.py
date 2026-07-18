@@ -63,6 +63,14 @@ image = (
 logger = logging.getLogger(__name__)
 
 
+# Modal tears containers down by raising into the running input: a
+# KeyboardInterrupt when it recycles/scales down, or an InputCancellation when a
+# function overruns its timeout. Both self-heal on the next scheduled run, so
+# they aren't a real failure worth an error-tracker event.
+def _is_lifecycle_interruption(exc: BaseException) -> bool:
+    return isinstance(exc, (KeyboardInterrupt, modal.exception.InputCancellation))
+
+
 def _heartbeat() -> None:
     """Best-effort Better Stack success heartbeat ping; monitoring must never break a run.
 
@@ -113,9 +121,14 @@ def update_asos_data(lookback_hours: int = 2):
         result = _update_asos_data_impl(lookback_hours)
         _heartbeat()
         return result
-    except BaseException:
+    except BaseException as exc:
         # No /fail ping: a single failed run self-heals on the next :20/:50 run.
-        # Sentry captures the traceback; missing-ping detection catches real outages.
+        # Sentry captures the traceback; missing-ping detection catches real
+        # outages. A lifecycle interruption isn't such a failure — log it at
+        # info so it doesn't become Sentry noise.
+        if _is_lifecycle_interruption(exc):
+            logger.info("update_asos_data interrupted by Modal lifecycle: %s", type(exc).__name__)
+            raise
         logger.exception("update_asos_data failed")
         raise
     finally:
@@ -258,7 +271,10 @@ def backfill_year(year: int):
     obs.init_sentry()
     try:
         return _backfill_year_impl(year)
-    except BaseException:
+    except BaseException as exc:
+        if _is_lifecycle_interruption(exc):
+            logger.info("backfill_year interrupted by Modal lifecycle: %s", type(exc).__name__)
+            raise
         logger.exception("backfill_year failed")
         raise
     finally:
