@@ -457,7 +457,6 @@ def fetch_station_observations(
                 status_code = e.response.status_code
                 attempt += 1
 
-                # Log retry attempt
                 logger.warning(f"{station_id}: {status_code} error, retry {attempt} (waiting {wait_time:.0f}s)")
 
                 # Update status via callback or print

@@ -197,7 +197,6 @@ class TestValidateNoDuplicates:
         gdf = pd.concat([valid_gdf, valid_gdf.iloc[[0]]], ignore_index=True)
         gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs="EPSG:4326")
         result = validate_no_duplicates(gdf)
-        # Duplicates check is now informational - always passes but reports count
         assert result.passed is True
         assert result.informational is True
         assert "duplicate" in result.message.lower()
@@ -235,7 +234,6 @@ class TestValidateStationCount:
         assert result.informational is True
 
     def test_reports_count_regardless_of_minimum(self, valid_gdf: gpd.GeoDataFrame):
-        # Station count is now informational - always passes but reports count
         result = validate_station_count(valid_gdf, min_stations=100)
         assert result.passed is True
         assert result.informational is True
