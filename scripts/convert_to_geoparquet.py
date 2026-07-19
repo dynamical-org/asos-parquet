@@ -74,9 +74,7 @@ def convert_file(path: Path, dry_run: bool = False) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert plain parquet files to GeoParquet"
-    )
+    parser = argparse.ArgumentParser(description="Convert plain parquet files to GeoParquet")
     parser.add_argument(
         "path",
         type=str,

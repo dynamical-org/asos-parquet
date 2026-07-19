@@ -61,21 +61,23 @@ def fetch_network_stations(network_id: str) -> pd.DataFrame:
         props = feature["properties"]
         coords = feature["geometry"]["coordinates"]
 
-        rows.append({
-            "station": props["sid"],
-            "name": props["sname"],
-            "longitude": coords[0],
-            "latitude": coords[1],
-            "elevation": props.get("elevation"),
-            "state": region_code,
-            "country": country,
-            "county": props.get("county", ""),
-            "wfo": props.get("wfo", ""),
-            "tzname": props.get("tzname", ""),
-            "archive_begin": props.get("archive_begin"),
-            "archive_end": props.get("archive_end"),
-            "online": props.get("online", False),
-        })
+        rows.append(
+            {
+                "station": props["sid"],
+                "name": props["sname"],
+                "longitude": coords[0],
+                "latitude": coords[1],
+                "elevation": props.get("elevation"),
+                "state": region_code,
+                "country": country,
+                "county": props.get("county", ""),
+                "wfo": props.get("wfo", ""),
+                "tzname": props.get("tzname", ""),
+                "archive_begin": props.get("archive_begin"),
+                "archive_end": props.get("archive_end"),
+                "online": props.get("online", False),
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -118,9 +120,7 @@ def fetch_all_stations(
     stations = pd.concat(all_stations, ignore_index=True)
 
     # Parse archive dates and ensure UTC timezone
-    stations["archive_begin"] = pd.to_datetime(
-        stations["archive_begin"], errors="coerce", utc=True
-    )
+    stations["archive_begin"] = pd.to_datetime(stations["archive_begin"], errors="coerce", utc=True)
     stations["archive_end"] = pd.to_datetime(
         stations["archive_end"].fillna(pd.Timestamp.now("UTC").strftime("%Y-%m-%d")),
         errors="coerce",

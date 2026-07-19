@@ -206,9 +206,9 @@ def run_load(
     failed_years = 0
 
     for i, year in enumerate(years_to_process, 1):
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"[{i}/{len(years_to_process)}] Year {year}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Mark as in progress
         progress.mark_in_progress(year)
@@ -281,9 +281,9 @@ def run_load(
             failed_years += 1
 
     # Final summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("LOAD COMPLETE")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Successful years: {successful_years}")
     print(f"Failed years: {failed_years}")
     print(f"Total records: {total_records:,}")
@@ -300,9 +300,7 @@ def run_load(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Load ASOS historical data year by year"
-    )
+    parser = argparse.ArgumentParser(description="Load ASOS historical data year by year")
     parser.add_argument(
         "--year",
         type=int,
@@ -324,7 +322,8 @@ def main():
         help="Skip validation after loading each year",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Show detailed validation results",
     )

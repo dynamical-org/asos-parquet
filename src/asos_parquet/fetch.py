@@ -127,10 +127,7 @@ class LiveProgressDisplay:
 
         with self.lock:
             # Sort by start time (oldest first)
-            sorted_requests = sorted(
-                self.in_flight.values(),
-                key=lambda r: r.start_time
-            )
+            sorted_requests = sorted(self.in_flight.values(), key=lambda r: r.start_time)
             for req in sorted_requests[:MAX_CONCURRENT_REQUESTS]:
                 status_style = "yellow" if "retry" in req.status else "green"
                 table.add_row(
@@ -205,21 +202,15 @@ def build_bulk_observation_url(
     )
 
 
-def calculate_optimal_chunk_size(
-    num_stations: int,
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp,
-) -> int:
-    """Calculate optimal stations per chunk based on date range.
+def calculate_optimal_chunk_size(num_stations: int) -> int:
+    """Cap stations per fetch chunk at MAX_STATIONS_PER_CHUNK.
 
-    Kept small (500) so each server-side cursor finishes quickly.
-    The IEM server limits concurrent cursors per IP subnet to ~6,
-    so shorter-lived queries reduce the chance of 503 rejections.
+    Smaller chunks keep each server-side cursor short-lived; the IEM server
+    limits concurrent cursors per IP subnet to ~6, so shorter queries reduce the
+    chance of 503 rejections.
 
     Args:
         num_stations: Total number of stations to fetch
-        start_date: Start timestamp
-        end_date: End timestamp
 
     Returns:
         Recommended stations per chunk
@@ -253,9 +244,7 @@ def split_date_range_monthly(
         if current.month == 12:
             month_end = pd.Timestamp(f"{current.year + 1}-01-01", tz=current.tz)
         else:
-            month_end = pd.Timestamp(
-                f"{current.year}-{current.month + 1:02d}-01", tz=current.tz
-            )
+            month_end = pd.Timestamp(f"{current.year}-{current.month + 1:02d}-01", tz=current.tz)
         period_end = min(month_end, end_date)
         periods.append((current, period_end))
         current = month_end
@@ -320,9 +309,21 @@ def fetch_bulk_chunk(
 
             # Convert numeric columns
             numeric_cols = [
-                "tmpf", "tmpc", "dwpf", "dwpc", "relh", "drct",
-                "sknt", "gust", "alti", "mslp", "vsby", "p01i", "p01m",
-                "longitude", "latitude",
+                "tmpf",
+                "tmpc",
+                "dwpf",
+                "dwpc",
+                "relh",
+                "drct",
+                "sknt",
+                "gust",
+                "alti",
+                "mslp",
+                "vsby",
+                "p01i",
+                "p01m",
+                "longitude",
+                "latitude",
             ]
             for col in numeric_cols:
                 if col in df.columns:
@@ -429,9 +430,21 @@ def fetch_station_observations(
 
             # Convert numeric columns
             numeric_cols = [
-                "tmpf", "tmpc", "dwpf", "dwpc", "relh", "drct",
-                "sknt", "gust", "alti", "mslp", "vsby", "p01i", "p01m",
-                "longitude", "latitude",
+                "tmpf",
+                "tmpc",
+                "dwpf",
+                "dwpc",
+                "relh",
+                "drct",
+                "sknt",
+                "gust",
+                "alti",
+                "mslp",
+                "vsby",
+                "p01i",
+                "p01m",
+                "longitude",
+                "latitude",
             ]
             for col in numeric_cols:
                 if col in df.columns:
@@ -457,14 +470,19 @@ def fetch_station_observations(
                 status_code = e.response.status_code
                 attempt += 1
 
-                # Log retry attempt
-                logger.warning(f"{station_id}: {status_code} error, retry {attempt} (waiting {wait_time:.0f}s)")
+                logger.warning(
+                    f"{station_id}: {status_code} error, retry {attempt} (waiting {wait_time:.0f}s)"
+                )
 
                 # Update status via callback or print
                 if status_callback:
                     status_callback(station_id, f"retry {attempt}", attempt)
                 elif attempt == 1:
-                    print(f"[{status_code}] {station_id}: server error, retrying...", end="", flush=True)
+                    print(
+                        f"[{status_code}] {station_id}: server error, retrying...",
+                        end="",
+                        flush=True,
+                    )
                 elif attempt % 5 == 0:
                     print(f" (attempt {attempt}, waiting {wait_time:.0f}s)", end="", flush=True)
 
@@ -507,7 +525,9 @@ def fetch_observations_batch(
     """
     if use_bulk:
         return fetch_observations_bulk(
-            stations, start_date, end_date,
+            stations,
+            start_date,
+            end_date,
             show_progress=show_progress,
             description=description,
         )
@@ -525,8 +545,7 @@ def fetch_observations_batch(
         return _fetch_with_rich_display(station_list, start_date, end_date, total, description)
     else:
         return _fetch_simple(
-            station_list, start_date, end_date, total,
-            show_progress, progress_interval
+            station_list, start_date, end_date, total, show_progress, progress_interval
         )
 
 
@@ -572,16 +591,13 @@ def fetch_observations_bulk(
 
     # Calculate optimal chunk size if not specified
     if chunk_size is None:
-        chunk_size = calculate_optimal_chunk_size(num_stations, start_date, end_date)
+        chunk_size = calculate_optimal_chunk_size(num_stations)
 
     if max_workers is None:
         max_workers = BULK_MAX_WORKERS
 
     # Split stations into chunks
-    station_chunks = [
-        station_ids[i:i + chunk_size]
-        for i in range(0, num_stations, chunk_size)
-    ]
+    station_chunks = [station_ids[i : i + chunk_size] for i in range(0, num_stations, chunk_size)]
 
     # Split long date ranges into monthly sub-periods for faster server response
     time_periods = split_date_range_monthly(start_date, end_date)
@@ -627,9 +643,7 @@ def fetch_observations_bulk(
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(
-                        fetch_bulk_chunk, stn_chunk, p_start, p_end, i
-                    ): i
+                    executor.submit(fetch_bulk_chunk, stn_chunk, p_start, p_end, i): i
                     for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
                 }
 
@@ -645,8 +659,12 @@ def fetch_observations_bulk(
                         all_observations.append(df)
                         total_records += len(df)
 
-                    chunk_records = f"{len(df):,} records" if df is not None and not df.empty else "empty"
-                    logger.info(f"Chunk {completed}/{num_chunks}: {chunk_records} (total: {total_records:,})")
+                    chunk_records = (
+                        f"{len(df):,} records" if df is not None and not df.empty else "empty"
+                    )
+                    logger.info(
+                        f"Chunk {completed}/{num_chunks}: {chunk_records} (total: {total_records:,})"
+                    )
 
                     progress.update(task, advance=1, records=total_records)
 
@@ -660,9 +678,7 @@ def fetch_observations_bulk(
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(
-                    fetch_bulk_chunk, stn_chunk, p_start, p_end, i
-                ): i
+                executor.submit(fetch_bulk_chunk, stn_chunk, p_start, p_end, i): i
                 for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
             }
 
@@ -681,8 +697,12 @@ def fetch_observations_bulk(
                     all_observations.append(df)
                     total_records += len(df)
 
-                chunk_records = f"{len(df):,} records" if df is not None and not df.empty else "empty"
-                logger.info(f"Chunk {completed}/{num_chunks}: {chunk_records} (total: {total_records:,})")
+                chunk_records = (
+                    f"{len(df):,} records" if df is not None and not df.empty else "empty"
+                )
+                logger.info(
+                    f"Chunk {completed}/{num_chunks}: {chunk_records} (total: {total_records:,})"
+                )
 
         if show_progress:
             print(f"Fetch complete: {total_records:,} records, {len(errors)} errors")
@@ -739,6 +759,7 @@ def _fetch_with_rich_display(
                 lines.append(f"[yellow]{warning}[/yellow]\n")
 
         from rich.console import Group
+
         content = Group(Text.from_markup("".join(lines)), table)
 
         return Panel(content, title="[bold]Fetching Observations[/bold]", border_style="blue")

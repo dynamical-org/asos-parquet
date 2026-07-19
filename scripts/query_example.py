@@ -50,9 +50,10 @@ def validate_dataset(conn: duckdb.DuckDBPyConnection) -> None:
                 f"Available years appear to be {min_year}-{max_year}."
             )
         )
+
+
 def setup_r2_s3(conn: duckdb.DuckDBPyConnection) -> None:
     """Configure DuckDB S3 settings for Cloudflare R2 using `.env` credentials."""
-    # `scripts/backfill_r2.py` uses python-dotenv; mirror that convention here.
     load_dotenv()
 
     account_id = os.environ.get("R2_ACCOUNT_ID")
@@ -168,7 +169,7 @@ def query_station_summary(conn: duckdb.DuckDBPyConnection, source: str):
     print("-" * 55)
 
     for _, row in result.iterrows():
-        precip = f"{row['total_precip_in']:.1f}\"" if row["total_precip_in"] else "N/A"
+        precip = f'{row["total_precip_in"]:.1f}"' if row["total_precip_in"] else "N/A"
         print(
             f"{row['station']:<8} {row['observations']:>10,} "
             f"{row['min_temp']:>8.0f} {row['avg_temp']:>8.1f} "

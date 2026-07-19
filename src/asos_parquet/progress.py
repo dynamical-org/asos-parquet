@@ -164,8 +164,7 @@ class LoadProgress:
     def get_completed_years(self) -> list[int]:
         """Get list of completed years."""
         return sorted(
-            int(year) for year, progress in self.years.items()
-            if progress.status == "completed"
+            int(year) for year, progress in self.years.items() if progress.status == "completed"
         )
 
     def summary(self) -> dict:
@@ -187,10 +186,7 @@ class LoadProgress:
         return {
             "version": self.version,
             "updated_at": self.updated_at,
-            "years": {
-                year: progress.to_dict()
-                for year, progress in self.years.items()
-            },
+            "years": {year: progress.to_dict() for year, progress in self.years.items()},
         }
 
     @classmethod

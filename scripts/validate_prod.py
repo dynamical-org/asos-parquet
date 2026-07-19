@@ -50,7 +50,11 @@ def check_schema_s3(s3, bucket: str, prefix: str, years: list[str]) -> int:
     from pyarrow.fs import S3FileSystem
 
     s3_endpoint = os.environ.get("AWS_ENDPOINT_URL")
-    fs = S3FileSystem(anonymous=True, region="us-west-2", **({"endpoint_override": s3_endpoint} if s3_endpoint else {}))
+    fs = S3FileSystem(
+        anonymous=True,
+        region="us-west-2",
+        **({"endpoint_override": s3_endpoint} if s3_endpoint else {}),
+    )
 
     failed = 0
     for year_str in years:
@@ -71,7 +75,9 @@ def check_schema_s3(s3, bucket: str, prefix: str, years: list[str]) -> int:
                 failed += 1
             else:
                 extra_str = f" (extra: {sorted(extra)})" if extra else ""
-                print(f"  year={year_str}: OK ({file_size:.0f} MB, {len(columns)} columns){extra_str}")
+                print(
+                    f"  year={year_str}: OK ({file_size:.0f} MB, {len(columns)} columns){extra_str}"
+                )
 
         except Exception as e:
             print(f"  year={year_str}: ERROR - {e}")
@@ -168,7 +174,8 @@ def main():
         help="Validate a specific year only",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Show detailed validation results",
     )
@@ -244,7 +251,10 @@ def main():
             s3_key = f"{prefix}/year={year}/data.parquet"
 
             report = download_and_validate(
-                s3, bucket, s3_key, tmp_path,
+                s3,
+                bucket,
+                s3_key,
+                tmp_path,
                 year=year,
                 stations=stations,
                 verbose=args.verbose,

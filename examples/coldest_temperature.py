@@ -1,6 +1,7 @@
 """20 coldest temperature readings ever recorded in New York state (since 2000)."""
 
 import matplotlib  # noqa: I001
+
 matplotlib.use("Agg")
 
 from datetime import datetime
@@ -45,8 +46,16 @@ ax.set_title(f"{TOP_N} Coldest Readings in {STATE} ({START}–{END})")
 ax.invert_yaxis()
 
 for bar, val in zip(bars, df["tmpf"]):
-    ax.text(bar.get_width() - 0.5, bar.get_y() + bar.get_height() / 2, f"{val:.0f}°F",
-            ha="right", va="center", fontsize=7, color="white", fontweight="bold")
+    ax.text(
+        bar.get_width() - 0.5,
+        bar.get_y() + bar.get_height() / 2,
+        f"{val:.0f}°F",
+        ha="right",
+        va="center",
+        fontsize=7,
+        color="white",
+        fontweight="bold",
+    )
 
 fig.tight_layout()
 

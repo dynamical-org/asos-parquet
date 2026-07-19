@@ -16,39 +16,109 @@ REQUEST_TIMEOUT = 120  # seconds - monthly requests can be large
 
 # Data fields to fetch (core weather subset with both imperial and metric)
 DATA_FIELDS = [
-    "tmpf",   # Air Temperature (F)
-    "tmpc",   # Air Temperature (C)
-    "dwpf",   # Dew Point (F)
-    "dwpc",   # Dew Point (C)
-    "relh",   # Relative Humidity (%)
-    "drct",   # Wind Direction (degrees)
-    "sknt",   # Wind Speed (knots)
-    "gust",   # Wind Gust (knots)
-    "alti",   # Pressure Altimeter (inches)
-    "mslp",   # Sea Level Pressure (mb)
-    "vsby",   # Visibility (miles)
-    "p01i",   # 1-hour Precipitation (inches)
-    "p01m",   # 1-hour Precipitation (mm)
+    "tmpf",  # Air Temperature (F)
+    "tmpc",  # Air Temperature (C)
+    "dwpf",  # Dew Point (F)
+    "dwpc",  # Dew Point (C)
+    "relh",  # Relative Humidity (%)
+    "drct",  # Wind Direction (degrees)
+    "sknt",  # Wind Speed (knots)
+    "gust",  # Wind Gust (knots)
+    "alti",  # Pressure Altimeter (inches)
+    "mslp",  # Sea Level Pressure (mb)
+    "vsby",  # Visibility (miles)
+    "p01i",  # 1-hour Precipitation (inches)
+    "p01m",  # 1-hour Precipitation (mm)
 ]
 
 # US states with ASOS networks
 US_STATES = [
-    "AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD",
-    "ME", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH",
-    "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY",
+    "AK",
+    "AL",
+    "AR",
+    "AZ",
+    "CA",
+    "CO",
+    "CT",
+    "DE",
+    "FL",
+    "GA",
+    "HI",
+    "IA",
+    "ID",
+    "IL",
+    "IN",
+    "KS",
+    "KY",
+    "LA",
+    "MA",
+    "MD",
+    "ME",
+    "MI",
+    "MN",
+    "MO",
+    "MS",
+    "MT",
+    "NC",
+    "ND",
+    "NE",
+    "NH",
+    "NJ",
+    "NM",
+    "NV",
+    "NY",
+    "OH",
+    "OK",
+    "OR",
+    "PA",
+    "RI",
+    "SC",
+    "SD",
+    "TN",
+    "TX",
+    "UT",
+    "VA",
+    "VT",
+    "WA",
+    "WI",
+    "WV",
+    "WY",
 ]
 
 # Canadian provinces with ASOS networks
 CANADIAN_PROVINCES = [
-    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK", "YT",
+    "AB",
+    "BC",
+    "MB",
+    "NB",
+    "NL",
+    "NS",
+    "NT",
+    "NU",
+    "ON",
+    "PE",
+    "QC",
+    "SK",
+    "YT",
 ]
 
 # All supported countries (US and CA expand to sub-networks, others use {cc}__ASOS)
 ALL_COUNTRIES = [
-    "US", "CA",
-    "AU", "BR", "CN", "DE", "FR", "GB", "IN", "JP", "KR", "MX", "NZ", "RU", "ZA",
+    "US",
+    "CA",
+    "AU",
+    "BR",
+    "CN",
+    "DE",
+    "FR",
+    "GB",
+    "IN",
+    "JP",
+    "KR",
+    "MX",
+    "NZ",
+    "RU",
+    "ZA",
 ]
 
 
