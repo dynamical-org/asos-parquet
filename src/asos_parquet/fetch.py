@@ -202,21 +202,15 @@ def build_bulk_observation_url(
     )
 
 
-def calculate_optimal_chunk_size(
-    num_stations: int,
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp,
-) -> int:
-    """Calculate optimal stations per chunk based on date range.
+def calculate_optimal_chunk_size(num_stations: int) -> int:
+    """Cap stations per fetch chunk at MAX_STATIONS_PER_CHUNK.
 
-    Kept small (500) so each server-side cursor finishes quickly.
-    The IEM server limits concurrent cursors per IP subnet to ~6,
-    so shorter-lived queries reduce the chance of 503 rejections.
+    Smaller chunks keep each server-side cursor short-lived; the IEM server
+    limits concurrent cursors per IP subnet to ~6, so shorter queries reduce the
+    chance of 503 rejections.
 
     Args:
         num_stations: Total number of stations to fetch
-        start_date: Start timestamp
-        end_date: End timestamp
 
     Returns:
         Recommended stations per chunk
@@ -597,7 +591,7 @@ def fetch_observations_bulk(
 
     # Calculate optimal chunk size if not specified
     if chunk_size is None:
-        chunk_size = calculate_optimal_chunk_size(num_stations, start_date, end_date)
+        chunk_size = calculate_optimal_chunk_size(num_stations)
 
     if max_workers is None:
         max_workers = BULK_MAX_WORKERS
