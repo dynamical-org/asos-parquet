@@ -91,10 +91,12 @@ def _heartbeat() -> None:
         modal.Secret.from_name("source-coop-asos-s3"),
         modal.Secret.from_name("betterstack-asos-parquet"),
     ],
-    timeout=900,  # 15 minutes (global station fetch takes longer than US-only)
+    timeout=1800,  # 30 minutes: global station fetch plus reading/merging/rewriting
+    # the current year's partition, which grows throughout the year (~32M rows
+    # by mid-2026) and takes proportionally longer to read and rewrite.
     schedule=modal.Cron("20,50 * * * *"),  # Run at :20 and :50 past each hour
     cpu=1.0,
-    memory=2048,
+    memory=4096,  # matches backfill_year: same yearly-partition size to read/merge/write
 )
 def update_asos_data(lookback_hours: int = 2):
     """Fetch recent ASOS observations and update S3.
