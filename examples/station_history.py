@@ -1,6 +1,7 @@
 """Full temperature history for JFK airport (1940–present) with 365-day rolling mean."""
 
 import matplotlib  # noqa: I001
+
 matplotlib.use("Agg")
 
 from datetime import datetime

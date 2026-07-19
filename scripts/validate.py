@@ -139,7 +139,8 @@ def main():
         help=f"Path to data directory (default: {DEFAULT_DATASET_PATH})",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Show detailed validation results",
     )

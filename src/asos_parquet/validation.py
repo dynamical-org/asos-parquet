@@ -90,19 +90,19 @@ REQUIRED_COLUMNS = [
 
 # Physical bounds for weather variables
 PHYSICAL_BOUNDS = {
-    "tmpf": (-130.0, 150.0),      # Temperature (F): -130 to 150
-    "tmpc": (-90.0, 65.0),        # Temperature (C): -90 to 65
-    "dwpf": (-130.0, 100.0),      # Dew point (F)
-    "dwpc": (-90.0, 40.0),        # Dew point (C)
-    "relh": (0.0, 100.0),         # Relative humidity (%)
-    "drct": (0.0, 360.0),         # Wind direction (degrees)
-    "sknt": (0.0, 250.0),         # Wind speed (knots): max ~250 for extreme gusts
-    "gust": (0.0, 300.0),         # Wind gust (knots)
-    "alti": (25.0, 32.0),         # Altimeter (inches): ~25-32 for sea level
-    "mslp": (850.0, 1100.0),      # Sea level pressure (mb)
-    "vsby": (0.0, 100.0),         # Visibility (miles)
-    "p01i": (0.0, 20.0),          # 1-hour precip (inches): max ~20 for extreme events
-    "p01m": (0.0, 500.0),         # 1-hour precip (mm)
+    "tmpf": (-130.0, 150.0),  # Temperature (F): -130 to 150
+    "tmpc": (-90.0, 65.0),  # Temperature (C): -90 to 65
+    "dwpf": (-130.0, 100.0),  # Dew point (F)
+    "dwpc": (-90.0, 40.0),  # Dew point (C)
+    "relh": (0.0, 100.0),  # Relative humidity (%)
+    "drct": (0.0, 360.0),  # Wind direction (degrees)
+    "sknt": (0.0, 250.0),  # Wind speed (knots): max ~250 for extreme gusts
+    "gust": (0.0, 300.0),  # Wind gust (knots)
+    "alti": (25.0, 32.0),  # Altimeter (inches): ~25-32 for sea level
+    "mslp": (850.0, 1100.0),  # Sea level pressure (mb)
+    "vsby": (0.0, 100.0),  # Visibility (miles)
+    "p01i": (0.0, 20.0),  # 1-hour precip (inches): max ~20 for extreme events
+    "p01m": (0.0, 500.0),  # 1-hour precip (mm)
     "longitude": (-180.0, 180.0),
     "latitude": (-90.0, 90.0),
 }
@@ -112,9 +112,9 @@ PHYSICAL_BOUNDS = {
 # stations (e.g., PASY at Shemya AFB) have positive longitudes (~174°E)
 US_BBOX = {
     "min_lon": -180.0,  # Western Alaska
-    "max_lon": -65.0,   # East coast (but see aleutian_lon below)
-    "min_lat": 17.0,    # Puerto Rico
-    "max_lat": 72.0,    # Northern Alaska
+    "max_lon": -65.0,  # East coast (but see aleutian_lon below)
+    "min_lat": 17.0,  # Puerto Rico
+    "max_lat": 72.0,  # Northern Alaska
     "aleutian_min_lon": 170.0,  # Far western Aleutians (positive longitude)
     "aleutian_max_lon": 180.0,
 }
@@ -162,7 +162,7 @@ def validate_geometry(gdf: gpd.GeoDataFrame) -> ValidationResult:
         return ValidationResult(
             name="geometry",
             passed=False,
-            message=f"{null_geom:,} null geometries ({null_geom/len(gdf)*100:.1f}%)",
+            message=f"{null_geom:,} null geometries ({null_geom / len(gdf) * 100:.1f}%)",
             details={"null_count": null_geom, "types": geom_types, "crs": crs},
         )
 
@@ -473,14 +473,14 @@ def validate_null_rates(
         return ValidationResult(
             name="null_rates",
             passed=False,
-            message=f"{len(high_null)} columns exceed {max_null_rate*100}% null rate",
+            message=f"{len(high_null)} columns exceed {max_null_rate * 100}% null rate",
             details={"columns": high_null},
         )
 
     return ValidationResult(
         name="null_rates",
         passed=True,
-        message=f"All key columns below {max_null_rate*100}% null rate",
+        message=f"All key columns below {max_null_rate * 100}% null rate",
     )
 
 
@@ -569,9 +569,9 @@ def validate_station_coverage(
     # Filter to stations that should have data for this year
     year_end = pd.Timestamp(f"{year}-12-31", tz="UTC")
 
-    active_stations = expected_stations[
-        (expected_stations["archive_begin"] <= year_end)
-    ]["station"].unique()
+    active_stations = expected_stations[(expected_stations["archive_begin"] <= year_end)][
+        "station"
+    ].unique()
 
     # Get stations actually present in data
     present_stations = set(gdf["station"].unique())
@@ -650,15 +650,11 @@ def validate_temporal_completeness(
     )
 
     # Calculate days covered and expected observations
-    station_stats["days"] = (
-        (station_stats["max_time"] - station_stats["min_time"]).dt.days + 1
-    )
+    station_stats["days"] = (station_stats["max_time"] - station_stats["min_time"]).dt.days + 1
     station_stats["obs_per_day"] = station_stats["obs_count"] / station_stats["days"]
 
     # Find stations with low observation density
-    sparse_stations = station_stats[
-        station_stats["obs_per_day"] < min_observations_per_day
-    ]
+    sparse_stations = station_stats[station_stats["obs_per_day"] < min_observations_per_day]
 
     # Sample check for large gaps (expensive, so only check subset)
     large_gaps = []
@@ -673,10 +669,12 @@ def validate_temporal_completeness(
         max_gap = time_diffs.max()
 
         if max_gap > pd.Timedelta(hours=max_gap_hours):
-            large_gaps.append({
-                "station": station,
-                "max_gap_hours": max_gap.total_seconds() / 3600,
-            })
+            large_gaps.append(
+                {
+                    "station": station,
+                    "max_gap_hours": max_gap.total_seconds() / 3600,
+                }
+            )
 
     sparse_pct = len(sparse_stations) / len(station_stats) * 100 if len(station_stats) > 0 else 0
     dense_pct = 100 - sparse_pct
@@ -795,19 +793,21 @@ def validate_geoparquet(
     )
 
     # Run all validation checks
-    report.results.extend([
-        validate_schema(gdf),
-        validate_geometry(gdf),
-        validate_timestamps(gdf),
-        validate_physical_bounds(gdf),
-        validate_locations(gdf, us_only=us_only),
-        validate_region_codes(gdf, us_only=us_only),
-        validate_no_duplicates(gdf),
-        validate_null_rates(gdf),
-        validate_record_count(gdf, min_records),
-        validate_station_count(gdf, min_stations),
-        validate_metric_imperial_consistency(gdf),
-    ])
+    report.results.extend(
+        [
+            validate_schema(gdf),
+            validate_geometry(gdf),
+            validate_timestamps(gdf),
+            validate_physical_bounds(gdf),
+            validate_locations(gdf, us_only=us_only),
+            validate_region_codes(gdf, us_only=us_only),
+            validate_no_duplicates(gdf),
+            validate_null_rates(gdf),
+            validate_record_count(gdf, min_records),
+            validate_station_count(gdf, min_stations),
+            validate_metric_imperial_consistency(gdf),
+        ]
+    )
 
     # Gap validation (if station metadata provided)
     if expected_stations is not None and year is not None:

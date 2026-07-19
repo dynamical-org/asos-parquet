@@ -1,6 +1,7 @@
 """25 wettest US stations by total annual precipitation in 2024."""
 
 import matplotlib  # noqa: I001
+
 matplotlib.use("Agg")
 
 from pathlib import Path
@@ -30,8 +31,10 @@ df = duckdb.execute(
     [URL, TOP_N],
 ).fetchdf()
 
-print(f"  Wettest: {df['station'].iloc[0]} ({df['state'].iloc[0]}) — "
-      f"{df['total_precip_in'].iloc[0]:.1f} in")
+print(
+    f"  Wettest: {df['station'].iloc[0]} ({df['state'].iloc[0]}) — "
+    f"{df['total_precip_in'].iloc[0]:.1f} in"
+)
 
 df["label"] = df["station"] + " (" + df["state"] + ")"
 df = df.sort_values("total_precip_in", ascending=True)
@@ -42,7 +45,7 @@ ax.set_xlabel("Total Precipitation (inches)")
 ax.set_title(f"Top {TOP_N} Wettest Stations — {YEAR}")
 
 for i, val in enumerate(df["total_precip_in"]):
-    ax.text(val + 0.3, i, f"{val:.1f}\"", va="center", fontsize=7)
+    ax.text(val + 0.3, i, f'{val:.1f}"', va="center", fontsize=7)
 
 fig.tight_layout()
 

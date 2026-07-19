@@ -155,7 +155,7 @@ def idw_interpolate(
         return values[np.argmin(distances)]
 
     # IDW weights
-    weights = 1.0 / (distances ** power)
+    weights = 1.0 / (distances**power)
     weights /= weights.sum()
 
     return np.sum(weights * values)
@@ -270,11 +270,15 @@ def main():
     print(f"{'=' * 45}")
 
     if interpolated["temp_f"].notna().any():
-        print(f"  Temperature: {interpolated['temp_f'].min():.1f}F - {interpolated['temp_f'].max():.1f}F")
+        print(
+            f"  Temperature: {interpolated['temp_f'].min():.1f}F - {interpolated['temp_f'].max():.1f}F"
+        )
         print(f"  Mean:        {interpolated['temp_f'].mean():.1f}F")
 
     if interpolated["humidity_pct"].notna().any():
-        print(f"  Humidity:    {interpolated['humidity_pct'].min():.0f}% - {interpolated['humidity_pct'].max():.0f}%")
+        print(
+            f"  Humidity:    {interpolated['humidity_pct'].min():.0f}% - {interpolated['humidity_pct'].max():.0f}%"
+        )
 
     # Show comparison with actual station readings
     print(f"\n{'=' * 45}")

@@ -28,9 +28,7 @@ def enrich_with_station_metadata(
     Drops any existing metadata columns first to ensure fresh values,
     then left-joins from the stations DataFrame on the 'station' column.
     """
-    metadata = stations[["station", *STATION_METADATA_COLUMNS]].drop_duplicates(
-        subset="station"
-    )
+    metadata = stations[["station", *STATION_METADATA_COLUMNS]].drop_duplicates(subset="station")
     drop_cols = [c for c in STATION_METADATA_COLUMNS if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)

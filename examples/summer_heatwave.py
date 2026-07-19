@@ -1,6 +1,7 @@
 """Hourly temperatures at 5 major airports during July 2024."""
 
 import matplotlib  # noqa: I001
+
 matplotlib.use("Agg")
 
 from pathlib import Path
