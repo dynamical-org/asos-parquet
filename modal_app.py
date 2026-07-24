@@ -17,11 +17,11 @@ Setup:
          ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx \\
          ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
          ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
-       modal secret create betterstack-asos-parquet \\
-         BETTERSTACK_SOURCE_TOKEN=xxx BETTERSTACK_INGESTING_HOST=xxx \\
-         BETTERSTACK_ERRORS_DSN=xxx BETTERSTACK_HEARTBEAT_URL=xxx
-       (log streaming + error tracking + uptime heartbeat; see obs.py. The
-        heartbeat URL comes from a Better Stack heartbeat created in the UI.)
+       modal secret create sentry-asos-parquet SENTRY_DSN=xxx
+       modal secret create betterstack-asos-parquet BETTERSTACK_HEARTBEAT_URL=xxx
+       (log streaming + error tracking + cron monitoring via Sentry, uptime
+        heartbeat via Better Stack; see obs.py. The heartbeat URL comes from a
+        Better Stack heartbeat created in the UI.)
     3. Deploy: modal deploy modal_app.py
 
 Cost estimate (twice-hourly runs with bulk fetch):
@@ -54,7 +54,6 @@ image = (
         "shapely>=2.0.0",
         "boto3>=1.34.0",
         "rich>=13.0.0",
-        "logtail-python>=0.3.4",
         "sentry-sdk>=2.63.0",
     )
     .add_local_python_source("asos_parquet")
@@ -93,10 +92,39 @@ def _heartbeat() -> None:
         urllib.request.urlopen(url, timeout=10)
 
 
+_CRON_MONITOR_SLUG = "asos-parquet-update"
+_CRON_SCHEDULE = "20,50 * * * *"  # keep in sync with update_asos_data's schedule=
+
+
+def _cron_checkin(status: str, check_in_id: str | None = None) -> str | None:
+    """Best-effort Sentry cron check-in; monitoring must never break a run.
+
+    Alerts on a missed or overrunning run, not just a raised exception. A
+    no-op when Sentry isn't initialized (e.g. local dev).
+    """
+    import sentry_sdk.crons
+
+    with contextlib.suppress(Exception):
+        return sentry_sdk.crons.capture_checkin(
+            monitor_slug=_CRON_MONITOR_SLUG,
+            check_in_id=check_in_id,
+            status=status,
+            monitor_config={
+                "schedule": {"type": "crontab", "value": _CRON_SCHEDULE},
+                "timezone": "UTC",
+                "checkin_margin": 10,
+                "failure_issue_threshold": 1,
+                "recovery_threshold": 1,
+            },
+        )
+    return None
+
+
 @app.function(
     image=image,
     secrets=[
         modal.Secret.from_name("source-coop-asos-s3"),
+        modal.Secret.from_name("sentry-asos-parquet"),
         modal.Secret.from_name("betterstack-asos-parquet"),
     ],
     timeout=1800,  # 30 minutes: global station fetch plus reading/merging/rewriting
@@ -119,19 +147,23 @@ def update_asos_data(lookback_hours: int = 2):
 
     obs.setup_logging()
     obs.init_sentry()
+    check_in_id = _cron_checkin("in_progress")
     try:
         result = _update_asos_data_impl(lookback_hours)
         _heartbeat()
+        _cron_checkin("ok", check_in_id)
         return result
     except BaseException as exc:
         # No /fail ping: a single failed run self-heals on the next :20/:50 run.
         # Sentry captures the traceback; missing-ping detection catches real
         # outages. A lifecycle interruption isn't such a failure — log it at
-        # info so it doesn't become Sentry noise.
+        # info so it doesn't become Sentry noise, and leave the check-in
+        # unresolved so it self-heals via checkin_margin rather than alerting.
         if _is_lifecycle_interruption(exc):
             logger.info("update_asos_data interrupted by Modal lifecycle: %s", type(exc).__name__)
             raise
         logger.exception("update_asos_data failed")
+        _cron_checkin("error", check_in_id)
         raise
     finally:
         obs.flush()
@@ -259,7 +291,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     image=image,
     secrets=[
         modal.Secret.from_name("source-coop-asos-s3"),
-        modal.Secret.from_name("betterstack-asos-parquet"),
+        modal.Secret.from_name("sentry-asos-parquet"),
     ],
     timeout=3600,  # 1 hour (full year × global stations, plus retry backoff)
     cpu=1.0,
