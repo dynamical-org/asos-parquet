@@ -42,12 +42,9 @@ modal secret create source-coop-asos-s3 \
     ASOS_S3_BUCKET=your-bucket-name \
     ASOS_S3_PREFIX=asos
 
-# 4. Create the observability secrets (see Monitoring below)
+# 4. Create the observability secret (see Monitoring below)
 modal secret create sentry-asos-parquet \
     SENTRY_DSN=https://xxxx@oNNNN.ingest.us.sentry.io/NNNN
-
-modal secret create betterstack-asos-parquet \
-    BETTERSTACK_HEARTBEAT_URL=https://uptime.betterstack.com/api/v1/heartbeat/xxxx
 
 # 5. Deploy (runs at :20 and :50 each hour)
 modal deploy modal_app.py
@@ -77,8 +74,7 @@ modal deploy modal_app.py
 
 View runs and logs in the Modal dashboard: https://modal.com/apps
 
-Observability is split between [Sentry](https://sentry.io) (errors, logs, cron
-monitoring) and [Better Stack](https://betterstack.com) (uptime heartbeat),
+Observability via [Sentry](https://sentry.io) (errors, logs, cron monitoring),
 configured in `obs.py` / `modal_app.py`:
 
 - **Logs** — `INFO`+ log records stream to Sentry Logs for the `asos-parquet`
@@ -88,17 +84,10 @@ configured in `obs.py` / `modal_app.py`:
 - **Cron monitoring** — `update_asos_data` sends a Sentry cron check-in
   (`asos-parquet-update` monitor) around each run, alerting on a missed or
   overrunning run in addition to raised exceptions.
-- **Uptime** — `update_asos_data` also pings a Better Stack heartbeat on
-  success. It deliberately does not ping `…/fail`; missing-ping detection
-  catches sustained outages without paging on singleton upstream blips.
-  Create the heartbeat in the Better Stack UI (suggested: **30m period, 30m
-  grace** — the job runs twice hourly for redundancy) and put its URL in
-  `BETTERSTACK_HEARTBEAT_URL`.
 
-`SENTRY_DSN` lives in the `sentry-asos-parquet` Modal secret;
-`BETTERSTACK_HEARTBEAT_URL` lives in the `betterstack-asos-parquet` secret.
-When unset (e.g. local `make load`), `obs.py` degrades to plain stdout logging
-with no network calls.
+`SENTRY_DSN` lives in the `sentry-asos-parquet` Modal secret. When unset (e.g.
+local `make load`), `obs.py` degrades to plain stdout logging with no network
+calls.
 
 ## How It Works
 

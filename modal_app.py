@@ -18,10 +18,7 @@ Setup:
          ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
          ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
        modal secret create sentry-asos-parquet SENTRY_DSN=xxx
-       modal secret create betterstack-asos-parquet BETTERSTACK_HEARTBEAT_URL=xxx
-       (log streaming + error tracking + cron monitoring via Sentry, uptime
-        heartbeat via Better Stack; see obs.py. The heartbeat URL comes from a
-        Better Stack heartbeat created in the UI.)
+       (log streaming + error tracking + cron monitoring via Sentry; see obs.py.)
     3. Deploy: modal deploy modal_app.py
 
 Cost estimate (twice-hourly runs with bulk fetch):
@@ -33,7 +30,6 @@ Cost estimate (twice-hourly runs with bulk fetch):
 import contextlib
 import logging
 import os
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -70,28 +66,6 @@ def _is_lifecycle_interruption(exc: BaseException) -> bool:
     return isinstance(exc, (KeyboardInterrupt, modal.exception.InputCancellation))
 
 
-def _heartbeat() -> None:
-    """Best-effort Better Stack success heartbeat ping; monitoring must never break a run.
-
-    The URL comes from the betterstack-asos-parquet secret
-    (BETTERSTACK_HEARTBEAT_URL); when unset (local dev) this is a no-op.
-
-    We deliberately ping only on success and never post to /fail. The job runs
-    twice hourly (:20 and :50) for redundancy, and transient upstream errors
-    (Iowa Mesonet, source.coop S3) routinely self-heal on the next run — a /fail
-    ping would page the on-call for a blip that's already fixed by the time they
-    look. Instead we rely on Better Stack's missing-ping detection: with a 30m
-    period + 30m grace it alerts only after ~2 consecutive failed runs (a real
-    sustained outage), while every exception is still captured in Sentry via
-    logger.exception for debugging.
-    """
-    url = os.environ.get("BETTERSTACK_HEARTBEAT_URL")
-    if not url:
-        return
-    with contextlib.suppress(Exception):
-        urllib.request.urlopen(url, timeout=10)
-
-
 _CRON_MONITOR_SLUG = "asos-parquet-update"
 _CRON_SCHEDULE = "20,50 * * * *"  # keep in sync with update_asos_data's schedule=
 
@@ -125,7 +99,6 @@ def _cron_checkin(status: str, check_in_id: str | None = None) -> str | None:
     secrets=[
         modal.Secret.from_name("source-coop-asos-s3"),
         modal.Secret.from_name("sentry-asos-parquet"),
-        modal.Secret.from_name("betterstack-asos-parquet"),
     ],
     timeout=1800,  # 30 minutes: global station fetch plus reading/merging/rewriting
     # the current year's partition, which grows throughout the year (~32M rows
@@ -150,7 +123,6 @@ def update_asos_data(lookback_hours: int = 2):
     check_in_id = _cron_checkin("in_progress")
     try:
         result = _update_asos_data_impl(lookback_hours)
-        _heartbeat()
         _cron_checkin("ok", check_in_id)
         return result
     except BaseException as exc:
