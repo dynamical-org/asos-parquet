@@ -15,9 +15,6 @@ dependencies = [
     "duckdb>=1.4.3",
     "rich>=13.0.0",
     "sentry-sdk>=2.63.0",
-    "eccodes>=2.47.0",
-    "paho-mqtt>=2.1.0",
-    "eccodeslib>=2.48.0.26",
 ]
 
 [project.optional-dependencies]
