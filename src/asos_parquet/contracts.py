@@ -87,10 +87,10 @@ class NormalizedObservation:
         _require(bool(self.unit), "Unit must not be empty")
         _assert_utc(self.observed_at)
         _assert_utc(self.available_at)
-        if self.observed_at > self.available_at and self.quality is not ObservationQuality.SUSPECT:
+        if self.observed_at > self.available_at and self.quality is ObservationQuality.ACCEPTED:
             raise ValueError(
                 f"Observation {self.station_id} {self.variable} at {self.observed_at!r} "
-                f"is after availability {self.available_at!r} without suspect quality"
+                f"is after availability {self.available_at!r} with accepted quality"
             )
         _require(
             self.available_at <= self.raw.ingested_at,

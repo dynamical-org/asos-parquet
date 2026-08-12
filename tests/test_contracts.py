@@ -147,3 +147,32 @@ def test_observation_cannot_be_available_before_it_was_observed() -> None:
             is_trace=False,
             raw=raw,
         )
+
+
+def test_future_dated_observation_can_be_rejected() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="s3://obs-raw/iem/future.csv",
+        sha256="f" * 64,
+        ingested_at=datetime(2026, 8, 1, 1, 4, tzinfo=UTC),
+    )
+    observation = NormalizedObservation(
+        station_id="iem:KJFK",
+        source_station_id="KJFK",
+        source_record_id="future",
+        revision_id="rejected",
+        supersedes_revision_id=None,
+        variable=Variable.AIR_TEMPERATURE,
+        value=24.0,
+        unit="degree_Celsius",
+        observed_at=datetime(2026, 8, 1, 1, 5, tzinfo=UTC),
+        available_at=datetime(2026, 8, 1, 1, 4, tzinfo=UTC),
+        period=None,
+        statistic=ObservationStatistic.INSTANTANEOUS,
+        quality=ObservationQuality.REJECTED,
+        source_quality=None,
+        is_trace=False,
+        raw=raw,
+    )
+
+    assert observation.quality is ObservationQuality.REJECTED

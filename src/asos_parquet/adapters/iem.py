@@ -53,7 +53,10 @@ def parse_observations(
     if "wxcodes" in df.columns:
         df["wxcodes"] = df["wxcodes"].astype("string")
     if preserve_trace and "p01m" in df.columns:
-        df["_p01m_trace"] = df["p01m"].astype("string").str.upper().eq("T")
+        precipitation = df["p01m"].astype("string").str.strip()
+        df["_p01m_trace"] = precipitation.str.upper().eq("T") | pd.to_numeric(
+            precipitation, errors="coerce"
+        ).eq(0.0001)
 
     df["valid"] = pd.to_datetime(
         df["valid"],
@@ -105,7 +108,7 @@ VARIABLE_MAPPINGS = {
         Variable.PRECIPITATION_AMOUNT,
         "mm",
         ObservationStatistic.SUM,
-        timedelta(hours=1),
+        None,
     ),
     "wxcodes": _VariableMapping(
         Variable.PRESENT_WEATHER,
@@ -125,7 +128,7 @@ VARIABLE_MAPPINGS = {
     "gust": _VariableMapping(
         Variable.WIND_GUST,
         "knot",
-        ObservationStatistic.INSTANTANEOUS,
+        ObservationStatistic.MAXIMUM,
     ),
 }
 
@@ -144,7 +147,9 @@ def normalize_observations(
         raise ValueError("IEM observations are missing the station column")
 
     observations: list[NormalizedObservation] = []
-    for _, row in source.iterrows():
+    revisions: dict[str, str] = {}
+    emitted_revision_ids: set[str] = set()
+    for row in source.to_dict("records"):
         station = str(row["station"])
         observed_at = pd.Timestamp(row["valid"]).to_pydatetime()
         for field, mapping in VARIABLE_MAPPINGS.items():
@@ -180,13 +185,18 @@ def normalize_observations(
                 separators=(",", ":"),
             )
             revision_id = sha256(revision_payload.encode()).hexdigest()
+            if revision_id in emitted_revision_ids:
+                continue
+            supersedes_revision_id = revisions.get(source_record_id)
+            revisions[source_record_id] = revision_id
+            emitted_revision_ids.add(revision_id)
             observations.append(
                 NormalizedObservation(
                     station_id=f"iem:{station}",
                     source_station_id=station,
                     source_record_id=source_record_id,
                     revision_id=revision_id,
-                    supersedes_revision_id=None,
+                    supersedes_revision_id=supersedes_revision_id,
                     variable=mapping.variable,
                     value=value,
                     unit=mapping.unit,

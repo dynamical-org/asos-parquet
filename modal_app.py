@@ -16,7 +16,7 @@ Setup:
        modal secret create source-coop-asos-s3 \\
          ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx \\
          ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
-         ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
+         ASOS_S3_BUCKET=your-bucket OBS_S3_PREFIX=obs-parquet/v1
        modal secret create sentry-asos-parquet SENTRY_DSN=xxx
        (log streaming + error tracking + cron monitoring via Sentry; see obs.py.)
     3. Deploy: modal deploy modal_app.py
@@ -197,15 +197,20 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
     # Step 1: Download existing data from S3 (if exists)
     existing_gdf = None
+    existing_etag: str | None = None
     logger.info("Downloading existing data from S3...")
     try:
         s3.download_file(s3_bucket, s3_key, str(data_file))
+        existing_etag = s3.head_object(Bucket=s3_bucket, Key=s3_key)["ETag"].strip('"')
         existing_gdf = gpd.read_parquet(data_file)
         logger.info(f"Downloaded existing partition ({len(existing_gdf):,} records)")
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
         if error_code in ("404", "NoSuchKey"):
-            logger.info(f"No existing data for year={current_year} (starting fresh)")
+            raise ValueError(
+                f"Missing seeded obs-parquet partition {s3_key}; "
+                f"run backfill_year({current_year}) before deploying the hourly updater"
+            )
         else:
             raise
 
@@ -245,7 +250,10 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
     # Step 6: Upload to S3
     logger.info("Uploading to S3...")
-    s3.upload_file(str(output_path), s3_bucket, s3_key)
+    if existing_etag is None:
+        raise ValueError(f"Missing ETag for existing partition {s3_key}")
+    with output_path.open("rb") as body:
+        s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=existing_etag)
     file_size = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Uploaded year={current_year} ({file_size:.1f} MB)")
 
@@ -343,7 +351,8 @@ def _backfill_year_impl(year: int):
     s3 = boto3.client("s3", **s3_kwargs)
 
     s3_key = f"{s3_prefix}/year={year}/data.parquet"
-    s3.upload_file(str(result.output_path), s3_bucket, s3_key)
+    with result.output_path.open("rb") as body:
+        s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfNoneMatch="*")
     file_size = result.output_path.stat().st_size / 1024 / 1024
     logger.info(f"Uploaded year={year} ({file_size:.1f} MB)")
 
@@ -370,7 +379,7 @@ def backfill(year: int):
     """Backfill a single year.
 
     Usage:
-        modal run modal_app.py::backfill --year 2022
+        modal run modal_app.py::backfill --year 2026
     """
     result = backfill_year.remote(year=year)
     print(f"Result: {result}")

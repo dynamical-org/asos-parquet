@@ -168,6 +168,7 @@ def test_normalize_observations_emits_values_with_provenance() -> None:
     assert precipitation.value == 1.016
     assert precipitation.unit == "mm"
     assert precipitation.statistic is ObservationStatistic.SUM
+    assert precipitation.period is None
 
 
 def test_normalize_observations_preserves_trace_before_numeric_conversion() -> None:
@@ -191,3 +192,51 @@ def test_normalize_observations_preserves_trace_before_numeric_conversion() -> N
     )
     assert trace.value == 0.0
     assert trace.is_trace is True
+
+
+def test_iem_numeric_trace_sentinel_is_preserved() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="https://mesonet.agron.iastate.edu/trace-sentinel",
+        sha256="9" * 64,
+        ingested_at=datetime(2026, 8, 1, 3, tzinfo=UTC),
+    )
+    observations = normalize_observations(
+        "station,valid,tmpf,p01m\nKJFK,2026-08-01 02:00,32,0.0001\n",
+        "%Y-%m-%d %H:%M",
+        raw,
+    )
+
+    precipitation = next(
+        observation
+        for observation in observations
+        if observation.variable is Variable.PRECIPITATION_AMOUNT
+    )
+    assert precipitation.value == 0.0
+    assert precipitation.is_trace is True
+    assert precipitation.source_quality == "T"
+
+
+def test_iem_duplicate_revisions_are_deduplicated_and_corrections_are_linked() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="https://mesonet.agron.iastate.edu/corrections",
+        sha256="8" * 64,
+        ingested_at=datetime(2026, 8, 1, 3, tzinfo=UTC),
+    )
+    observations = normalize_observations(
+        "station,valid,tmpf,tmpc\n"
+        "KJFK,2026-08-01 02:00,70,21.0\n"
+        "KJFK,2026-08-01 02:00,70,21.0\n"
+        "KJFK,2026-08-01 02:00,71,21.7\n",
+        "%Y-%m-%d %H:%M",
+        raw,
+    )
+    temperatures = [
+        observation
+        for observation in observations
+        if observation.variable is Variable.AIR_TEMPERATURE
+    ]
+
+    assert len(temperatures) == 2
+    assert temperatures[1].supersedes_revision_id == temperatures[0].revision_id
