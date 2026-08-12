@@ -1,4 +1,4 @@
-.PHONY: install test lint format typecheck load upload validate validate-prod clean deploy dev examples
+.PHONY: install test lint format typecheck rebuild-iem load upload validate validate-prod clean deploy dev examples
 
 # Setup
 install:
@@ -25,6 +25,12 @@ RESUME ?=
 UPDATE ?=
 NETWORKS ?=
 COUNTRIES ?=
+IEM_MANIFEST ?=
+IEM_OUTPUT ?= data/obs-parquet/v1/canonical/iem
+
+rebuild-iem:
+	@test -n "$(IEM_MANIFEST)" || (echo "IEM_MANIFEST is required" && exit 1)
+	uv run python scripts/rebuild_iem_2026.py --manifest "$(IEM_MANIFEST)" --output "$(IEM_OUTPUT)"
 
 # Load historical data year by year
 # Progress is tracked in data/progress.json
