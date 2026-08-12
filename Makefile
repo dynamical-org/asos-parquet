@@ -1,4 +1,4 @@
-.PHONY: install test lint format typecheck rebuild-iem rebuild-eccc load upload validate validate-prod clean deploy dev examples
+.PHONY: install test lint format typecheck capture-eccc rebuild-iem rebuild-eccc load upload validate validate-prod clean deploy dev examples
 
 # Setup
 install:
@@ -29,6 +29,13 @@ IEM_MANIFEST ?=
 IEM_OUTPUT ?= data/obs-parquet/v1/canonical/iem
 ECCC_MANIFEST ?=
 ECCC_OUTPUT ?= data/obs-parquet/v1/canonical/eccc-climate-hourly
+ECCC_THROUGH ?=
+ECCC_CAPTURE_MANIFEST ?= data/obs-parquet/v1/staging/eccc-climate-hourly/manifest.json
+
+capture-eccc:
+	@test -n "$(ECCC_THROUGH)" || (echo "ECCC_THROUGH is required" && exit 1)
+	uv run python scripts/capture_eccc_2026.py --manifest "$(ECCC_CAPTURE_MANIFEST)" --through "$(ECCC_THROUGH)"
+
 
 rebuild-iem:
 	@test -n "$(IEM_MANIFEST)" || (echo "IEM_MANIFEST is required" && exit 1)
