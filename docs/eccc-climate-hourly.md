@@ -31,10 +31,10 @@ Build fresh canonical artifacts next to prior datasets:
 make rebuild-eccc ECCC_MANIFEST=/path/to/manifest.json ECCC_OUTPUT=/path/to/eccc-climate-hourly
 ```
 
-The rebuild archives content-addressed raw pages, emits normalized observations and
-per-variable capabilities, and writes explicit watermark and unavailable-interval metadata.
-It rejects partial cumulative manifests and completeness regression. Missing precipitation is
-stored as unavailable, never as zero.
+The rebuild reads path-backed pages one at a time, archives content-addressed raw pages, streams normalized observations to Parquet, and
+per-variable capabilities through DuckDB, and writes explicit watermark and unavailable-interval metadata.
+It rejects partial cumulative manifests and completeness regression. Missing precipitation is omitted from normalized observations and represented as an `ABSENT`
+capability, never as zero.
 
 The reconciliation boundary accepts canonical records from `eccc-climate-hourly` and the
 future `eccc-swob` adapter. It retains both candidates, prefers observed over unavailable or

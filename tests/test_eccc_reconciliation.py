@@ -69,3 +69,17 @@ def test_rejected_historical_value_does_not_beat_swob() -> None:
     result = reconcile_eccc([climate, swob], datetime(2026, 1, 3, tzinfo=UTC))
 
     assert result.canonical is swob
+
+
+def test_superseded_revision_cannot_win() -> None:
+    stale = _observation("eccc-climate-hourly", 0.8, 12)
+    corrected = replace(
+        stale,
+        value=0.9,
+        revision_id="corrected",
+        supersedes_revision_id=stale.revision_id,
+    )
+
+    result = reconcile_eccc([corrected, stale], datetime(2026, 1, 3, tzinfo=UTC))
+
+    assert result.canonical is corrected

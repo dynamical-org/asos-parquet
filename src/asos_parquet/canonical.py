@@ -282,9 +282,9 @@ def select_canonical(
         min(
             candidates,
             key=lambda observation: (
-                source_precedence[observation.raw.source],
-                observation.quality is not ObservationQuality.ACCEPTED,
                 observation.value_state is not ValueState.OBSERVED,
+                observation.quality is not ObservationQuality.ACCEPTED,
+                source_precedence[observation.raw.source],
                 -observation.available_at.timestamp(),
                 observation.revision_id,
             ),

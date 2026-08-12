@@ -345,3 +345,20 @@ def test_write_normalized_sorts_for_predicate_pushdown(tmp_path: Path) -> None:
 def test_revision_cannot_supersede_itself() -> None:
     with pytest.raises(ValueError, match="cannot supersede itself"):
         replace(observation("iem", "a", 1, 10.0), supersedes_revision_id="a")
+
+
+def test_observed_value_beats_higher_precedence_unavailable_value() -> None:
+    unavailable = replace(
+        observation("eccc-climate-hourly", "a", 1, 10.0),
+        value=None,
+        value_state=ValueState.UNAVAILABLE,
+    )
+    observed = observation("eccc-swob", "b", 1, 0.6)
+
+    selected = select_canonical(
+        [unavailable, observed],
+        as_of=datetime(2026, 1, 1, 2, tzinfo=UTC),
+        source_precedence={"eccc-climate-hourly": 0, "eccc-swob": 1},
+    )
+
+    assert selected == [observed]

@@ -27,7 +27,7 @@ def load_payload_manifest(
                         else datetime.fromisoformat(item["source_published_at"])
                     ),
                 ),
-                data=payload_path.read_bytes(),
+                data=payload_path,
             )
         )
     intervals = [
