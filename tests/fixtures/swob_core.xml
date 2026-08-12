@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<om:ObservationCollection xmlns:om="http://www.opengis.net/om/1.0" xmlns="http://dms.ec.gc.ca/schema/point-observation/2.0" xmlns:gml="http://www.opengis.net/gml">
+  <om:member><om:Observation><om:metadata><set><general><dataset name="msc/observation/atmospheric/surface_weather/ca-1.2-ascii"/></general><identification-elements>
+    <element name="date_tm" uom="datetime" value="2026-08-12T18:00:00.000Z"/><element name="tc_id" uom="unitless" value="ADN"/><element name="data_pvdr" uom="unitless" value="MSC"/>
+  </identification-elements></set></om:metadata><om:samplingTime><gml:TimeInstant><gml:timePosition>2026-08-12T18:00:00.000Z</gml:timePosition></gml:TimeInstant></om:samplingTime><om:resultTime><gml:TimeInstant><gml:timePosition>2026-08-12T18:02:00.000Z</gml:timePosition></gml:TimeInstant></om:resultTime><om:result><elements>
+    <element name="air_temp" uom="°C" value="25.1"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="dwpt_temp" uom="°C" value="14.1"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="rel_hum" uom="%" value="50"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="rnfl_amt_pst1hr" uom="mm" value="0.8"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="prsnt_wx_1" uom="code" value="RA"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="avg_wnd_spd_10m_pst10mts" uom="km/h" value="6.2"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="avg_wnd_dir_10m_pst10mts" uom="°" value="239"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+    <element name="max_wnd_spd_10m_pst10mts" uom="km/h" value="10.1"><qualifier name="qa_summary" uom="unitless" value="100"/></element>
+  </elements></om:result></om:Observation></om:member>
+</om:ObservationCollection>

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<om:ObservationCollection xmlns:om="http://www.opengis.net/om/1.0" xmlns="http://dms.ec.gc.ca/schema/point-observation/2.0" xmlns:gml="http://www.opengis.net/gml">
+  <om:member><om:Observation><om:metadata><set><identification-elements><element name="date_tm" uom="datetime" value="2026-08-12T19:00:00.000Z"/><element name="tc_id" uom="unitless" value="YYZ"/><element name="data_pvdr" uom="unitless" value="MSC"/></identification-elements></set></om:metadata><om:resultTime><gml:TimeInstant><gml:timePosition>2026-08-12T19:04:00.000Z</gml:timePosition></gml:TimeInstant></om:resultTime><om:result><elements><element name="air_temp" uom="°C" value="20.0"><qualifier name="qa_summary" uom="unitless" value="100"/></element><element name="pcpn_amt_pst1hr" uom="mm" value="MSNG"><qualifier name="qa_summary" uom="unitless" value="-1"/></element></elements></om:result></om:Observation></om:member>
+</om:ObservationCollection>
