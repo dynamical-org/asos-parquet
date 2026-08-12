@@ -3,7 +3,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from asos_parquet.fetch import fetch_bulk_chunk, fetch_station_observations
+from asos_parquet.fetch import (
+    build_bulk_observation_url,
+    build_observation_url,
+    fetch_bulk_chunk,
+    fetch_station_observations,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -80,3 +85,28 @@ def test_international_false_zero_evidence_is_preserved(
     assert df is not None
     assert df["p01m"].eq(0).all()
     assert set(df["wxcodes"]) == {"RA", "+RA", "VCSH"}
+
+
+def test_observation_urls_request_present_weather() -> None:
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-02", tz="UTC")
+
+    single = build_observation_url("KJFK", start, end)
+    bulk = build_bulk_observation_url(["KJFK", "KSFO"], start, end)
+
+    assert "data=wxcodes" in single
+    assert "data=wxcodes" in bulk
+    assert single.count("data=wxcodes") == 1
+    assert bulk.count("data=wxcodes") == 1
+
+
+def test_fetch_keeps_present_weather_as_text(iem_response: None) -> None:
+    df = fetch_station_observations(
+        "KJFK",
+        pd.Timestamp("2026-08-01 00:00", tz="UTC"),
+        pd.Timestamp("2026-08-01 03:00", tz="UTC"),
+    )
+
+    assert df is not None
+    assert df["wxcodes"].dtype == object
+    assert set(df["wxcodes"].dropna()) == {"RA", "-RA"}

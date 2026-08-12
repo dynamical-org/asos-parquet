@@ -4,9 +4,8 @@ These tests require network access and perform real data fetching.
 Run with: pytest tests/test_integration.py -v
 """
 
-import pytest
-
 import pandas as pd
+import pytest
 
 from asos_parquet.fetch import fetch_observations_batch, fetch_station_observations
 from asos_parquet.load import observations_to_geoparquet
@@ -61,6 +60,7 @@ class TestObservationFetching:
         assert "valid" in df.columns
         assert "tmpf" in df.columns
         assert "tmpc" in df.columns
+        assert "wxcodes" in df.columns
 
     def test_fetch_batch(self):
         """Fetch observations for multiple stations."""
@@ -93,6 +93,9 @@ class TestGeoparquetCreation:
         # Write to file
         path = tmp_path / "test.parquet"
         gdf.to_parquet(path, compression="zstd", index=False)
+
+        stored = pd.read_parquet(path)
+        assert "wxcodes" in stored.columns
 
         # Validate
         report = validate_geoparquet(path)

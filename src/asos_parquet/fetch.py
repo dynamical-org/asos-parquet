@@ -16,19 +16,17 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from io import StringIO
 from threading import Lock
 
 import pandas as pd
 import requests
 from rich.console import Console
 from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
-
+from .adapters.iem import parse_observations
 from .config import (
     DATA_FIELDS,
     MAX_BACKOFF,
@@ -38,6 +36,8 @@ from .config import (
     REQUEST_TIMEOUT,
     RETRY_BACKOFF,
 )
+
+logger = logging.getLogger(__name__)
 
 # Bulk fetching configuration
 MAX_URL_LENGTH = 7500  # Conservative limit below 8KB server limit
@@ -295,45 +295,8 @@ def fetch_bulk_chunk(
             if "No results found" in text or len(text) < 50:
                 return (chunk_id, None, None)
 
-            df = pd.read_csv(StringIO(response.text), low_memory=False)
-
-            if df.empty or "valid" not in df.columns:
-                return (chunk_id, None, None)
-
-            # Parse timestamp - use mixed format for robustness
-            df["valid"] = pd.to_datetime(df["valid"], format="mixed", utc=True)
-
-            # Rename lat/lon columns for consistency
-            if "lon" in df.columns:
-                df = df.rename(columns={"lon": "longitude", "lat": "latitude"})
-
-            # Convert numeric columns
-            numeric_cols = [
-                "tmpf",
-                "tmpc",
-                "dwpf",
-                "dwpc",
-                "relh",
-                "drct",
-                "sknt",
-                "gust",
-                "alti",
-                "mslp",
-                "vsby",
-                "p01i",
-                "p01m",
-                "longitude",
-                "latitude",
-            ]
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            # Filter to full METAR observations only
-            if "tmpf" in df.columns:
-                df = df[df["tmpf"].notna()]
-
-            if df.empty:
+            df = parse_observations(response.text, timestamp_format="mixed")
+            if df is None:
                 return (chunk_id, None, None)
 
             return (chunk_id, df, None)
@@ -412,50 +375,12 @@ def fetch_station_observations(
             if "No results found" in response.text or len(response.text.strip()) < 50:
                 return None
 
-            df = pd.read_csv(StringIO(response.text), low_memory=False)
-
-            if df.empty or "valid" not in df.columns:
-                return None
-
-            # Parse timestamp (IEM format: "YYYY-MM-DD HH:MM")
-            df["valid"] = pd.to_datetime(df["valid"], format="%Y-%m-%d %H:%M", utc=True)
-
-            # Add state if provided
-            if state is not None:
-                df["state"] = state
-
-            # Rename lat/lon columns for consistency
-            if "lon" in df.columns:
-                df = df.rename(columns={"lon": "longitude", "lat": "latitude"})
-
-            # Convert numeric columns
-            numeric_cols = [
-                "tmpf",
-                "tmpc",
-                "dwpf",
-                "dwpc",
-                "relh",
-                "drct",
-                "sknt",
-                "gust",
-                "alti",
-                "mslp",
-                "vsby",
-                "p01i",
-                "p01m",
-                "longitude",
-                "latitude",
-            ]
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            # Filter to full METAR observations only (drop partial/automated updates)
-            # Full METARs have temperature data; partial updates only have wind/pressure
-            if "tmpf" in df.columns:
-                df = df[df["tmpf"].notna()]
-
-            if df.empty:
+            df = parse_observations(
+                response.text,
+                timestamp_format="%Y-%m-%d %H:%M",
+                state=state,
+            )
+            if df is None:
                 return None
 
             return df

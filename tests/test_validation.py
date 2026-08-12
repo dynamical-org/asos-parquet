@@ -18,8 +18,8 @@ from asos_parquet.validation import (
     validate_record_count,
     validate_region_codes,
     validate_schema,
-    validate_station_count,
     validate_states,
+    validate_station_count,
     validate_timestamps,
     validate_us_locations,
 )
@@ -50,6 +50,7 @@ def valid_gdf() -> gpd.GeoDataFrame:
         "vsby": np.random.uniform(5, 10, n),
         "p01i": np.random.uniform(0, 0.5, n),
         "p01m": None,
+        "wxcodes": [None] * n,
     }
 
     # Calculate metric values from imperial
@@ -317,6 +318,7 @@ class TestValidateGeoparquet:
             "vsby": np.random.uniform(5, 10, n),
             "p01i": np.random.uniform(0, 0.5, n),
             "p01m": None,
+            "wxcodes": [None] * n,
         }
         data["tmpc"] = (np.array(data["tmpf"]) - 32) * 5 / 9
         data["dwpc"] = (np.array(data["dwpf"]) - 32) * 5 / 9

@@ -29,6 +29,7 @@ DATA_FIELDS = [
     "vsby",  # Visibility (miles)
     "p01i",  # 1-hour Precipitation (inches)
     "p01m",  # 1-hour Precipitation (mm)
+    "wxcodes",  # Present weather codes
 ]
 
 # US states with ASOS networks
