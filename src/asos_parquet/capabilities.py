@@ -48,6 +48,7 @@ def derive_daily_capabilities(
     expected: dict[tuple[str, str, date], set[datetime]] = defaultdict(set)
     observed: dict[tuple[str, str, date, Variable], set[str]] = defaultdict(set)
     accepted: dict[tuple[str, str, date, Variable], set[str]] = defaultdict(set)
+    precipitation_contradictions: dict[tuple[str, str, date], set[str]] = defaultdict(set)
     station_days: dict[tuple[str, str], set[date]] = defaultdict(set)
     for item in records:
         source = item.raw.source
@@ -60,6 +61,14 @@ def derive_daily_capabilities(
             observed[key].add(item.source_record_id)
             if item.quality is ObservationQuality.ACCEPTED:
                 accepted[key].add(item.source_record_id)
+            if (
+                item.variable is Variable.PRECIPITATION_AMOUNT
+                and item.source_quality is not None
+                and "present_weather_contradicts_zero" in item.source_quality
+            ):
+                precipitation_contradictions[(source, item.source_station_id, day)].add(
+                    item.source_record_id
+                )
 
     daily: list[StationVariableCapability] = []
     for (source, station_id), days in sorted(station_days.items()):
@@ -77,6 +86,12 @@ def derive_daily_capabilities(
                         accepted_count,
                         accepted_ratio_threshold,
                     )
+                    if (
+                        variable is Variable.PRECIPITATION_AMOUNT
+                        and precipitation_contradictions[(source, station_id, day)]
+                    ):
+                        state = CapabilityState.DEGRADED
+                        reason = "present_weather_contradicts_zero"
                     daily.append(
                         StationVariableCapability(
                             source=source,

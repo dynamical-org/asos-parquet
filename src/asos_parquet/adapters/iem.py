@@ -108,7 +108,7 @@ VARIABLE_MAPPINGS = {
         Variable.PRECIPITATION_AMOUNT,
         "mm",
         ObservationStatistic.SUM,
-        None,
+        timedelta(hours=1),
     ),
     "wxcodes": _VariableMapping(
         Variable.PRESENT_WEATHER,

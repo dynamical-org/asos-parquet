@@ -6,6 +6,7 @@ from json import dumps, loads
 from pathlib import Path
 
 from .adapters.iem import VARIABLE_MAPPINGS, normalize_observations
+from .adapters.iem_precip import classify_precipitation_quality
 from .canonical import read_raw_manifests, write_normalized, write_raw_manifests
 from .capabilities import derive_daily_capabilities, write_capabilities
 from .config import OBS_DATASET_START_YEAR
@@ -130,6 +131,7 @@ def rebuild_iem_2026(
             emitted_occurrences.add(occurrence_id)
             latest_revision[linked.source_record_id] = linked.revision_id
 
+    observations = classify_precipitation_quality(observations)
     variables = tuple(dict.fromkeys(mapping.variable for mapping in VARIABLE_MAPPINGS.values()))
     capabilities = derive_daily_capabilities(observations, variables)
     normalized_path = output_dir / "normalized.parquet"
