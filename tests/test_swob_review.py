@@ -65,7 +65,7 @@ def test_normalizes_every_collection_member() -> None:
 
     assert {item.source_station_id for item in observations} == {
         "MSC:tc_id:ADN",
-        "ON-MNR-AFFES:msc_id:ON-MNRF-AFFES_GAL",
+        "msc_id:ON-MNRF-AFFES_GAL",
     }
 
 
@@ -104,12 +104,45 @@ def test_missing_provider_uses_capture_network_hint() -> None:
             b'<element name="data_pvdr" uom="unitless" value="MSC"/>',
             b"",
         )
+        .replace(
+            b'<element name="date_tm"',
+            b'<element name="msc_id" uom="unitless" value="8101201"/><element name="date_tm"',
+        )
     )
 
     observations = normalize_swob(data, _raw(data), provider_hint="MSC-CORE")
 
     assert observations
-    assert observations[0].source_station_id.startswith("MSC-CORE:")
+    assert observations[0].source_station_id == "msc_id:8101201"
+
+
+def test_empty_provider_is_rejected_and_not_replaced_by_hint() -> None:
+    data = (
+        (FIXTURES / "swob_core.xml")
+        .read_bytes()
+        .replace(b'value="MSC"', b'value=""')
+        .replace(b'<element name="msc_id" uom="unitless" value="8101201"/>', b"")
+    )
+
+    with pytest.raises(ValueError, match="no data provider"):
+        normalize_swob(data, _raw(data), provider_hint="core")
+
+
+def test_msc_id_identity_is_stable_across_provider_corrections() -> None:
+    data = (
+        (FIXTURES / "swob_core.xml")
+        .read_bytes()
+        .replace(
+            b'<element name="date_tm"',
+            b'<element name="msc_id" uom="unitless" value="8101201"/><element name="date_tm"',
+        )
+    )
+    missing = data.replace(b'<element name="data_pvdr" uom="unitless" value="MSC"/>', b"")
+
+    original = normalize_swob(data, _raw(data))[0]
+    correction = normalize_swob(missing, _raw(missing), provider_hint="swob-realtime")[0]
+
+    assert original.source_station_id == correction.source_station_id == "msc_id:8101201"
 
 
 def test_accepts_xml_media_types_and_rejects_unknown_types(tmp_path: Path) -> None:

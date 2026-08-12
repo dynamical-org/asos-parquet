@@ -58,7 +58,7 @@ def test_rebuild_archives_raw_replays_and_emits_capabilities(tmp_path: Path) -> 
     partner_dewpoint = next(
         item
         for item in capabilities
-        if item.source_station_id == "ON-MNR-AFFES:msc_id:ON-MNRF-AFFES_GAL"
+        if item.source_station_id == "msc_id:ON-MNRF-AFFES_GAL"
         and item.variable is Variable.DEW_POINT
     )
     assert partner_dewpoint.state is CapabilityState.ABSENT

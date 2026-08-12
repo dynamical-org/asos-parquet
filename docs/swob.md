@@ -1,8 +1,9 @@
 # MSC SWOB realtime observations
 
 The adapter consumes canonical XML files from ECCC's Datamart and uses GeoMet's
-`swob-realtime` collection only for discovery. A cumulative JSON manifest drives
-deterministic 2026 replay:
+`swob-realtime` collection only for discovery. Daily JSON manifests and a shared cursor drive deterministic 2026 replay.
+The scheduled collector writes `manifests/YYYY-MM-DD.json`, the matching
+`.index.json`, and `state.json` only after a complete bounded capture:
 
 ```json
 [
@@ -21,10 +22,10 @@ deterministic 2026 replay:
 Run:
 
 ```bash
-uv run python scripts/rebuild_swob_2026.py --manifest manifest.json --output data/obs-parquet/v1/canonical/msc-swob
+uv run python scripts/rebuild_swob_2026.py --manifest manifests/2026-08-11.json --manifest manifests/2026-08-12.json --output data/obs-parquet/v1/canonical/msc-swob
 ```
 
-Station-list CSV revisions belong in the same manifest with `media_type` set to
+Corrections discovered by overlap may appear in a later daily manifest, so replay must pass every manifest in the desired period. Station-list CSV revisions belong in the same manifest with `media_type` set to
 `text/csv`; they are archived but not treated as observations. Raw objects are stored
 by SHA-256 before normalization.
 
@@ -55,7 +56,7 @@ implemented.
   exposed `qa_summary` qualifiers.
 - The current partner sample exposed `rnfl_amt_pst1hr`; the official product guide and
   GeoMet schema also expose `pcpn_amt_pst1hr`.
-- Core and partner station-list CSVs were reachable from the official Datamart.
+- Core, partner, and marine station-list CSVs were reachable from the official Datamart.
 - A malformed DFO record dated 2101 appeared first under descending date sort. Replay
   therefore enforces the 2026 target rather than trusting discovery ordering.
 - The committed fixtures are minimized from observed schemas; they are not assertions

@@ -70,7 +70,13 @@ _CRON_MONITOR_SLUG = "asos-parquet-update"
 _CRON_SCHEDULE = "20,50 * * * *"  # keep in sync with update_asos_data's schedule=
 
 
-def _cron_checkin(status: str, check_in_id: str | None = None) -> str | None:
+def _cron_checkin(
+    status: str,
+    check_in_id: str | None = None,
+    *,
+    monitor_slug: str = _CRON_MONITOR_SLUG,
+    schedule: str = _CRON_SCHEDULE,
+) -> str | None:
     """Best-effort Sentry cron check-in; monitoring must never break a run.
 
     Alerts on a missed or overrunning run, not just a raised exception. A
@@ -80,11 +86,11 @@ def _cron_checkin(status: str, check_in_id: str | None = None) -> str | None:
 
     with contextlib.suppress(Exception):
         return sentry_sdk.crons.capture_checkin(
-            monitor_slug=_CRON_MONITOR_SLUG,
+            monitor_slug=monitor_slug,
             check_in_id=check_in_id,
             status=status,
             monitor_config={
-                "schedule": {"type": "crontab", "value": _CRON_SCHEDULE},
+                "schedule": {"type": "crontab", "value": schedule},
                 "timezone": "UTC",
                 "checkin_margin": 10,
                 "failure_issue_threshold": 1,
@@ -413,25 +419,6 @@ def _swob_cursor(state_path: Path) -> datetime | None:
     return parsed
 
 
-def _swob_cron_checkin(status: str, check_in_id: str | None = None) -> str | None:
-    import sentry_sdk.crons
-
-    with contextlib.suppress(Exception):
-        return sentry_sdk.crons.capture_checkin(
-            monitor_slug=_SWOB_CRON_MONITOR_SLUG,
-            check_in_id=check_in_id,
-            status=status,
-            monitor_config={
-                "schedule": {"type": "crontab", "value": _SWOB_CRON_SCHEDULE},
-                "timezone": "UTC",
-                "checkin_margin": 10,
-                "failure_issue_threshold": 1,
-                "recovery_threshold": 1,
-            },
-        )
-    return None
-
-
 @app.function(
     image=image,
     secrets=[modal.Secret.from_name("sentry-asos-parquet")],
@@ -446,17 +433,31 @@ def update_swob_data() -> dict[str, object]:
 
     obs.setup_logging()
     obs.init_sentry()
-    check_in_id = _swob_cron_checkin("in_progress")
+    check_in_id = _cron_checkin(
+        "in_progress",
+        monitor_slug=_SWOB_CRON_MONITOR_SLUG,
+        schedule=_SWOB_CRON_SCHEDULE,
+    )
     try:
         result = _update_swob_data_impl()
-        _swob_cron_checkin("ok", check_in_id)
+        _cron_checkin(
+            "ok",
+            check_in_id,
+            monitor_slug=_SWOB_CRON_MONITOR_SLUG,
+            schedule=_SWOB_CRON_SCHEDULE,
+        )
         return result
     except BaseException as exc:
         if _is_lifecycle_interruption(exc):
             logger.info("update_swob_data interrupted by Modal lifecycle: %s", type(exc).__name__)
             raise
         logger.exception("update_swob_data failed")
-        _swob_cron_checkin("error", check_in_id)
+        _cron_checkin(
+            "error",
+            check_in_id,
+            monitor_slug=_SWOB_CRON_MONITOR_SLUG,
+            schedule=_SWOB_CRON_SCHEDULE,
+        )
         raise
     finally:
         obs.flush()
@@ -473,21 +474,29 @@ def _update_swob_data_impl(now: datetime | None = None) -> dict[str, object]:
         raise ValueError("SWOB cursor is beyond the verified 30-day source retention")
     if start >= end:
         return {"status": "caught_up", "source_complete_through": end.isoformat()}
-    manifest_date = (end - timedelta(microseconds=1)).date().isoformat()
-    manifest_path = _SWOB_VOLUME_PATH / "manifests" / f"{manifest_date}.json"
-    index_manifest_path = manifest_path.with_suffix(".index.json")
-    result = capture_swob_window(
-        start,
-        end,
-        manifest_path,
-        overlap=timedelta(hours=6),
-        state_path=state_path,
-        index_manifest_path=index_manifest_path,
-    )
-    swob_archive.commit()
+    payload_count = 0
+    index_page_count = 0
+    complete_through = start
+    while complete_through < end:
+        chunk_end = min(complete_through + timedelta(hours=6), end)
+        manifest_date = (chunk_end - timedelta(microseconds=1)).date().isoformat()
+        manifest_path = _SWOB_VOLUME_PATH / "manifests" / f"{manifest_date}.json"
+        index_manifest_path = manifest_path.with_suffix(".index.json")
+        result = capture_swob_window(
+            complete_through,
+            chunk_end,
+            manifest_path,
+            overlap=timedelta(hours=6),
+            state_path=state_path,
+            index_manifest_path=index_manifest_path,
+        )
+        swob_archive.commit()
+        payload_count += result.payload_count
+        index_page_count += result.index_page_count
+        complete_through = result.source_complete_through
     return {
         "status": "success",
-        "payload_count": result.payload_count,
-        "index_page_count": result.index_page_count,
-        "source_complete_through": result.source_complete_through.isoformat(),
+        "payload_count": payload_count,
+        "index_page_count": index_page_count,
+        "source_complete_through": complete_through.isoformat(),
     }

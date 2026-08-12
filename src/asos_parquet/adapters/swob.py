@@ -98,13 +98,17 @@ def _timestamp(value: str) -> datetime:
 
 
 def _station_identity(identity: dict[str, ElementTree.Element], provider_hint: str | None) -> str:
+    msc_element = identity.get("msc_id")
+    msc_id = None if msc_element is None else msc_element.get("value")
+    if msc_id:
+        return f"msc_id:{msc_id}"
     provider_element = identity.get("data_pvdr")
     provider = None if provider_element is None else provider_element.get("value")
-    if not provider:
+    if provider_element is None:
         provider = provider_hint
     if not provider:
         raise ValueError("SWOB payload has no data provider")
-    for field in ("msc_id", "tc_id", "stn_id"):
+    for field in ("tc_id", "stn_id"):
         element = identity.get(field)
         value = None if element is None else element.get("value")
         if value:

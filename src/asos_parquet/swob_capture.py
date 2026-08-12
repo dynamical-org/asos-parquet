@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Protocol
 from urllib.parse import urlencode
 
@@ -48,6 +49,7 @@ def capture_swob_window(
     max_workers: int = 16,
     state_path: Path | None = None,
     index_manifest_path: Path | None = None,
+    quarantine_path: Path | None = None,
 ) -> CaptureResult:
     start = _require_utc(start)
     end = _require_utc(end)
@@ -59,7 +61,10 @@ def capture_swob_window(
         raise ValueError("max_workers must be positive")
     if (state_path is None) != (index_manifest_path is None):
         raise ValueError("state_path and index_manifest_path must be supplied together")
+    if index_manifest_path is not None and index_manifest_path.parent != manifest_path.parent:
+        raise ValueError("index_manifest_path and manifest_path must share a parent")
     resolved_state_path = state_path or manifest_path.with_suffix(".state.json")
+    resolved_quarantine_path = quarantine_path or manifest_path.with_suffix(".quarantine.json")
     split_state = index_manifest_path is not None
     state = _load_state(resolved_state_path, expect_index_pages=not split_state)
     cursor = _optional_timestamp(state.get("source_complete_through"))
@@ -75,6 +80,7 @@ def capture_swob_window(
     new_entries: list[dict[str, object]] = []
     new_pages: list[dict[str, object]] = []
     selected: list[dict[str, object]] = []
+    quarantined: list[dict[str, object]] = []
 
     url: str | None = _initial_url(effective_start, end)
     while url is not None:
@@ -91,7 +97,21 @@ def capture_swob_window(
         new_pages.append(page_entry)
         page = loads(page_data)
         for feature in _features(page):
-            metadata = _feature_metadata(feature, effective_start, end)
+            try:
+                if not isinstance(feature, dict):
+                    raise ValueError("SWOB index page contains a malformed feature")
+                metadata = _feature_metadata(feature, effective_start, end)
+            except ValueError as error:
+                quarantined.append(
+                    {
+                        "error": str(error),
+                        "feature": feature,
+                        "page": url,
+                        "window_end": end.isoformat(),
+                        "window_start": effective_start.isoformat(),
+                    }
+                )
+                continue
             if metadata is None:
                 continue
             selected.append(metadata)
@@ -131,8 +151,12 @@ def capture_swob_window(
         entry["source_published_at"] = None
         new_entries.append(entry)
 
+    payload_count = _addition_count(entries, new_entries)
+    index_page_count = _addition_count(pages, new_pages)
     entries = _merge_by_uri_digest(entries, new_entries)
     pages = _merge_by_uri_digest(pages, new_pages)
+    quarantine = _merge_quarantine(_load_quarantine(resolved_quarantine_path), quarantined)
+    _write_json(resolved_quarantine_path, quarantine)
     _write_json(manifest_path, entries)
     complete_through = max(cursor, end) if cursor is not None else end
     if index_manifest_path is not None:
@@ -152,8 +176,8 @@ def capture_swob_window(
     return CaptureResult(
         manifest_path=manifest_path,
         state_path=resolved_state_path,
-        payload_count=len(entries),
-        index_page_count=len(pages),
+        payload_count=payload_count,
+        index_page_count=index_page_count,
         source_complete_through=complete_through,
     )
 
@@ -181,15 +205,10 @@ def _get(client: _HttpSession, url: str) -> bytes:
     return response.content
 
 
-def _features(page: object) -> list[dict[str, object]]:
+def _features(page: object) -> list[object]:
     if not isinstance(page, dict) or not isinstance(page.get("features"), list):
         raise ValueError("SWOB index page is missing features")
-    features: list[dict[str, object]] = []
-    for feature in page["features"]:
-        if not isinstance(feature, dict):
-            raise ValueError("SWOB index page contains a malformed feature")
-        features.append(feature)
-    return features
+    return list(page["features"])
 
 
 def _feature_metadata(
@@ -268,10 +287,8 @@ def _archive(
     ]
     path = root / "raw" / f"{digest}{suffix}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_bytes() != data:
-        raise ValueError(f"Archived SWOB object changed: {path}")
-    if not path.exists():
-        path.write_bytes(data)
+    if not path.exists() or path.read_bytes() != data:
+        _write_bytes(path, data)
     return {
         "path": path.relative_to(root).as_posix(),
         "uri": uri,
@@ -297,6 +314,15 @@ def _load_manifest(path: Path) -> list[dict[str, object]]:
     document = loads(path.read_text())
     if not isinstance(document, list) or not all(isinstance(item, dict) for item in document):
         raise ValueError("SWOB manifest must be a list of objects")
+    return [dict(item) for item in document]
+
+
+def _load_quarantine(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    document = loads(path.read_text())
+    if not isinstance(document, list) or not all(isinstance(item, dict) for item in document):
+        raise ValueError("SWOB quarantine manifest must be a list of objects")
     return [dict(item) for item in document]
 
 
@@ -329,6 +355,35 @@ def _merge_by_uri_digest(
     for item in incoming:
         merged.setdefault((str(item["uri"]), str(item["sha256"])), item)
     return [merged[key] for key in sorted(merged)]
+
+
+def _addition_count(
+    existing: Sequence[dict[str, object]], incoming: Sequence[dict[str, object]]
+) -> int:
+    existing_keys = {(str(item["uri"]), str(item["sha256"])) for item in existing}
+    return len(
+        {
+            (str(item["uri"]), str(item["sha256"]))
+            for item in incoming
+            if (str(item["uri"]), str(item["sha256"])) not in existing_keys
+        }
+    )
+
+
+def _merge_quarantine(
+    existing: Sequence[dict[str, object]], incoming: Sequence[dict[str, object]]
+) -> list[dict[str, object]]:
+    merged = {dumps(item, sort_keys=True): item for item in existing}
+    for item in incoming:
+        merged.setdefault(dumps(item, sort_keys=True), item)
+    return [merged[key] for key in sorted(merged)]
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    with NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+        temporary.write(data)
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(path)
 
 
 def _write_json(path: Path, document: object) -> None:

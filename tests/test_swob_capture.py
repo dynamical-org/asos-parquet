@@ -378,6 +378,159 @@ def test_daily_manifests_share_monotonic_cursor_with_overlap(tmp_path: Path) -> 
     assert len(loads(second_index.read_text())) == 1
 
 
+def _single_feature_responses(
+    start: datetime, end: datetime, raw_url: str, raw: bytes
+) -> dict[str, bytes]:
+    page_url = (
+        "https://api.weather.gc.ca/collections/swob-realtime/items"
+        "?f=json&limit=1000&_is-minutely_obs-value=false&datetime="
+        f"{start.strftime('%Y-%m-%dT%H%%3A%M%%3A%SZ')}%2F"
+        f"{end.strftime('%Y-%m-%dT%H%%3A%M%%3A%SZ')}"
+    )
+    return {
+        page_url: _page([_feature("feature", start.isoformat(), start.isoformat(), raw_url)]),
+        raw_url: raw,
+        "https://dd.weather.gc.ca/today/observations/doc/swob-xml_station_list.csv": b"a",
+        "https://dd.weather.gc.ca/today/observations/doc/swob-xml_partner_station_list.csv": b"b",
+        "https://dd.weather.gc.ca/today/observations/doc/swob-xml_marine_station_list.csv": b"c",
+    }
+
+
+def test_capture_replaces_truncated_digest_archive_atomically(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    end = datetime(2026, 8, 12, 11, tzinfo=UTC)
+    raw_url = "https://example.test/station.xml"
+    raw = b"<xml>complete</xml>"
+    archived = tmp_path / "raw" / f"{sha256(raw).hexdigest()}.xml"
+    archived.parent.mkdir()
+    archived.write_bytes(b"<xml>")
+
+    capture_swob_window(
+        start,
+        end,
+        tmp_path / "manifest.json",
+        session=Session(_single_feature_responses(start, end, raw_url, raw)),
+    )
+
+    assert archived.read_bytes() == raw
+    assert len(list(archived.parent.iterdir())) == 5
+
+
+def test_capture_quarantines_malformed_features_and_continues(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    end = datetime(2026, 8, 12, 11, tzinfo=UTC)
+    raw_url = "https://example.test/valid.xml"
+    responses = _single_feature_responses(start, end, raw_url, b"<xml>valid</xml>")
+    page_url = next(url for url in responses if "swob-realtime" in url)
+    missing_network = _feature(
+        "missing-network",
+        "2026-08-12T10:20:00Z",
+        "2026-08-12T10:21:00Z",
+        "https://example.test/missing-network.xml",
+        provider=None,
+        network=None,
+    )
+    responses[page_url] = dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                "malformed",
+                missing_network,
+                _feature(
+                    "valid",
+                    "2026-08-12T10:30:00Z",
+                    "2026-08-12T10:31:00Z",
+                    raw_url,
+                ),
+            ],
+            "links": [],
+        }
+    ).encode()
+    quarantine_path = tmp_path / "quarantine.json"
+
+    result = capture_swob_window(
+        start,
+        end,
+        tmp_path / "manifest.json",
+        session=Session(responses),
+        quarantine_path=quarantine_path,
+    )
+
+    quarantine = loads(quarantine_path.read_text())
+    assert len(quarantine) == 2
+    features = [
+        item["feature"] if isinstance(item["feature"], str) else item["feature"]["id"]
+        for item in quarantine
+    ]
+    assert set(features) == {"malformed", "missing-network"}
+    assert all(item["page"] == page_url for item in quarantine)
+    assert all(item["window_start"] == start.isoformat() for item in quarantine)
+    assert all(item["window_end"] == end.isoformat() for item in quarantine)
+    assert result.payload_count == 4
+    assert (
+        loads((tmp_path / "manifest.state.json").read_text())["source_complete_through"]
+        == end.isoformat()
+    )
+
+
+def test_quarantine_write_failure_does_not_advance_cursor(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    end = datetime(2026, 8, 12, 11, tzinfo=UTC)
+    raw_url = "https://example.test/station.xml"
+    manifest = tmp_path / "manifest.json"
+    state_path = tmp_path / "manifest.state.json"
+    state_path.write_text(
+        dumps({"source_complete_through": start.isoformat(), "index_pages": []}) + "\n"
+    )
+    original_state = state_path.read_bytes()
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("not a directory")
+
+    with pytest.raises(FileExistsError):
+        capture_swob_window(
+            start,
+            end,
+            manifest,
+            overlap=timedelta(0),
+            session=Session(_single_feature_responses(start, end, raw_url, b"<xml>valid</xml>")),
+            quarantine_path=blocked_parent / "quarantine.json",
+        )
+
+    assert not manifest.exists()
+    assert state_path.read_bytes() == original_state
+
+
+def test_capture_result_counts_only_additions_this_run(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    end = datetime(2026, 8, 12, 11, tzinfo=UTC)
+    raw_url = "https://example.test/station.xml"
+    responses = _single_feature_responses(start, end, raw_url, b"<xml>valid</xml>")
+    manifest = tmp_path / "manifest.json"
+
+    first = capture_swob_window(
+        start, end, manifest, overlap=timedelta(0), session=Session(responses)
+    )
+    second = capture_swob_window(
+        start, end, manifest, overlap=timedelta(0), session=Session(responses)
+    )
+
+    assert first.payload_count == 4
+    assert first.index_page_count == 1
+    assert second.payload_count == 0
+    assert second.index_page_count == 0
+
+
+def test_split_index_manifest_must_share_manifest_parent(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must share a parent"):
+        capture_swob_window(
+            datetime(2026, 8, 12, 10, tzinfo=UTC),
+            datetime(2026, 8, 12, 11, tzinfo=UTC),
+            tmp_path / "payloads" / "manifest.json",
+            state_path=tmp_path / "state.json",
+            index_manifest_path=tmp_path / "indexes" / "index.json",
+        )
+
+
 @pytest.mark.parametrize(
     "start,end",
     [

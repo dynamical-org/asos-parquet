@@ -62,10 +62,10 @@ def test_swob_schedule_captures_only_closed_windows_with_overlap() -> None:
 
 class _Volume:
     def __init__(self) -> None:
-        self.committed = False
+        self.commits = 0
 
     def commit(self) -> None:
-        self.committed = True
+        self.commits += 1
 
 
 def test_swob_schedule_uses_daily_manifests_and_shared_cursor(
@@ -89,5 +89,53 @@ def test_swob_schedule_uses_daily_manifests_and_shared_cursor(
     assert captured["manifest_path"] == tmp_path / "manifests" / "2026-08-12.json"
     assert captured["index_manifest_path"] == (tmp_path / "manifests" / "2026-08-12.index.json")
     assert captured["state_path"] == tmp_path / "state.json"
-    assert volume.committed
+    assert volume.commits == 1
+    assert result["source_complete_through"] == "2026-08-13T00:00:00+00:00"
+
+
+def test_swob_catchup_advances_in_bounded_committed_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state.json"
+    state.write_text('{"source_complete_through":"2026-08-11T18:00:00+00:00"}\n')
+    captured: list[tuple[datetime, datetime, Path]] = []
+
+    def fake_capture(
+        start: datetime, end: datetime, manifest_path: Path, **kwargs: object
+    ) -> CaptureResult:
+        captured.append((start, end, manifest_path))
+        state.write_text(f'{{"source_complete_through":"{end.isoformat()}"}}\n')
+        return CaptureResult(manifest_path, state, 1, 1, end)
+
+    volume = _Volume()
+    monkeypatch.setattr(modal_app, "_SWOB_VOLUME_PATH", tmp_path)
+    monkeypatch.setattr(modal_app, "swob_archive", volume)
+    monkeypatch.setattr("asos_parquet.swob_capture.capture_swob_window", fake_capture)
+
+    result = _update_swob_data_impl(datetime(2026, 8, 13, 1, 20, tzinfo=UTC))
+
+    assert [(start, end) for start, end, _ in captured] == [
+        (
+            datetime(2026, 8, 11, 18, tzinfo=UTC),
+            datetime(2026, 8, 12, 0, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 12, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 6, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 12, 6, tzinfo=UTC),
+            datetime(2026, 8, 12, 12, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 12, 12, tzinfo=UTC),
+            datetime(2026, 8, 12, 18, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 12, 18, tzinfo=UTC),
+            datetime(2026, 8, 13, 0, tzinfo=UTC),
+        ),
+    ]
+    assert volume.commits == 5
+    assert result["payload_count"] == 5
     assert result["source_complete_through"] == "2026-08-13T00:00:00+00:00"
