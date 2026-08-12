@@ -157,3 +157,17 @@ modal deploy modal_app.py
 - **Original data**: NOAA / NWS / FAA (public domain)
 - **Processing**: [dynamical.org](https://dynamical.org)
 - **Hosting**: [Source Cooperative](https://source.coop/), a [Radiant Earth](https://radiant.earth/) initiative
+
+#### WIS2 30-day reliability collector
+
+Issue #26 is an evidence-gathering spike, not a production cutover. Start its clock on a persistent host with durable storage:
+
+```bash
+uv run python scripts/collect_wis2.py --output /var/lib/obs-parquet/wis2
+```
+
+The collector subscribes over TLS to the public WIS2 Global Broker's core SYNOP cache topic. It archives every notification and integrity-verified BUFR payload content-addressably before ecCodes decoding, and stores restart-safe publisher/template cursors, gap counts, duplicates, decoder failures, and watermarks in `measurements.sqlite3`. Back up or mount the entire output directory; WIS2 cache links are not a historical archive.
+
+Verified 2026-08-12: anonymous `everyone` credentials connected to `globalbroker.meteo.fr:8883`; a live `ru-roshydromet` SYNOP notification conformed to WNM 1, included inline base64 BUFR plus a canonical `application/bufr` link and SHA-512 integrity value, and its canonical object decoded with ecCodes as BUFR edition 4, one subset, template descriptors `301150+307080`. This single sample verifies interoperability, not publisher coverage or reliability.
+
+Still unverified until collection has elapsed: 30-day publisher/station/template/variable coverage, one-hour and 24-hour restart drills, recovery beyond cache retention, exact retention by cache, 2026 fallback coverage, and operating cost. Do not mark the issue's gate passed before those measurements are complete.
