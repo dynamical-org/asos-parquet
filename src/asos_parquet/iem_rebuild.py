@@ -2,11 +2,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
-from json import dumps
+from json import dumps, loads
 from pathlib import Path
 
 from .adapters.iem import VARIABLE_MAPPINGS, normalize_observations
-from .canonical import write_normalized, write_raw_manifests
+from .canonical import read_raw_manifests, write_normalized, write_raw_manifests
 from .capabilities import derive_daily_capabilities, write_capabilities
 from .config import OBS_DATASET_START_YEAR
 from .contracts import (
@@ -43,6 +43,27 @@ def rebuild_iem_2026(
     if any(item.raw.source != "iem" for item in ordered_payloads):
         raise ValueError("IEM rebuild accepts only IEM raw payloads")
 
+    as_of = max(item.raw.ingested_at for item in ordered_payloads)
+    watermark_path = output_dir / "watermark.json"
+    if watermark_path.exists():
+        previous_as_of = datetime.fromisoformat(str(loads(watermark_path.read_text())["as_of"]))
+        if as_of < previous_as_of:
+            raise ValueError(
+                f"IEM rebuild watermark would regress from {previous_as_of.isoformat()} "
+                f"to {as_of.isoformat()}"
+            )
+
+    manifests_path = output_dir / "raw-manifests.parquet"
+    input_digests = {item.raw.sha256 for item in ordered_payloads}
+    if manifests_path.exists():
+        recorded_digests = {item.raw.sha256 for item in read_raw_manifests(manifests_path)}
+        dropped_digests = recorded_digests - input_digests
+        if dropped_digests:
+            raise ValueError(
+                "IEM rebuild manifest drops previously recorded raw objects: "
+                f"{sorted(dropped_digests)}"
+            )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = output_dir / "raw" / "iem"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -50,7 +71,7 @@ def rebuild_iem_2026(
     observations: list[NormalizedObservation] = []
     manifests_by_sha: dict[str, RawObjectManifest] = {}
     latest_revision: dict[str, str] = {}
-    emitted_revisions: set[str] = set()
+    emitted_occurrences: set[str] = set()
     for payload in ordered_payloads:
         digest = sha256(payload.data).hexdigest()
         if digest != payload.raw.sha256:
@@ -85,25 +106,38 @@ def rebuild_iem_2026(
                     f"obs-parquet v1 starts in {OBS_DATASET_START_YEAR}, "
                     f"got {observation.observed_at!r}"
                 )
-            if observation.revision_id in emitted_revisions:
+            occurrence_id = sha256(
+                dumps(
+                    {
+                        "content_revision_id": observation.revision_id,
+                        "raw_sha256": payload.raw.sha256,
+                        "raw_uri": payload.raw.uri,
+                        "ingested_at": payload.raw.ingested_at.isoformat(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if occurrence_id in emitted_occurrences:
                 continue
             previous = latest_revision.get(observation.source_record_id)
-            linked = replace(observation, supersedes_revision_id=previous)
+            linked = replace(
+                observation,
+                revision_id=occurrence_id,
+                supersedes_revision_id=previous,
+            )
             observations.append(linked)
-            emitted_revisions.add(linked.revision_id)
+            emitted_occurrences.add(occurrence_id)
             latest_revision[linked.source_record_id] = linked.revision_id
 
     variables = tuple(dict.fromkeys(mapping.variable for mapping in VARIABLE_MAPPINGS.values()))
     capabilities = derive_daily_capabilities(observations, variables)
     normalized_path = output_dir / "normalized.parquet"
     capabilities_path = output_dir / "capabilities.parquet"
-    manifests_path = output_dir / "raw-manifests.parquet"
-    watermark_path = output_dir / "watermark.json"
     write_normalized(observations, normalized_path)
     write_capabilities(capabilities, capabilities_path)
     write_raw_manifests([manifests_by_sha[key] for key in sorted(manifests_by_sha)], manifests_path)
 
-    as_of = max(item.raw.ingested_at for item in ordered_payloads)
     watermark_path.write_text(
         dumps(
             {

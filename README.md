@@ -38,7 +38,9 @@ The manifest contains a `payloads` list with `path`, `uri`, `sha256`, and UTC-aw
 `ingested_at` fields; `source_published_at` is optional. Paths are relative to the manifest.
 The rebuild verifies every digest, archives content-addressed raw CSVs, links revisions across
 overlapping payloads, and writes normalized, capability, raw-manifest, and watermark artifacts.
-Rerunning the same manifest is idempotent. Add newly archived payloads to advance the explicit
+Every manifest is a cumulative inventory: retain all previously recorded payloads and append new
+ones. A rebuild refuses to drop recorded raw objects or regress its watermark. Rerunning the same
+manifest is idempotent. Add newly archived payloads to advance the explicit
 `as_of` watermark; observations before 2026 are rejected.
 
 ### Full history for a station
