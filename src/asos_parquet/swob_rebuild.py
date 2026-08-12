@@ -119,7 +119,7 @@ def rebuild_swob_2026(
         if media_type not in XML_MEDIA_TYPES:
             continue
         observation_networks.add(payload.network)
-        for observation in normalize_swob(payload.data, payload.raw):
+        for observation in normalize_swob(payload.data, payload.raw, provider_hint=payload.network):
             if observation.observed_at.year < OBS_DATASET_START_YEAR:
                 raise ValueError(
                     f"SWOB obs-parquet starts in {OBS_DATASET_START_YEAR}, "

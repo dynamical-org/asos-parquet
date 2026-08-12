@@ -96,6 +96,22 @@ def test_namespaces_station_identifiers_by_provider_and_field() -> None:
     assert core_station != partner_station
 
 
+def test_missing_provider_uses_capture_network_hint() -> None:
+    data = (
+        (FIXTURES / "swob_core.xml")
+        .read_bytes()
+        .replace(
+            b'<element name="data_pvdr" uom="unitless" value="MSC"/>',
+            b"",
+        )
+    )
+
+    observations = normalize_swob(data, _raw(data), provider_hint="MSC-CORE")
+
+    assert observations
+    assert observations[0].source_station_id.startswith("MSC-CORE:")
+
+
 def test_accepts_xml_media_types_and_rejects_unknown_types(tmp_path: Path) -> None:
     data = (FIXTURES / "swob_core.xml").read_bytes()
     result = rebuild_swob_2026([_payload(data, media_type="text/xml; charset=UTF-8")], tmp_path)

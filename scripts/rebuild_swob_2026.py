@@ -30,10 +30,13 @@ def load_payloads(path: Path) -> list[SwobRawPayload]:
     entries: list[ManifestEntry] = loads(path.read_text())
     payloads: list[SwobRawPayload] = []
     for entry in entries:
-        data = Path(entry["path"]).read_bytes()
+        payload_path = Path(entry["path"])
+        if not payload_path.is_absolute():
+            payload_path = path.parent / payload_path
+        data = payload_path.read_bytes()
         digest = sha256(data).hexdigest()
         if digest != entry["sha256"]:
-            raise ValueError(f"Manifest digest mismatch for {entry['path']}")
+            raise ValueError(f"Manifest digest mismatch for {payload_path}")
         published = entry.get("source_published_at")
         payloads.append(
             SwobRawPayload(

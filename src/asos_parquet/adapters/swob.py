@@ -97,9 +97,11 @@ def _timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _station_identity(identity: dict[str, ElementTree.Element]) -> str:
+def _station_identity(identity: dict[str, ElementTree.Element], provider_hint: str | None) -> str:
     provider_element = identity.get("data_pvdr")
     provider = None if provider_element is None else provider_element.get("value")
+    if not provider:
+        provider = provider_hint
     if not provider:
         raise ValueError("SWOB payload has no data provider")
     for field in ("msc_id", "tc_id", "stn_id"):
@@ -113,12 +115,13 @@ def _station_identity(identity: dict[str, ElementTree.Element]) -> str:
 def _normalize_observation(
     observation: ElementTree.Element,
     raw: RawObjectRef,
+    provider_hint: str | None,
 ) -> list[NormalizedObservation]:
     identity = _elements(
         observation,
         f"{OM}metadata/{POINT}set/{POINT}identification-elements/{POINT}element",
     )
-    station = _station_identity(identity)
+    station = _station_identity(identity, provider_hint)
     observed_value = identity.get("date_tm")
     if observed_value is None or observed_value.get("value") is None:
         raise ValueError("SWOB payload has no observation time")
@@ -206,11 +209,15 @@ def _normalize_observation(
     return normalized
 
 
-def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation]:
+def normalize_swob(
+    data: bytes, raw: RawObjectRef, provider_hint: str | None = None
+) -> list[NormalizedObservation]:
     if raw.source != "msc-swob":
         raise ValueError(f"Expected MSC SWOB raw object, got {raw.source!r}")
     root = ElementTree.fromstring(data)
     members = root.findall(f"{OM}member/{OM}Observation")
     if not members:
         raise ValueError("SWOB payload has no observation")
-    return [item for member in members for item in _normalize_observation(member, raw)]
+    return [
+        item for member in members for item in _normalize_observation(member, raw, provider_hint)
+    ]

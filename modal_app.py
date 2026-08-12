@@ -383,3 +383,101 @@ def backfill(year: int):
     """
     result = backfill_year.remote(year=year)
     print(f"Result: {result}")
+
+
+_SWOB_CRON_MONITOR_SLUG = "obs-parquet-swob-update"
+_SWOB_CRON_SCHEDULE = "15 * * * *"
+_SWOB_VOLUME_PATH = Path("/swob-archive")
+swob_archive = modal.Volume.from_name("obs-parquet-swob", create_if_missing=True)
+
+
+def _swob_capture_bounds(now: datetime, cursor: datetime | None) -> tuple[datetime, datetime]:
+    if now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise ValueError("SWOB scheduler requires a UTC-aware timestamp")
+    end = (now - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=6) if cursor is None else cursor
+    return start, end
+
+
+def _swob_cursor(state_path: Path) -> datetime | None:
+    from json import loads
+
+    if not state_path.exists():
+        return None
+    value = loads(state_path.read_text()).get("source_complete_through")
+    if not isinstance(value, str):
+        raise ValueError("SWOB capture state has no source completeness timestamp")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError("SWOB capture cursor must be UTC-aware")
+    return parsed
+
+
+def _swob_cron_checkin(status: str, check_in_id: str | None = None) -> str | None:
+    import sentry_sdk.crons
+
+    with contextlib.suppress(Exception):
+        return sentry_sdk.crons.capture_checkin(
+            monitor_slug=_SWOB_CRON_MONITOR_SLUG,
+            check_in_id=check_in_id,
+            status=status,
+            monitor_config={
+                "schedule": {"type": "crontab", "value": _SWOB_CRON_SCHEDULE},
+                "timezone": "UTC",
+                "checkin_margin": 10,
+                "failure_issue_threshold": 1,
+                "recovery_threshold": 1,
+            },
+        )
+    return None
+
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("sentry-asos-parquet")],
+    volumes={str(_SWOB_VOLUME_PATH): swob_archive},
+    timeout=1800,
+    schedule=modal.Cron(_SWOB_CRON_SCHEDULE),
+    cpu=2.0,
+    memory=4096,
+)
+def update_swob_data() -> dict[str, object]:
+    from asos_parquet import obs
+
+    obs.setup_logging()
+    obs.init_sentry()
+    check_in_id = _swob_cron_checkin("in_progress")
+    try:
+        result = _update_swob_data_impl()
+        _swob_cron_checkin("ok", check_in_id)
+        return result
+    except BaseException as exc:
+        if _is_lifecycle_interruption(exc):
+            logger.info("update_swob_data interrupted by Modal lifecycle: %s", type(exc).__name__)
+            raise
+        logger.exception("update_swob_data failed")
+        _swob_cron_checkin("error", check_in_id)
+        raise
+    finally:
+        obs.flush()
+
+
+def _update_swob_data_impl(now: datetime | None = None) -> dict[str, object]:
+    from asos_parquet.swob_capture import capture_swob_window
+
+    current = datetime.now(timezone.utc) if now is None else now
+    manifest_path = _SWOB_VOLUME_PATH / "manifest.json"
+    cursor = _swob_cursor(manifest_path.with_suffix(".state.json"))
+    start, end = _swob_capture_bounds(current, cursor)
+    if cursor is not None and end - cursor > timedelta(days=29):
+        raise ValueError("SWOB cursor is beyond the verified 30-day source retention")
+    if start >= end:
+        return {"status": "caught_up", "source_complete_through": end.isoformat()}
+    result = capture_swob_window(start, end, manifest_path, overlap=timedelta(hours=6))
+    swob_archive.commit()
+    return {
+        "status": "success",
+        "payload_count": result.payload_count,
+        "index_page_count": result.index_page_count,
+        "source_complete_through": result.source_complete_through.isoformat(),
+    }
