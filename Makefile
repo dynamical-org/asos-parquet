@@ -1,4 +1,4 @@
-.PHONY: install test lint format load upload validate validate-prod clean deploy dev examples
+.PHONY: install test lint format typecheck load upload validate validate-prod clean deploy dev examples
 
 # Setup
 install:
@@ -14,6 +14,9 @@ lint:
 format:
 	uv run ruff format src/ scripts/ tests/
 	uv run ruff check --fix src/ scripts/ tests/
+
+typecheck:
+	uv run mypy
 
 # Variables
 YEAR ?=
