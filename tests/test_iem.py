@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -177,7 +177,7 @@ def test_normalize_observations_emits_values_with_provenance() -> None:
     assert precipitation.value == 1.016
     assert precipitation.unit == "mm"
     assert precipitation.statistic is ObservationStatistic.SUM
-    assert precipitation.period is None
+    assert precipitation.period == timedelta(hours=1)
 
 
 def test_normalize_observations_preserves_trace_before_numeric_conversion() -> None:
