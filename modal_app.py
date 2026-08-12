@@ -466,14 +466,24 @@ def _update_swob_data_impl(now: datetime | None = None) -> dict[str, object]:
     from asos_parquet.swob_capture import capture_swob_window
 
     current = datetime.now(timezone.utc) if now is None else now
-    manifest_path = _SWOB_VOLUME_PATH / "manifest.json"
-    cursor = _swob_cursor(manifest_path.with_suffix(".state.json"))
+    state_path = _SWOB_VOLUME_PATH / "state.json"
+    cursor = _swob_cursor(state_path)
     start, end = _swob_capture_bounds(current, cursor)
     if cursor is not None and end - cursor > timedelta(days=29):
         raise ValueError("SWOB cursor is beyond the verified 30-day source retention")
     if start >= end:
         return {"status": "caught_up", "source_complete_through": end.isoformat()}
-    result = capture_swob_window(start, end, manifest_path, overlap=timedelta(hours=6))
+    manifest_date = (end - timedelta(microseconds=1)).date().isoformat()
+    manifest_path = _SWOB_VOLUME_PATH / "manifests" / f"{manifest_date}.json"
+    index_manifest_path = manifest_path.with_suffix(".index.json")
+    result = capture_swob_window(
+        start,
+        end,
+        manifest_path,
+        overlap=timedelta(hours=6),
+        state_path=state_path,
+        index_manifest_path=index_manifest_path,
+    )
     swob_archive.commit()
     return {
         "status": "success",

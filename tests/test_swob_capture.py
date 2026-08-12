@@ -291,6 +291,93 @@ def test_partial_failure_does_not_advance_manifest_or_cursor(tmp_path: Path) -> 
     assert state_path.read_bytes() == original_state
 
 
+def test_daily_manifests_share_monotonic_cursor_with_overlap(tmp_path: Path) -> None:
+    first_start = datetime(2026, 8, 10, 10, tzinfo=UTC)
+    first_end = datetime(2026, 8, 10, 11, tzinfo=UTC)
+    second_end = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    first_url = "https://example.test/first.xml"
+    second_url = "https://example.test/second.xml"
+    first_page_url = (
+        "https://api.weather.gc.ca/collections/swob-realtime/items"
+        "?f=json&limit=1000&_is-minutely_obs-value=false"
+        "&datetime=2026-08-10T10%3A00%3A00Z%2F2026-08-10T11%3A00%3A00Z"
+    )
+    second_page_url = (
+        "https://api.weather.gc.ca/collections/swob-realtime/items"
+        "?f=json&limit=1000&_is-minutely_obs-value=false"
+        "&datetime=2026-08-10T10%3A00%3A00Z%2F2026-08-10T12%3A00%3A00Z"
+    )
+    station_responses = {
+        "https://dd.weather.gc.ca/today/observations/doc/swob-xml_station_list.csv": b"a",
+        "https://dd.weather.gc.ca/today/observations/doc/swob-xml_partner_station_list.csv": b"b",
+        "https://dd.weather.gc.ca/today/observations/doc/swob-xml_marine_station_list.csv": b"c",
+    }
+    responses = {
+        first_page_url: _page(
+            [_feature("first", "2026-08-10T10:30:00Z", "2026-08-10T10:31:00Z", first_url)]
+        ),
+        second_page_url: _page(
+            [
+                _feature("first", "2026-08-10T10:30:00Z", "2026-08-10T10:31:00Z", first_url),
+                _feature("second", "2026-08-10T11:30:00Z", "2026-08-10T11:31:00Z", second_url),
+            ]
+        ),
+        first_url: b"<xml>first</xml>",
+        second_url: b"<xml>second</xml>",
+        **station_responses,
+    }
+    state = tmp_path / "state.json"
+    first_manifest = tmp_path / "2026-08-10-a.json"
+    first_index = tmp_path / "2026-08-10-a.index.json"
+    second_manifest = tmp_path / "2026-08-10-b.json"
+    second_index = tmp_path / "2026-08-10-b.index.json"
+
+    capture_swob_window(
+        first_start,
+        first_end,
+        first_manifest,
+        overlap=timedelta(hours=1),
+        session=Session(responses),
+        state_path=state,
+        index_manifest_path=first_index,
+    )
+    capture_swob_window(
+        first_end,
+        second_end,
+        second_manifest,
+        overlap=timedelta(hours=1),
+        session=Session(responses),
+        state_path=state,
+        index_manifest_path=second_index,
+    )
+    first_before = first_manifest.read_bytes()
+    first_index_before = first_index.read_bytes()
+    second_before = second_manifest.read_bytes()
+    second_index_before = second_index.read_bytes()
+    cursor_before = state.read_bytes()
+
+    capture_swob_window(
+        first_start,
+        first_end,
+        first_manifest,
+        overlap=timedelta(hours=1),
+        session=Session(responses),
+        state_path=state,
+        index_manifest_path=first_index,
+    )
+
+    assert loads(state.read_text()) == {"source_complete_through": second_end.isoformat()}
+    assert first_manifest.read_bytes() == first_before
+    assert first_index.read_bytes() == first_index_before
+    assert second_manifest.read_bytes() == second_before
+    assert second_index.read_bytes() == second_index_before
+    assert state.read_bytes() == cursor_before
+    assert len(loads(first_manifest.read_text())) == 4
+    assert len(loads(first_index.read_text())) == 1
+    assert len(loads(second_manifest.read_text())) == 5
+    assert len(loads(second_index.read_text())) == 1
+
+
 @pytest.mark.parametrize(
     "start,end",
     [

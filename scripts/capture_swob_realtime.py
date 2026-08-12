@@ -19,6 +19,8 @@ def main() -> None:
     parser.add_argument("--end", type=_timestamp, required=True)
     parser.add_argument("--overlap-minutes", type=int, default=180)
     parser.add_argument("--max-workers", type=int, default=16)
+    parser.add_argument("--state", type=Path)
+    parser.add_argument("--index-manifest", type=Path)
     args = parser.parse_args()
     result = capture_swob_window(
         args.start,
@@ -26,6 +28,8 @@ def main() -> None:
         args.manifest,
         overlap=timedelta(minutes=args.overlap_minutes),
         max_workers=args.max_workers,
+        state_path=args.state,
+        index_manifest_path=args.index_manifest,
     )
     print(
         f"Captured {result.payload_count} payloads and {result.index_page_count} index pages "

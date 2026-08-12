@@ -46,6 +46,8 @@ def capture_swob_window(
     fetched_at: Callable[[], datetime] = lambda: datetime.now(UTC),
     session: _HttpSession | None = None,
     max_workers: int = 16,
+    state_path: Path | None = None,
+    index_manifest_path: Path | None = None,
 ) -> CaptureResult:
     start = _require_utc(start)
     end = _require_utc(end)
@@ -55,14 +57,21 @@ def capture_swob_window(
         raise ValueError("overlap must not be negative")
     if max_workers < 1:
         raise ValueError("max_workers must be positive")
-    state_path = manifest_path.with_suffix(".state.json")
-    state = _load_state(state_path)
+    if (state_path is None) != (index_manifest_path is None):
+        raise ValueError("state_path and index_manifest_path must be supplied together")
+    resolved_state_path = state_path or manifest_path.with_suffix(".state.json")
+    split_state = index_manifest_path is not None
+    state = _load_state(resolved_state_path, expect_index_pages=not split_state)
     cursor = _optional_timestamp(state.get("source_complete_through"))
     effective_start = min(start, cursor - overlap) if cursor is not None else start
     client = session or requests.Session()
     ingested_at = _require_utc(fetched_at())
     entries = _load_manifest(manifest_path)
-    pages = _load_pages(state)
+    pages = (
+        _load_manifest(index_manifest_path)
+        if index_manifest_path is not None
+        else _load_pages(state)
+    )
     new_entries: list[dict[str, object]] = []
     new_pages: list[dict[str, object]] = []
     selected: list[dict[str, object]] = []
@@ -126,16 +135,23 @@ def capture_swob_window(
     pages = _merge_by_uri_digest(pages, new_pages)
     _write_json(manifest_path, entries)
     complete_through = max(cursor, end) if cursor is not None else end
-    _write_json(
-        state_path,
-        {
-            "source_complete_through": complete_through.isoformat(),
-            "index_pages": pages,
-        },
-    )
+    if index_manifest_path is not None:
+        _write_json(index_manifest_path, pages)
+        _write_json(
+            resolved_state_path,
+            {"source_complete_through": complete_through.isoformat()},
+        )
+    else:
+        _write_json(
+            resolved_state_path,
+            {
+                "source_complete_through": complete_through.isoformat(),
+                "index_pages": pages,
+            },
+        )
     return CaptureResult(
         manifest_path=manifest_path,
-        state_path=state_path,
+        state_path=resolved_state_path,
         payload_count=len(entries),
         index_page_count=len(pages),
         source_complete_through=complete_through,
@@ -284,13 +300,18 @@ def _load_manifest(path: Path) -> list[dict[str, object]]:
     return [dict(item) for item in document]
 
 
-def _load_state(path: Path) -> dict[str, object]:
+def _load_state(path: Path, *, expect_index_pages: bool) -> dict[str, object]:
     if not path.exists():
-        return {"source_complete_through": None, "index_pages": []}
-    document = loads(path.read_text())
-    if not isinstance(document, dict) or not isinstance(document.get("index_pages"), list):
+        document: dict[str, object] = {"source_complete_through": None}
+        if expect_index_pages:
+            document["index_pages"] = []
+        return document
+    loaded = loads(path.read_text())
+    if not isinstance(loaded, dict):
         raise ValueError("SWOB capture state is malformed")
-    return document
+    if expect_index_pages and not isinstance(loaded.get("index_pages"), list):
+        raise ValueError("SWOB capture state is missing index pages")
+    return loaded
 
 
 def _load_pages(state: dict[str, object]) -> list[dict[str, object]]:

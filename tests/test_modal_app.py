@@ -1,16 +1,20 @@
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 import modal
 import pytest
 
+import modal_app
 from asos_parquet.config import OBS_S3_PREFIX
 from asos_parquet.partitioned import DEFAULT_DATASET_PATH, LEGACY_DATASET_PATH
+from asos_parquet.swob_capture import CaptureResult
 from modal_app import (
     _SWOB_CRON_SCHEDULE,
     _backfill_year_impl,
     _is_lifecycle_interruption,
     _swob_capture_bounds,
+    _update_swob_data_impl,
 )
 
 
@@ -54,3 +58,36 @@ def test_swob_schedule_captures_only_closed_windows_with_overlap() -> None:
         datetime(2026, 8, 12, 18, tzinfo=UTC),
         datetime(2026, 8, 12, 19, tzinfo=UTC),
     )
+
+
+class _Volume:
+    def __init__(self) -> None:
+        self.committed = False
+
+    def commit(self) -> None:
+        self.committed = True
+
+
+def test_swob_schedule_uses_daily_manifests_and_shared_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_capture(
+        start: datetime, end: datetime, manifest_path: Path, **kwargs: object
+    ) -> CaptureResult:
+        captured.update(start=start, end=end, manifest_path=manifest_path, **kwargs)
+        return CaptureResult(manifest_path, Path(str(kwargs["state_path"])), 7, 2, end)
+
+    volume = _Volume()
+    monkeypatch.setattr(modal_app, "_SWOB_VOLUME_PATH", tmp_path)
+    monkeypatch.setattr(modal_app, "swob_archive", volume)
+    monkeypatch.setattr("asos_parquet.swob_capture.capture_swob_window", fake_capture)
+
+    result = _update_swob_data_impl(datetime(2026, 8, 13, 1, 20, tzinfo=UTC))
+
+    assert captured["manifest_path"] == tmp_path / "manifests" / "2026-08-12.json"
+    assert captured["index_manifest_path"] == (tmp_path / "manifests" / "2026-08-12.index.json")
+    assert captured["state_path"] == tmp_path / "state.json"
+    assert volume.committed
+    assert result["source_complete_through"] == "2026-08-13T00:00:00+00:00"
