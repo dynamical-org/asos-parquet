@@ -35,6 +35,12 @@ class ValueState(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class CapabilityState(StrEnum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    DEGRADED = "degraded"
+
+
 class StationMatchMethod(StrEnum):
     EXACT = "exact"
     UNMATCHED = "unmatched"
@@ -120,6 +126,33 @@ class NormalizedObservation:
         else:
             _require(self.value is None, f"{self.value_state} values must be null")
             _require(not self.is_trace, f"{self.value_state} values cannot be trace observations")
+
+
+@dataclass(frozen=True, slots=True)
+class StationVariableCapability:
+    source: str
+    source_station_id: str
+    variable: Variable
+    state: CapabilityState
+    valid_from: datetime
+    valid_to: datetime
+    expected_count: int
+    observed_count: int
+    accepted_count: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        _require(bool(self.source), "Capability source must not be empty")
+        _require(bool(self.source_station_id), "Capability station ID must not be empty")
+        _assert_utc(self.valid_from)
+        _assert_utc(self.valid_to)
+        _require(self.valid_from < self.valid_to, "Capability interval must be positive")
+        _require(self.expected_count > 0, "Capability expected count must be positive")
+        _require(
+            0 <= self.accepted_count <= self.observed_count <= self.expected_count,
+            "Capability counts must satisfy accepted <= observed <= expected",
+        )
+        _require(bool(self.reason), "Capability reason must not be empty")
 
 
 @dataclass(frozen=True, slots=True)

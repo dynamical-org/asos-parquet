@@ -26,6 +26,23 @@ https://data.source.coop/dynamical/obs-parquet/v1/year={YYYY}/data.parquet
 partition, and includes nullable-string `wxcodes`. Existing `asos-parquet` objects are not
 rewritten or migrated.
 
+#### Rebuilding canonical IEM artifacts
+
+Raw IEM CSV responses are recorded in a JSON manifest and rebuilt deterministically:
+
+```bash
+make rebuild-iem IEM_MANIFEST=archive/iem/payloads.json
+```
+
+The manifest contains a `payloads` list with `path`, `uri`, `sha256`, and UTC-aware
+`ingested_at` fields; `source_published_at` is optional. Paths are relative to the manifest.
+The rebuild verifies every digest, archives content-addressed raw CSVs, links revisions across
+overlapping payloads, and writes normalized, capability, raw-manifest, and watermark artifacts.
+Every manifest is a cumulative inventory: retain all previously recorded payloads and append new
+ones. A rebuild refuses to drop recorded raw objects or regress its watermark. Rerunning the same
+manifest is idempotent. Add newly archived payloads to advance the explicit
+`as_of` watermark; observations before 2026 are rejected.
+
 ### Full history for a station
 
 Query a station's complete record across all year partitions:
