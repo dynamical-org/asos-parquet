@@ -1,5 +1,10 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, cast
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from asos_parquet.canonical import (
@@ -62,7 +67,7 @@ def observation(
     )
 
 
-def test_source_representatives_round_trip_without_losing_semantics(tmp_path) -> None:
+def test_source_representatives_round_trip_without_losing_semantics(tmp_path: Path) -> None:
     sources = ["iem", "msc-swob", "wis2"]
     observations = [
         observation(source, chr(ord("a") + index), index + 1, 10.0 + index)
@@ -76,7 +81,7 @@ def test_source_representatives_round_trip_without_losing_semantics(tmp_path) ->
     assert restored == observations
 
 
-def test_empty_normalized_dataset_retains_readable_schema(tmp_path) -> None:
+def test_empty_normalized_dataset_retains_readable_schema(tmp_path: Path) -> None:
     path = tmp_path / "empty.parquet"
 
     write_normalized([], path)
@@ -117,7 +122,7 @@ def test_source_precedence_is_deterministic() -> None:
 
 
 def test_unknown_source_precedence_is_rejected() -> None:
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="Missing source precedence"):
         select_canonical(
             [observation("unknown", "a", 1, 10.0)],
             as_of=datetime(2026, 1, 1, 2, tzinfo=UTC),
@@ -233,7 +238,7 @@ def test_normalized_partition_is_source_and_event_time_based() -> None:
     }
 
 
-def test_manifests_mappings_and_attributions_round_trip(tmp_path) -> None:
+def test_manifests_mappings_and_attributions_round_trip(tmp_path: Path) -> None:
     raw = RawObjectRef(
         source="msc-swob",
         uri="s3://raw/msc-swob/report.xml",
@@ -276,3 +281,67 @@ def test_manifests_mappings_and_attributions_round_trip(tmp_path) -> None:
     assert read_raw_manifests(tmp_path / "raw.parquet") == manifests
     assert read_station_mappings(tmp_path / "stations.parquet") == mappings
     assert read_attributions(tmp_path / "attributions.parquet") == attributions
+
+
+def test_numeric_values_are_coerced_or_rejected_before_writing(tmp_path: Path) -> None:
+    integer_value = replace(observation("iem", "a", 1, 10.0), value=270)
+    numpy_value = replace(observation("iem", "b", 1, 10.0), value=cast(Any, np.float32(12.5)))
+    path = tmp_path / "numeric.parquet"
+
+    write_normalized([integer_value, numpy_value], path)
+    restored = read_normalized(path)
+
+    assert [item.value for item in restored] == [270.0, 12.5]
+    with pytest.raises(ValueError, match="finite"):
+        write_normalized([replace(integer_value, value=float("nan"))], path)
+
+
+def test_supersession_is_scoped_to_source_and_canonical_key() -> None:
+    temperature = observation("msc-swob", "a", 1, 10.0)
+    wind = replace(
+        observation("wis2", "a", 1, 5.0),
+        variable=Variable.WIND_SPEED,
+        unit="m s-1",
+    )
+    wind_fix = replace(wind, revision_id="b", supersedes_revision_id="a", value=6.0)
+
+    selected = select_canonical(
+        [temperature, wind, wind_fix],
+        as_of=datetime(2026, 1, 1, 2, tzinfo=UTC),
+        source_precedence={"msc-swob": 0, "wis2": 1},
+    )
+
+    assert selected == [temperature, wind_fix]
+
+
+def test_observed_accepted_value_beats_later_missing_or_suspect_record() -> None:
+    accepted = observation("iem", "a", 1, 10.0)
+    missing = replace(
+        observation("iem", "b", 2, 11.0),
+        value=None,
+        value_state=ValueState.MISSING,
+    )
+    suspect = replace(observation("iem", "c", 3, 12.0), quality=ObservationQuality.SUSPECT)
+
+    selected = select_canonical(
+        [accepted, missing, suspect],
+        as_of=datetime(2026, 1, 1, 4, tzinfo=UTC),
+        source_precedence={"iem": 0},
+    )
+
+    assert selected == [accepted]
+
+
+def test_write_normalized_sorts_for_predicate_pushdown(tmp_path: Path) -> None:
+    earlier = observation("iem", "a", 1, 10.0)
+    later_station = replace(earlier, station_id="station:999", revision_id="b")
+    path = tmp_path / "sorted.parquet"
+
+    write_normalized([later_station, earlier], path)
+
+    assert list(pd.read_parquet(path)["station_id"]) == ["station:001", "station:999"]
+
+
+def test_revision_cannot_supersede_itself() -> None:
+    with pytest.raises(ValueError, match="cannot supersede itself"):
+        replace(observation("iem", "a", 1, 10.0), supersedes_revision_id="a")

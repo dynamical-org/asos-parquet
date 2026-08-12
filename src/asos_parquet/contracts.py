@@ -96,6 +96,10 @@ class NormalizedObservation:
         _require(bool(self.source_station_id), "Source station ID must not be empty")
         _require(bool(self.source_record_id), "Source record ID must not be empty")
         _require(bool(self.revision_id), "Revision ID must not be empty")
+        _require(
+            self.supersedes_revision_id != self.revision_id,
+            "An observation revision cannot supersede itself",
+        )
         _require(bool(self.unit), "Unit must not be empty")
         _assert_utc(self.observed_at)
         _assert_utc(self.available_at)

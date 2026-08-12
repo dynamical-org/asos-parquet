@@ -42,6 +42,10 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 
+[tool.mypy]
+strict = true
+files = ["src/asos_parquet/canonical.py", "src/asos_parquet/contracts.py", "tests/test_canonical.py"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

@@ -3,6 +3,7 @@ name: Deploy to Modal
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch: {}
 
 concurrency:
@@ -10,6 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout # v6.0.3
+      - uses: astral-sh/setup-uv # v8.2.0
+      - run: uv sync --all-extras --dev
+      - run: uv run ruff check src/asos_parquet/canonical.py src/asos_parquet/contracts.py tests/test_canonical.py
+      - run: uv run mypy
+      - run: uv run pytest
+
   deploy:
     # workflow_dispatch can target any branch; never expose prod Modal
     # credentials to a deploy from anything but main.
