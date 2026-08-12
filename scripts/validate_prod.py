@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import os  # noqa: E402
 
-from asos_parquet.config import DATA_FIELDS  # noqa: E402
+from asos_parquet.config import LEGACY_DATA_FIELDS  # noqa: E402
 from asos_parquet.load import STATION_METADATA_COLUMNS  # noqa: E402
 from asos_parquet.stations import fetch_all_stations  # noqa: E402
 from asos_parquet.validation import (  # noqa: E402
@@ -40,7 +40,7 @@ from asos_parquet.validation import (  # noqa: E402
 
 EXPECTED_COLUMNS = sorted(
     ["station", "valid", "longitude", "latitude", "state", "geometry"]
-    + DATA_FIELDS
+    + LEGACY_DATA_FIELDS
     + STATION_METADATA_COLUMNS
 )
 

@@ -7,6 +7,7 @@ import pytest
 from shapely.geometry import Point
 
 from asos_parquet.validation import (
+    OBS_V1_REQUIRED_COLUMNS,
     ValidationReport,
     validate_geometry,
     validate_geoparquet,
@@ -50,7 +51,6 @@ def valid_gdf() -> gpd.GeoDataFrame:
         "vsby": np.random.uniform(5, 10, n),
         "p01i": np.random.uniform(0, 0.5, n),
         "p01m": None,
-        "wxcodes": [None] * n,
     }
 
     # Calculate metric values from imperial
@@ -78,6 +78,11 @@ class TestValidateSchema:
         assert "Missing" in result.message
         assert "tmpf" in result.details["missing"]
         assert "station" in result.details["missing"]
+
+    def test_obs_v1_requires_present_weather(self, valid_gdf: gpd.GeoDataFrame):
+        result = validate_schema(valid_gdf, OBS_V1_REQUIRED_COLUMNS)
+        assert result.passed is False
+        assert result.details["missing"] == ["wxcodes"]
 
 
 class TestValidateGeometry:
@@ -318,7 +323,6 @@ class TestValidateGeoparquet:
             "vsby": np.random.uniform(5, 10, n),
             "p01i": np.random.uniform(0, 0.5, n),
             "p01m": None,
-            "wxcodes": [None] * n,
         }
         data["tmpc"] = (np.array(data["tmpf"]) - 32) * 5 / 9
         data["dwpc"] = (np.array(data["dwpf"]) - 32) * 5 / 9

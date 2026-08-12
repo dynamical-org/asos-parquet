@@ -13,6 +13,18 @@ Each year is a separate GeoParquet file following the pattern:
 ```
 https://data.source.coop/dynamical/asos-parquet/year={YYYY}/data.parquet
 ```
+### obs-parquet v1
+
+
+The multi-source successor is generated independently beside the immutable historical dataset:
+
+```
+https://data.source.coop/dynamical/obs-parquet/v1/year={YYYY}/data.parquet
+```
+
+`obs-parquet/v1` begins at `2026-01-01T00:00:00Z`, uses one consistent schema across every
+partition, and includes nullable-string `wxcodes`. Existing `asos-parquet` objects are not
+rewritten or migrated.
 
 ### Full history for a station
 

@@ -30,8 +30,13 @@ class ObservationQuality(StrEnum):
 
 
 def _assert_utc(value: datetime) -> None:
-    assert value.tzinfo is not None
-    assert value.utcoffset() == timedelta(0)
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError(f"Timestamp must be UTC-aware, got {value!r}")
+
+
+def _require(value: bool, message: str) -> None:
+    if not value:
+        raise ValueError(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,10 +48,13 @@ class RawObjectRef:
     source_published_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        assert self.source
-        assert self.uri
-        assert len(self.sha256) == 64
-        assert all(character in "0123456789abcdef" for character in self.sha256)
+        _require(bool(self.source), "Raw object source must not be empty")
+        _require(bool(self.uri), "Raw object URI must not be empty")
+        _require(
+            len(self.sha256) == 64
+            and all(character in "0123456789abcdef" for character in self.sha256),
+            f"Raw object sha256 must be 64 lowercase hexadecimal characters: {self.sha256!r}",
+        )
         _assert_utc(self.ingested_at)
         if self.source_published_at is not None:
             _assert_utc(self.source_published_at)
@@ -72,14 +80,21 @@ class NormalizedObservation:
     raw: RawObjectRef
 
     def __post_init__(self) -> None:
-        assert self.station_id
-        assert self.source_station_id
-        assert self.source_record_id
-        assert self.revision_id
-        assert self.unit
+        _require(bool(self.station_id), "Canonical station ID must not be empty")
+        _require(bool(self.source_station_id), "Source station ID must not be empty")
+        _require(bool(self.source_record_id), "Source record ID must not be empty")
+        _require(bool(self.revision_id), "Revision ID must not be empty")
+        _require(bool(self.unit), "Unit must not be empty")
         _assert_utc(self.observed_at)
         _assert_utc(self.available_at)
-        assert self.observed_at <= self.available_at
-        assert self.available_at <= self.raw.ingested_at
+        if self.observed_at > self.available_at and self.quality is not ObservationQuality.SUSPECT:
+            raise ValueError(
+                f"Observation {self.station_id} {self.variable} at {self.observed_at!r} "
+                f"is after availability {self.available_at!r} without suspect quality"
+            )
+        _require(
+            self.available_at <= self.raw.ingested_at,
+            f"Availability {self.available_at!r} is after raw ingest {self.raw.ingested_at!r}",
+        )
         if self.period is not None:
-            assert self.period > timedelta(0)
+            _require(self.period > timedelta(0), f"Period must be positive, got {self.period!r}")

@@ -83,6 +83,7 @@ def validate_year(
 
     report = validate_geoparquet(
         partition_path,
+        schema_version="obs-v1",
         min_records=100_000,
         min_stations=100,
         expected_stations=stations,

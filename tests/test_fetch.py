@@ -108,5 +108,5 @@ def test_fetch_keeps_present_weather_as_text(iem_response: None) -> None:
     )
 
     assert df is not None
-    assert df["wxcodes"].dtype == object
+    assert isinstance(df["wxcodes"].dtype, pd.StringDtype)
     assert set(df["wxcodes"].dropna()) == {"RA", "-RA"}

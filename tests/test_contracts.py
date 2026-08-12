@@ -53,7 +53,7 @@ def test_normalized_observation_preserves_provenance_and_semantics() -> None:
     ],
 )
 def test_contracts_require_utc_timestamps(timestamp: datetime) -> None:
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="UTC-aware"):
         RawObjectRef(
             source="iem",
             uri="s3://obs-raw/object",
@@ -128,7 +128,7 @@ def test_observation_cannot_be_available_before_it_was_observed() -> None:
         sha256="e" * 64,
         ingested_at=datetime(2026, 8, 1, 1, 5, tzinfo=UTC),
     )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="after availability"):
         NormalizedObservation(
             station_id="iem:KJFK",
             source_station_id="KJFK",

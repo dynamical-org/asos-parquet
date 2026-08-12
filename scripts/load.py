@@ -92,6 +92,7 @@ def validate_year_data(
 
     report = validate_geoparquet(
         partition_path,
+        schema_version="obs-v1",
         min_records=1000,  # Lower threshold for early years
         min_stations=10,
         expected_stations=stations,

@@ -7,6 +7,10 @@ STATION_METADATA_URL = "https://mesonet.agron.iastate.edu/geojson/network/{state
 NETWORK_METADATA_URL = "https://mesonet.agron.iastate.edu/geojson/network/{network_id}.geojson"
 OBSERVATION_DATA_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 
+OBS_DATASET_VERSION = "v1"
+OBS_DATASET_START_YEAR = 2026
+OBS_S3_PREFIX = f"obs-parquet/{OBS_DATASET_VERSION}"
+
 # Rate limiting
 MAX_CONCURRENT_REQUESTS = 5  # Keep low to avoid overwhelming Iowa Mesonet server
 MAX_RETRIES = 5
@@ -14,8 +18,8 @@ RETRY_BACKOFF = 3.0  # seconds (base for exponential backoff)
 MAX_BACKOFF = 300.0  # seconds (5 minutes) - cap for exponential backoff
 REQUEST_TIMEOUT = 120  # seconds - monthly requests can be large
 
-# Data fields to fetch (core weather subset with both imperial and metric)
-DATA_FIELDS = [
+# Columns in the immutable legacy asos-parquet dataset.
+LEGACY_DATA_FIELDS = [
     "tmpf",  # Air Temperature (F)
     "tmpc",  # Air Temperature (C)
     "dwpf",  # Dew Point (F)
@@ -29,6 +33,11 @@ DATA_FIELDS = [
     "vsby",  # Visibility (miles)
     "p01i",  # 1-hour Precipitation (inches)
     "p01m",  # 1-hour Precipitation (mm)
+]
+
+# Fields fetched for the versioned obs-parquet dataset.
+DATA_FIELDS = [
+    *LEGACY_DATA_FIELDS,
     "wxcodes",  # Present weather codes
 ]
 

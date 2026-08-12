@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
 from io import StringIO
+from json import dumps
 
 import pandas as pd
 
@@ -36,6 +37,7 @@ def parse_observations(
     text: str,
     timestamp_format: str,
     state: str | None = None,
+    preserve_trace: bool = False,
 ) -> pd.DataFrame | None:
     if not text.strip():
         return None
@@ -47,6 +49,11 @@ def parse_observations(
 
     if df.empty or "valid" not in df.columns:
         return None
+
+    if "wxcodes" in df.columns:
+        df["wxcodes"] = df["wxcodes"].astype("string")
+    if preserve_trace and "p01m" in df.columns:
+        df["_p01m_trace"] = df["p01m"].astype("string").str.upper().eq("T")
 
     df["valid"] = pd.to_datetime(
         df["valid"],
@@ -128,22 +135,24 @@ def normalize_observations(
     timestamp_format: str,
     raw: RawObjectRef,
 ) -> list[NormalizedObservation]:
-    assert raw.source == "iem"
-    source = pd.read_csv(StringIO(text), dtype=str)
-    assert {"station", "valid", "tmpf"} <= set(source.columns)
-    source["valid"] = pd.to_datetime(source["valid"], format=timestamp_format, utc=True)
-    source = source[pd.to_numeric(source["tmpf"], errors="coerce").notna()]
+    if raw.source != "iem":
+        raise ValueError(f"Expected IEM raw object, got {raw.source!r}")
+    source = parse_observations(text, timestamp_format, preserve_trace=True)
+    if source is None:
+        return []
+    if "station" not in source.columns:
+        raise ValueError("IEM observations are missing the station column")
 
     observations: list[NormalizedObservation] = []
-    for row_position, (_, row) in enumerate(source.iterrows()):
+    for _, row in source.iterrows():
         station = str(row["station"])
         observed_at = pd.Timestamp(row["valid"]).to_pydatetime()
         for field, mapping in VARIABLE_MAPPINGS.items():
             source_value = row.get(field)
-            if pd.isna(source_value) or not str(source_value).strip():
+            is_trace = field == "p01m" and bool(row.get("_p01m_trace", False))
+            if not is_trace and (pd.isna(source_value) or not str(source_value).strip()):
                 continue
 
-            is_trace = field == "p01m" and str(source_value).strip().upper() == "T"
             value: float | str
             if is_trace:
                 value = 0.0
@@ -155,10 +164,22 @@ def normalize_observations(
                     continue
                 value = float(numeric_value)
 
-            source_record_id = (
-                f"{station}:{observed_at.isoformat()}:{row_position}:{mapping.variable}"
+            source_record_id = f"{station}:{observed_at.isoformat()}:{mapping.variable}"
+            revision_payload = dumps(
+                {
+                    "source_record_id": source_record_id,
+                    "value": value,
+                    "unit": mapping.unit,
+                    "period_seconds": (
+                        mapping.period.total_seconds() if mapping.period is not None else None
+                    ),
+                    "statistic": mapping.statistic,
+                    "source_quality": "T" if is_trace else None,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
             )
-            revision_id = sha256(f"{raw.sha256}:{source_record_id}".encode()).hexdigest()
+            revision_id = sha256(revision_payload.encode()).hexdigest()
             observations.append(
                 NormalizedObservation(
                     station_id=f"iem:{station}",
@@ -173,7 +194,11 @@ def normalize_observations(
                     available_at=raw.ingested_at,
                     period=mapping.period,
                     statistic=mapping.statistic,
-                    quality=ObservationQuality.ACCEPTED,
+                    quality=(
+                        ObservationQuality.SUSPECT
+                        if observed_at > raw.ingested_at
+                        else ObservationQuality.ACCEPTED
+                    ),
                     source_quality="T" if is_trace else None,
                     is_trace=is_trace,
                     raw=raw,

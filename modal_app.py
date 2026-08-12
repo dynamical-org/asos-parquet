@@ -148,7 +148,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     from botocore.config import Config
     from botocore.exceptions import ClientError
 
-    from asos_parquet.config import get_all_network_ids
+    from asos_parquet.config import OBS_S3_PREFIX, get_all_network_ids
     from asos_parquet.fetch import fetch_observations_batch
     from asos_parquet.load import (
         enrich_with_station_metadata,
@@ -159,7 +159,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
     # Configuration from environment
     s3_bucket = os.environ.get("ASOS_S3_BUCKET")
-    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos").strip("/")
+    s3_prefix = os.environ.get("OBS_S3_PREFIX", OBS_S3_PREFIX).strip("/")
     s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
@@ -175,7 +175,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     )
 
     # Set up local paths (flat path avoids pyarrow Hive partition inference)
-    data_dir = Path("/tmp/asos")
+    data_dir = Path("/tmp/obs-parquet-v1")
     data_dir.mkdir(parents=True, exist_ok=True)
     data_file = data_dir / "data.parquet"
     s3_key = f"{s3_prefix}/year={current_year}/data.parquet"
@@ -291,18 +291,20 @@ def _backfill_year_impl(year: int):
     import boto3
     from botocore.config import Config
 
-    from asos_parquet.config import get_all_network_ids
+    from asos_parquet.config import OBS_DATASET_START_YEAR, OBS_S3_PREFIX, get_all_network_ids
     from asos_parquet.load import load_year
     from asos_parquet.stations import fetch_all_stations
 
     s3_bucket = os.environ.get("ASOS_S3_BUCKET")
-    s3_prefix = os.environ.get("ASOS_S3_PREFIX", "asos").strip("/")
+    s3_prefix = os.environ.get("OBS_S3_PREFIX", OBS_S3_PREFIX).strip("/")
     s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
         raise ValueError("ASOS_S3_BUCKET environment variable not set")
 
     logger.info(f"Backfill year {year} → s3://{s3_bucket}/{s3_prefix}/year={year}/data.parquet")
+    if year < OBS_DATASET_START_YEAR:
+        raise ValueError(f"obs-parquet v1 starts in {OBS_DATASET_START_YEAR}, got {year}")
 
     # Fetch all stations (including offline — they may have historical data)
     networks = get_all_network_ids()
@@ -315,7 +317,7 @@ def _backfill_year_impl(year: int):
         return {"status": "no_stations", "year": year, "records": 0}
 
     # Load full year to /tmp
-    data_dir = Path("/tmp/asos")
+    data_dir = Path("/tmp/obs-parquet-v1")
     result = load_year(year, stations, base_path=data_dir, show_progress=True)
 
     if not result.success:
