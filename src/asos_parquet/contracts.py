@@ -9,6 +9,7 @@ class Variable(StrEnum):
     RELATIVE_HUMIDITY = "relative_humidity"
     PRECIPITATION_AMOUNT = "precipitation_amount"
     PRECIPITATION_TYPE = "precipitation_type"
+    PRESENT_WEATHER = "present_weather"
     WIND_DIRECTION = "wind_direction"
     WIND_SPEED = "wind_speed"
     WIND_GUST = "wind_gust"

@@ -1,8 +1,10 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 
-from asos_parquet.adapters.iem import parse_observations
+from asos_parquet.adapters.iem import normalize_observations, parse_observations
+from asos_parquet.contracts import ObservationStatistic, RawObjectRef, Variable
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -41,3 +43,68 @@ KJFK,2026-08-01 00:30,,,190,14,-73.7781,40.6413,VCSH
 def test_parse_observations_rejects_empty_or_malformed_data() -> None:
     assert parse_observations("", timestamp_format="mixed") is None
     assert parse_observations("station,tmpf\nKJFK,72\n", timestamp_format="mixed") is None
+
+
+def test_normalize_observations_emits_values_with_provenance() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?fixture",
+        sha256="a" * 64,
+        ingested_at=datetime(2026, 8, 1, 3, tzinfo=UTC),
+    )
+    observations = normalize_observations(
+        (FIXTURES / "iem_observations.csv").read_text(),
+        timestamp_format="%Y-%m-%d %H:%M",
+        raw=raw,
+    )
+
+    first_report = [
+        observation
+        for observation in observations
+        if observation.observed_at == datetime(2026, 8, 1, tzinfo=UTC)
+    ]
+    assert {observation.variable for observation in first_report} == {
+        Variable.AIR_TEMPERATURE,
+        Variable.DEW_POINT,
+        Variable.RELATIVE_HUMIDITY,
+        Variable.PRECIPITATION_AMOUNT,
+        Variable.PRESENT_WEATHER,
+        Variable.WIND_DIRECTION,
+        Variable.WIND_SPEED,
+        Variable.WIND_GUST,
+    }
+    assert all(observation.raw is raw for observation in observations)
+    assert all(observation.available_at == raw.ingested_at for observation in observations)
+    assert len({observation.source_record_id for observation in observations}) == len(observations)
+
+    precipitation = next(
+        observation
+        for observation in first_report
+        if observation.variable is Variable.PRECIPITATION_AMOUNT
+    )
+    assert precipitation.value == 1.016
+    assert precipitation.unit == "mm"
+    assert precipitation.statistic is ObservationStatistic.SUM
+
+
+def test_normalize_observations_preserves_trace_before_numeric_conversion() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?trace",
+        sha256="b" * 64,
+        ingested_at=datetime(2026, 8, 1, 3, tzinfo=UTC),
+    )
+    observations = normalize_observations(
+        (FIXTURES / "iem_observations.csv").read_text(),
+        timestamp_format="%Y-%m-%d %H:%M",
+        raw=raw,
+    )
+
+    trace = next(
+        observation
+        for observation in observations
+        if observation.observed_at == datetime(2026, 8, 1, 2, tzinfo=UTC)
+        and observation.variable is Variable.PRECIPITATION_AMOUNT
+    )
+    assert trace.value == 0.0
+    assert trace.is_trace is True
