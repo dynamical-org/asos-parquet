@@ -6,7 +6,13 @@ from asos_parquet.adapters.iem_precip import (
     classify_precipitation_quality,
     has_on_station_precipitation,
 )
-from asos_parquet.contracts import NormalizedObservation, ObservationQuality, Variable
+from asos_parquet.capabilities import derive_daily_capabilities
+from asos_parquet.contracts import (
+    CapabilityState,
+    NormalizedObservation,
+    ObservationQuality,
+    Variable,
+)
 from tests.test_iem_precip import observation
 
 
@@ -103,3 +109,31 @@ def test_classifier_scaling_is_not_quadratic() -> None:
     large = perf_counter() - start
 
     assert large < small * 3.5
+
+
+def test_dead_gauge_is_degraded_with_sparse_rain_hours() -> None:
+    records: list[NormalizedObservation] = []
+    for hour in range(24):
+        records.append(observation(hour, Variable.PRECIPITATION_AMOUNT, 0.0))
+        if hour in {1, 2, 3, 4}:
+            records.append(observation(hour, Variable.PRESENT_WEATHER, "RA"))
+
+    classified = classify_precipitation_quality(records)
+    capabilities = derive_daily_capabilities(
+        classified,
+        [Variable.PRECIPITATION_AMOUNT],
+    )
+
+    assert (
+        sum(
+            item.quality is ObservationQuality.SUSPECT
+            for item in classified
+            if item.variable is Variable.PRECIPITATION_AMOUNT
+        )
+        == 4
+    )
+    assert len(capabilities) == 1
+    assert capabilities[0].state is CapabilityState.DEGRADED
+    assert capabilities[0].expected_count == 24
+    assert capabilities[0].accepted_count == 20
+    assert capabilities[0].reason == "present_weather_contradicts_zero"
