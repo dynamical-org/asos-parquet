@@ -9,7 +9,7 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
-from .config import ALL_COUNTRIES, CANADIAN_PROVINCES, DATA_FIELDS, US_STATES
+from .config import ALL_COUNTRIES, CANADIAN_PROVINCES, LEGACY_DATA_FIELDS, US_STATES
 
 # All valid region codes (US states + Canadian provinces + international country codes)
 ALL_REGION_CODES = set(US_STATES) | set(CANADIAN_PROVINCES) | set(ALL_COUNTRIES)
@@ -86,7 +86,8 @@ REQUIRED_COLUMNS = [
     "latitude",
     "state",
     "geometry",
-] + DATA_FIELDS
+] + LEGACY_DATA_FIELDS
+OBS_V1_REQUIRED_COLUMNS = [*REQUIRED_COLUMNS, "wxcodes"]
 
 # Physical bounds for weather variables
 PHYSICAL_BOUNDS = {
@@ -120,9 +121,11 @@ US_BBOX = {
 }
 
 
-def validate_schema(gdf: gpd.GeoDataFrame) -> ValidationResult:
+def validate_schema(
+    gdf: gpd.GeoDataFrame, required_columns: list[str] = REQUIRED_COLUMNS
+) -> ValidationResult:
     """Validate that all required columns exist."""
-    missing = [col for col in REQUIRED_COLUMNS if col not in gdf.columns]
+    missing = [col for col in required_columns if col not in gdf.columns]
 
     if missing:
         return ValidationResult(
@@ -135,7 +138,7 @@ def validate_schema(gdf: gpd.GeoDataFrame) -> ValidationResult:
     return ValidationResult(
         name="schema_columns",
         passed=True,
-        message=f"All {len(REQUIRED_COLUMNS)} required columns present",
+        message=f"All {len(required_columns)} required columns present",
         details={"columns": list(gdf.columns)},
     )
 
@@ -743,6 +746,7 @@ def validate_geoparquet(
     expected_stations: pd.DataFrame | None = None,
     year: int | None = None,
     us_only: bool = True,
+    schema_version: str = "legacy",
 ) -> ValidationReport:
     """Run all validation checks on a geoparquet file.
 
@@ -758,6 +762,9 @@ def validate_geoparquet(
         ValidationReport with all check results
     """
     path = Path(path)
+    if schema_version not in {"legacy", "obs-v1"}:
+        raise ValueError(f"Unknown schema version: {schema_version!r}")
+
     report = ValidationReport(path=str(path))
 
     # Check file exists
@@ -795,7 +802,10 @@ def validate_geoparquet(
     # Run all validation checks
     report.results.extend(
         [
-            validate_schema(gdf),
+            validate_schema(
+                gdf,
+                OBS_V1_REQUIRED_COLUMNS if schema_version == "obs-v1" else REQUIRED_COLUMNS,
+            ),
             validate_geometry(gdf),
             validate_timestamps(gdf),
             validate_physical_bounds(gdf),

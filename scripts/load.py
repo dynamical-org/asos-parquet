@@ -28,11 +28,10 @@ load_dotenv()
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from asos_parquet.config import US_STATES, get_all_network_ids  # noqa: E402
+from asos_parquet.config import OBS_DATASET_START_YEAR, US_STATES, get_all_network_ids  # noqa: E402
 from asos_parquet.load import load_year, update_year  # noqa: E402
 from asos_parquet.partitioned import DEFAULT_DATASET_PATH  # noqa: E402
 from asos_parquet.progress import (  # noqa: E402
-    DEFAULT_PROGRESS_PATH,
     load_progress,
     save_progress,
 )
@@ -41,7 +40,8 @@ from asos_parquet.validation import validate_geoparquet  # noqa: E402
 
 # Constants
 LOG_DIR = Path("logs")
-FIRST_YEAR = 1940  # First year with significant ASOS data
+FIRST_YEAR = OBS_DATASET_START_YEAR
+PROGRESS_PATH = DEFAULT_DATASET_PATH / "progress.json"
 
 
 def setup_logging() -> Path:
@@ -92,6 +92,7 @@ def validate_year_data(
 
     report = validate_geoparquet(
         partition_path,
+        schema_version="obs-v1",
         min_records=1000,  # Lower threshold for early years
         min_stations=10,
         expected_stations=stations,
@@ -155,6 +156,11 @@ def run_load(
 
     current_year = pd.Timestamp.now("UTC").year
 
+    if year is not None and year < OBS_DATASET_START_YEAR:
+        raise ValueError(f"obs-parquet v1 starts in {OBS_DATASET_START_YEAR}, got {year}")
+    if start_year is not None and start_year < OBS_DATASET_START_YEAR:
+        raise ValueError(f"obs-parquet v1 starts in {OBS_DATASET_START_YEAR}, got {start_year}")
+
     # Determine years to process
     if year is not None:
         years_to_process = [year]
@@ -166,7 +172,7 @@ def run_load(
         print(f"Loading years {start_year}-{current_year} ({len(years_to_process)} years)")
 
     # Load progress
-    progress = load_progress()
+    progress = load_progress(PROGRESS_PATH)
 
     if resume and year is None:
         # Filter to incomplete years, but always include current year for updates
@@ -214,7 +220,7 @@ def run_load(
         progress.mark_in_progress(year)
         if year == current_year:
             progress.mark_current_year(year)
-        save_progress(progress)
+        save_progress(progress, PROGRESS_PATH)
 
         # Load or update the year
         # For current year with --resume, do incremental update from last observation
@@ -269,7 +275,7 @@ def run_load(
                 temporal_completeness_pct=metrics.temporal_completeness_pct if metrics else None,
                 median_obs_per_day=metrics.median_obs_per_day if metrics else None,
             )
-            save_progress(progress)
+            save_progress(progress, PROGRESS_PATH)
 
             total_records += result.records
             successful_years += 1
@@ -277,7 +283,7 @@ def run_load(
             print(f"FAILED: {result.error}")
             logging.error(f"Year {year} failed: {result.error}")
             progress.mark_failed(year, result.error or "Unknown error")
-            save_progress(progress)
+            save_progress(progress, PROGRESS_PATH)
             failed_years += 1
 
     # Final summary
@@ -288,7 +294,7 @@ def run_load(
     print(f"Failed years: {failed_years}")
     print(f"Total records: {total_records:,}")
     print(f"Output: {DEFAULT_DATASET_PATH}")
-    print(f"Progress: {DEFAULT_PROGRESS_PATH}")
+    print(f"Progress: {PROGRESS_PATH}")
 
     logging.info("=" * 60)
     logging.info("LOAD COMPLETE")

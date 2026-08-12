@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import os  # noqa: E402
 
-from asos_parquet.config import DATA_FIELDS  # noqa: E402
+from asos_parquet.config import DATA_FIELDS, LEGACY_DATA_FIELDS  # noqa: E402
 from asos_parquet.load import STATION_METADATA_COLUMNS  # noqa: E402
 from asos_parquet.stations import fetch_all_stations  # noqa: E402
 from asos_parquet.validation import (  # noqa: E402
@@ -38,14 +38,21 @@ from asos_parquet.validation import (  # noqa: E402
     validate_geoparquet,
 )
 
-EXPECTED_COLUMNS = sorted(
+LEGACY_EXPECTED_COLUMNS = sorted(
+    ["station", "valid", "longitude", "latitude", "state", "geometry"]
+    + LEGACY_DATA_FIELDS
+    + STATION_METADATA_COLUMNS
+)
+OBS_V1_EXPECTED_COLUMNS = sorted(
     ["station", "valid", "longitude", "latitude", "state", "geometry"]
     + DATA_FIELDS
     + STATION_METADATA_COLUMNS
 )
 
 
-def check_schema_s3(s3, bucket: str, prefix: str, years: list[str]) -> int:
+def check_schema_s3(
+    s3, bucket: str, prefix: str, years: list[str], expected_columns: list[str]
+) -> int:
     """Check that all expected columns are present by reading parquet metadata only."""
     from pyarrow.fs import S3FileSystem
 
@@ -66,7 +73,7 @@ def check_schema_s3(s3, bucket: str, prefix: str, years: list[str]) -> int:
             file_size = fs.get_file_info(s3_path).size / 1024 / 1024
 
             columns = set(schema.names)
-            expected = set(EXPECTED_COLUMNS)
+            expected = set(expected_columns)
             missing = expected - columns
             extra = columns - expected
 
@@ -122,6 +129,7 @@ def download_and_validate(
     stations,
     verbose: bool = False,
     us_only: bool = True,
+    schema_version: str = "legacy",
 ) -> ValidationReport:
     """Download a partition from S3 and validate it."""
     print(f"\nValidating s3://{bucket}/{s3_key}...", end=" ", flush=True)
@@ -145,6 +153,7 @@ def download_and_validate(
 
     report = validate_geoparquet(
         local_path,
+        schema_version=schema_version,
         min_records=100_000,
         min_stations=100,
         expected_stations=stations,
@@ -196,6 +205,12 @@ def main():
         action="store_true",
         help="Only check that all expected columns are present (fast, no full download)",
     )
+    parser.add_argument(
+        "--schema-version",
+        choices=("legacy", "obs-v1"),
+        default="legacy",
+        help="Dataset schema to validate (default: legacy)",
+    )
     args = parser.parse_args()
 
     if args.global_mode:
@@ -231,8 +246,11 @@ def main():
     # Schema-only mode: just check columns are present
     if args.schema_only:
         print(f"\nChecking schema for {len(years)} partitions...")
-        print(f"Expected columns: {EXPECTED_COLUMNS}\n")
-        failed = check_schema_s3(s3, bucket, prefix, years)
+        expected_columns = (
+            LEGACY_EXPECTED_COLUMNS if args.schema_version == "legacy" else OBS_V1_EXPECTED_COLUMNS
+        )
+        print(f"Expected columns: {expected_columns}\n")
+        failed = check_schema_s3(s3, bucket, prefix, years, expected_columns)
         print(f"\n{len(years) - failed}/{len(years)} passed")
         return 0 if failed == 0 else 1
 
@@ -259,6 +277,7 @@ def main():
                 stations=stations,
                 verbose=args.verbose,
                 us_only=args.us_only,
+                schema_version=args.schema_version,
             )
             all_reports.append(report)
 

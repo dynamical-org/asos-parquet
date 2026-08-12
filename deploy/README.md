@@ -40,7 +40,7 @@ modal secret create source-coop-asos-s3 \
     ASOS_AWS_SESSION_TOKEN=your_session_token \
     ASOS_AWS_DEFAULT_REGION=us-east-1 \
     ASOS_S3_BUCKET=your-bucket-name \
-    ASOS_S3_PREFIX=asos
+    OBS_S3_PREFIX=obs-parquet/v1
 
 # 4. Create the observability secret (see Monitoring below)
 modal secret create sentry-asos-parquet \

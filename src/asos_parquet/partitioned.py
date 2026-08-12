@@ -1,8 +1,7 @@
 """Partitioned geoparquet operations for efficient cloud storage.
 
 Uses yearly partitioning for optimal browser access:
-- data/asos/year=2024/data.parquet
-- data/asos/year=2025/data.parquet
+- data/obs-parquet/v1/year=2026/data.parquet
 
 Yearly partitions minimize HTTP requests while maintaining reasonable file sizes.
 Data is sorted by station then timestamp for efficient predicate pushdown.
@@ -14,10 +13,13 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
+from .config import OBS_DATASET_VERSION
+
 logger = logging.getLogger(__name__)
 
 # Directory structure
-DEFAULT_DATASET_PATH = Path("data/asos")
+LEGACY_DATASET_PATH = Path("data/asos")
+DEFAULT_DATASET_PATH = Path("data/obs-parquet") / OBS_DATASET_VERSION
 
 
 def read_dataset(

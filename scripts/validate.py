@@ -25,7 +25,7 @@ load_dotenv()
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from asos_parquet.partitioned import DEFAULT_DATASET_PATH  # noqa: E402
+from asos_parquet.partitioned import DEFAULT_DATASET_PATH, LEGACY_DATASET_PATH  # noqa: E402
 from asos_parquet.progress import load_progress, save_progress  # noqa: E402
 from asos_parquet.stations import fetch_all_stations  # noqa: E402
 from asos_parquet.validation import (  # noqa: E402
@@ -53,6 +53,7 @@ def validate_year(
     stations,
     verbose: bool = False,
     us_only: bool = True,
+    schema_version: str = "obs-v1",
 ) -> ValidationReport:
     """Validate a single year partition.
 
@@ -83,6 +84,7 @@ def validate_year(
 
     report = validate_geoparquet(
         partition_path,
+        schema_version=schema_version,
         min_records=100_000,
         min_stations=100,
         expected_stations=stations,
@@ -168,6 +170,7 @@ def main():
         args.us_only = False
 
     base_path = Path(args.path)
+    schema_version = "legacy" if base_path == LEGACY_DATASET_PATH else "obs-v1"
 
     # Check if directory exists
     if not base_path.exists():
@@ -201,7 +204,12 @@ def main():
     for year_str in years:
         year = int(year_str)
         report = validate_year(
-            year, base_path, stations, verbose=args.verbose, us_only=args.us_only
+            year,
+            base_path,
+            stations,
+            verbose=args.verbose,
+            us_only=args.us_only,
+            schema_version=schema_version,
         )
         all_reports.append(report)
 
@@ -238,7 +246,7 @@ def main():
     # Update progress.json if requested
     if args.update_progress:
         print("\nUpdating progress.json...")
-        progress = load_progress()
+        progress = load_progress(base_path / "progress.json")
         updated_count = 0
 
         for report in all_reports:
@@ -266,7 +274,7 @@ def main():
 
             updated_count += 1
 
-        save_progress(progress)
+        save_progress(progress, base_path / "progress.json")
         print(f"  Updated {updated_count} years in progress.json")
 
     return 0 if failed == 0 else 1

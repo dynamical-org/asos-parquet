@@ -7,6 +7,7 @@ import pytest
 from shapely.geometry import Point
 
 from asos_parquet.validation import (
+    OBS_V1_REQUIRED_COLUMNS,
     ValidationReport,
     validate_geometry,
     validate_geoparquet,
@@ -18,8 +19,8 @@ from asos_parquet.validation import (
     validate_record_count,
     validate_region_codes,
     validate_schema,
-    validate_station_count,
     validate_states,
+    validate_station_count,
     validate_timestamps,
     validate_us_locations,
 )
@@ -77,6 +78,11 @@ class TestValidateSchema:
         assert "Missing" in result.message
         assert "tmpf" in result.details["missing"]
         assert "station" in result.details["missing"]
+
+    def test_obs_v1_requires_present_weather(self, valid_gdf: gpd.GeoDataFrame):
+        result = validate_schema(valid_gdf, OBS_V1_REQUIRED_COLUMNS)
+        assert result.passed is False
+        assert result.details["missing"] == ["wxcodes"]
 
 
 class TestValidateGeometry:

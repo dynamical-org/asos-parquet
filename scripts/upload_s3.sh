@@ -14,7 +14,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-DATA_DIR="$PROJECT_DIR/data/asos"
+DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/obs-parquet/v1}"
 
 # Load .env if it exists
 if [ -f "$PROJECT_DIR/.env" ]; then
@@ -22,7 +22,7 @@ if [ -f "$PROJECT_DIR/.env" ]; then
 fi
 
 # Defaults
-S3_PREFIX="${S3_PREFIX:-asos}"
+S3_PREFIX="${OBS_S3_PREFIX:-obs-parquet/v1}"
 S3_PREFIX="${S3_PREFIX%/}"
 DRY_RUN=""
 YEAR=""
