@@ -1,4 +1,5 @@
 import argparse
+from collections.abc import Sequence
 from datetime import datetime
 from hashlib import sha256
 from json import loads
@@ -26,35 +27,39 @@ def _timestamp(value: str) -> datetime:
     return parsed
 
 
-def load_payloads(path: Path) -> list[SwobRawPayload]:
-    entries: list[ManifestEntry] = loads(path.read_text())
+def load_payloads(paths: Sequence[Path]) -> list[SwobRawPayload]:
     payloads: list[SwobRawPayload] = []
-    for entry in entries:
-        data = Path(entry["path"]).read_bytes()
-        digest = sha256(data).hexdigest()
-        if digest != entry["sha256"]:
-            raise ValueError(f"Manifest digest mismatch for {entry['path']}")
-        published = entry.get("source_published_at")
-        payloads.append(
-            SwobRawPayload(
-                raw=RawObjectRef(
-                    source="msc-swob",
-                    uri=entry["uri"],
-                    sha256=digest,
-                    ingested_at=_timestamp(entry["ingested_at"]),
-                    source_published_at=None if published is None else _timestamp(published),
-                ),
-                data=data,
-                network=entry["network"],
-                media_type=entry["media_type"],
+    for path in paths:
+        entries: list[ManifestEntry] = loads(path.read_text())
+        for entry in entries:
+            payload_path = Path(entry["path"])
+            if not payload_path.is_absolute():
+                payload_path = path.parent / payload_path
+            data = payload_path.read_bytes()
+            digest = sha256(data).hexdigest()
+            if digest != entry["sha256"]:
+                raise ValueError(f"Manifest digest mismatch for {payload_path}")
+            published = entry.get("source_published_at")
+            payloads.append(
+                SwobRawPayload(
+                    raw=RawObjectRef(
+                        source="msc-swob",
+                        uri=entry["uri"],
+                        sha256=digest,
+                        ingested_at=_timestamp(entry["ingested_at"]),
+                        source_published_at=None if published is None else _timestamp(published),
+                    ),
+                    data=data,
+                    network=entry["network"],
+                    media_type=entry["media_type"],
+                )
             )
-        )
     return payloads
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = rebuild_swob_2026(load_payloads(args.manifest), args.output)
