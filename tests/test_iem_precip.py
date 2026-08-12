@@ -181,7 +181,7 @@ def test_labeled_iem_fixture_has_no_classification_errors() -> None:
 
     metrics = evaluate_precipitation_classifier(predicted, labels)
 
-    assert metrics.sample_count == 12
+    assert metrics.sample_count == 15
     assert metrics.false_positive_count == 0
     assert metrics.false_negative_count == 0
     assert metrics.false_positive_rate == 0.0

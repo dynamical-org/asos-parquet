@@ -1,12 +1,15 @@
 import re
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from ..contracts import NormalizedObservation, ObservationQuality, Variable
 
-_PRECIPITATION_PHENOMENA = re.compile(r"DZ|RA|SN|SG|IC|PL|GR|GS|UP")
+_PRECIPITATION_PHENOMENA = re.compile(r"(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP)+")
+_DESCRIPTORS = {"MI", "BC", "PR", "DR", "BL", "SH", "TS", "FZ"}
+_NON_FALLING_DESCRIPTORS = {"DR", "BL"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,13 +22,18 @@ class PrecipitationClassifierMetrics:
 
 
 def has_on_station_precipitation(weather_code: str) -> bool:
-    tokens = weather_code.upper().split()
-    return any(
-        "VC" not in token
-        and not token.lstrip("+-").startswith("RE")
-        and _PRECIPITATION_PHENOMENA.search(token) is not None
-        for token in tokens
-    )
+    for token in weather_code.upper().split():
+        phenomenon = token.lstrip("+-")
+        if "VC" in phenomenon or phenomenon.startswith("RE"):
+            continue
+        descriptor = phenomenon[:2] if phenomenon[:2] in _DESCRIPTORS else None
+        if descriptor in _NON_FALLING_DESCRIPTORS:
+            continue
+        if descriptor is not None:
+            phenomenon = phenomenon[2:]
+        if _PRECIPITATION_PHENOMENA.fullmatch(phenomenon):
+            return True
+    return False
 
 
 def classify_precipitation_quality(
@@ -39,40 +47,48 @@ def classify_precipitation_quality(
     if evidence_window <= timedelta(0):
         raise ValueError("evidence_window must be positive")
     records = list(observations)
-    weather_by_station: dict[str, list[NormalizedObservation]] = defaultdict(list)
-    for item in records:
+    active = _latest_revisions(records)
+    weather_times: dict[str, list[datetime]] = defaultdict(list)
+    nonzero_times: dict[str, list[datetime]] = defaultdict(list)
+    zero_accumulations: list[NormalizedObservation] = []
+    for item in active.values():
         if (
             item.variable is Variable.PRESENT_WEATHER
             and isinstance(item.value, str)
             and has_on_station_precipitation(item.value)
         ):
-            weather_by_station[item.station_id].append(item)
+            weather_times[item.station_id].append(item.observed_at)
+        elif _is_zero_accumulation(item):
+            zero_accumulations.append(item)
+        elif _is_nonzero_accumulation(item):
+            nonzero_times[item.station_id].append(item.observed_at)
+    for times in (*weather_times.values(), *nonzero_times.values()):
+        times.sort()
 
-    contradictions: list[NormalizedObservation] = []
-    for item in records:
-        if not _is_zero_accumulation(item):
-            continue
+    contradictions: dict[str, list[datetime]] = defaultdict(list)
+    for item in zero_accumulations:
         period = item.period or timedelta(hours=1)
-        period_start = item.observed_at - period
-        if any(
-            period_start < weather.observed_at <= item.observed_at
-            for weather in weather_by_station[item.station_id]
-        ):
-            contradictions.append(item)
+        times = weather_times[item.station_id]
+        if bisect_right(times, item.observed_at - period) < bisect_right(times, item.observed_at):
+            contradictions[item.station_id].append(item.observed_at)
+    for times in contradictions.values():
+        times.sort()
 
-    suspect_ids = {
-        item.revision_id
-        for item in contradictions
-        if sum(
-            other.station_id == item.station_id
-            and abs(other.observed_at - item.observed_at) <= evidence_window
-            for other in contradictions
-        )
-        >= minimum_contradictions
-    }
+    suspect_hours: set[tuple[str, datetime]] = set()
+    for station_id, times in contradictions.items():
+        gauge_times = nonzero_times[station_id]
+        for observed_at in times:
+            start = observed_at - evidence_window
+            end = observed_at + evidence_window
+            contradiction_count = bisect_right(times, end) - bisect_left(times, start)
+            gauge_count = bisect_right(gauge_times, end) - bisect_left(gauge_times, start)
+            if contradiction_count >= minimum_contradictions and gauge_count == 0:
+                suspect_hours.add((station_id, observed_at))
+
     classified: list[NormalizedObservation] = []
     for item in records:
-        if item.revision_id not in suspect_ids:
+        key = (item.station_id, item.observed_at)
+        if not _is_zero_accumulation(item) or key not in suspect_hours:
             classified.append(item)
             continue
         reason = "present_weather_contradicts_zero"
@@ -82,11 +98,29 @@ def classify_precipitation_quality(
     return classified
 
 
+def _latest_revisions(
+    observations: Sequence[NormalizedObservation],
+) -> dict[str, NormalizedObservation]:
+    latest: dict[str, NormalizedObservation] = {}
+    for observation in observations:
+        latest[observation.source_record_id] = observation
+    return latest
+
+
 def _is_zero_accumulation(observation: NormalizedObservation) -> bool:
     return (
         observation.variable is Variable.PRECIPITATION_AMOUNT
         and observation.value == 0.0
         and not observation.is_trace
+        and observation.quality is ObservationQuality.ACCEPTED
+    )
+
+
+def _is_nonzero_accumulation(observation: NormalizedObservation) -> bool:
+    return (
+        observation.variable is Variable.PRECIPITATION_AMOUNT
+        and isinstance(observation.value, float)
+        and observation.value > 0.0
         and observation.quality is ObservationQuality.ACCEPTED
     )
 

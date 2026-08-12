@@ -46,20 +46,22 @@ manifest is idempotent. Add newly archived payloads to advance the explicit
 #### IEM hourly precipitation quality
 
 IEM `p01m` is normalized as a one-hour accumulation. Zero accumulations are marked suspect,
-not removed, when at least two zero reports within 24 hours are each contradicted by an
-on-station precipitation METAR code during their accumulation hour. `VC` weather, recent-weather
+not removed, when at least two distinct zero-report hours within 24 hours are each contradicted by
+an on-station precipitation METAR code during their accumulation hour and there is no nonzero
+gauge report in that window. `VC` weather, recent-weather
 groups, fog, mist, and other obscurations are excluded. Trace remains an accepted zero with
 `is_trace=true`; missing precipitation remains missing.
 
 The threshold is deliberately conservative because present weather is supporting evidence, not
 proof of an accumulation amount. The checked-in labeled regression fixture covers a working US
-gauge, repeated international false zeros, trace, vicinity-only weather, fog/mist, and a single
-unconfirmed contradiction. At the selected threshold it measures:
+gauge, repeated international false zeros, trace, vicinity-only weather, fog/mist, a single
+unconfirmed contradiction, and two short-shower zeros from a gauge with nonzero evidence. At the
+selected threshold it measures:
 
-- false-positive rate: 0/10 (0%)
+- false-positive rate: 0/13 (0%)
 - false-negative rate: 0/2 (0%)
 
-These are exact results for 12 hand-labeled regression cases, not an estimate of production error
+These are exact results for 15 hand-labeled regression cases, not an estimate of production error
 rates. Broader station-season labels are required before lowering the threshold or rejecting data.
 
 ### Full history for a station
