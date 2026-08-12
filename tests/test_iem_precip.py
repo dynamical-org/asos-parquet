@@ -10,7 +10,9 @@ from asos_parquet.adapters.iem_precip import (
     evaluate_precipitation_classifier,
     has_on_station_precipitation,
 )
+from asos_parquet.capabilities import derive_daily_capabilities
 from asos_parquet.contracts import (
+    CapabilityState,
     NormalizedObservation,
     ObservationQuality,
     ObservationStatistic,
@@ -134,6 +136,23 @@ def test_classifier_recovers_after_contradictions_stop() -> None:
         ObservationQuality.SUSPECT,
         ObservationQuality.ACCEPTED,
     ]
+
+    capabilities = derive_daily_capabilities(
+        classified,
+        [Variable.PRECIPITATION_AMOUNT],
+    )
+    precipitation_capabilities = [
+        item for item in capabilities if item.variable is Variable.PRECIPITATION_AMOUNT
+    ]
+
+    assert [item.state for item in precipitation_capabilities] == [
+        CapabilityState.DEGRADED,
+        CapabilityState.PRESENT,
+    ]
+    assert precipitation_capabilities[0].valid_from == datetime(2026, 1, 1, tzinfo=UTC)
+    assert precipitation_capabilities[0].valid_to == datetime(2026, 1, 2, tzinfo=UTC)
+    assert precipitation_capabilities[1].valid_from == datetime(2026, 1, 3, tzinfo=UTC)
+    assert precipitation_capabilities[1].valid_to == datetime(2026, 1, 4, tzinfo=UTC)
 
 
 def test_fixture_evaluation_reports_measured_error_rates() -> None:
