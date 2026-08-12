@@ -23,6 +23,8 @@ SWOB_VARIABLES = (
     Variable.WIND_SPEED,
     Variable.WIND_GUST,
 )
+XML_MEDIA_TYPES = {"application/xml", "text/xml"}
+STATION_LIST_MEDIA_TYPES = {"text/csv"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,14 +46,21 @@ class SwobRebuildResult:
     as_of: datetime
 
 
+def _normalized_media_type(value: str) -> str:
+    return value.split(";", maxsplit=1)[0].strip().lower()
+
+
 def _archive(payload: SwobRawPayload, raw_dir: Path) -> RawObjectManifest:
+    media_type = _normalized_media_type(payload.media_type)
+    if media_type not in XML_MEDIA_TYPES | STATION_LIST_MEDIA_TYPES:
+        raise ValueError(f"Unsupported SWOB media type: {payload.media_type!r}")
     digest = sha256(payload.data).hexdigest()
     if digest != payload.raw.sha256:
         raise ValueError(
             f"Raw payload digest mismatch for {payload.raw.uri}: "
             f"expected {payload.raw.sha256}, got {digest}"
         )
-    suffix = ".xml" if payload.media_type == "application/xml" else ".csv"
+    suffix = ".xml" if media_type in XML_MEDIA_TYPES else ".csv"
     path = raw_dir / f"{digest}{suffix}"
     if path.exists() and path.read_bytes() != payload.data:
         raise ValueError(f"Archived raw object changed: {path}")
@@ -60,7 +69,7 @@ def _archive(payload: SwobRawPayload, raw_dir: Path) -> RawObjectManifest:
     return RawObjectManifest(
         raw=payload.raw,
         size_bytes=len(payload.data),
-        media_type=payload.media_type,
+        media_type=media_type,
         attribution_source="msc-swob",
     )
 
@@ -92,31 +101,36 @@ def rebuild_swob_2026(
             raise ValueError(
                 f"SWOB rebuild manifest drops previously recorded raw objects: {sorted(dropped)}"
             )
+
+    canonical_payloads: dict[str, SwobRawPayload] = {}
+    for payload in ordered:
+        canonical_payloads.setdefault(payload.raw.sha256, payload)
+
     manifests: dict[str, RawObjectManifest] = {}
     observations: list[NormalizedObservation] = []
     latest_revision: dict[str, str] = {}
-    emitted_revisions: set[str] = set()
-    networks_by_digest: dict[str, str] = {}
-
-    for payload in ordered:
+    network_by_digest: dict[str, str] = {}
+    observation_networks: set[str] = set()
+    for digest, payload in canonical_payloads.items():
         manifest = _archive(payload, raw_dir)
-        manifests.setdefault(payload.raw.sha256, manifest)
-        networks_by_digest[payload.raw.sha256] = payload.network
-        if payload.media_type != "application/xml":
+        manifests[digest] = manifest
+        network_by_digest[digest] = payload.network
+        media_type = _normalized_media_type(payload.media_type)
+        if media_type not in XML_MEDIA_TYPES:
             continue
+        observation_networks.add(payload.network)
         for observation in normalize_swob(payload.data, payload.raw):
-            if observation.observed_at.year != OBS_DATASET_START_YEAR:
+            if observation.observed_at.year < OBS_DATASET_START_YEAR:
                 raise ValueError(
-                    f"SWOB obs-parquet target is {OBS_DATASET_START_YEAR}, "
+                    f"SWOB obs-parquet starts in {OBS_DATASET_START_YEAR}, "
                     f"got {observation.observed_at!r}"
                 )
+            if observation.observed_at.year > OBS_DATASET_START_YEAR:
+                continue
             revision_id = sha256(
                 f"{observation.revision_id}:{payload.raw.sha256}:"
                 f"{payload.raw.ingested_at.isoformat()}".encode()
             ).hexdigest()
-            if revision_id in emitted_revisions:
-                continue
-            emitted_revisions.add(revision_id)
             linked = replace(
                 observation,
                 revision_id=revision_id,
@@ -128,7 +142,6 @@ def rebuild_swob_2026(
     capabilities = derive_daily_capabilities(observations, SWOB_VARIABLES)
     normalized_path = output_dir / "normalized.parquet"
     capabilities_path = output_dir / "capabilities.parquet"
-    manifests_path = output_dir / "raw-manifests.parquet"
     watermark_path = output_dir / "watermark.json"
     write_normalized(observations, normalized_path)
     write_capabilities(capabilities, capabilities_path)
@@ -136,11 +149,22 @@ def rebuild_swob_2026(
 
     network_observations: dict[str, list[NormalizedObservation]] = defaultdict(list)
     for observation in observations:
-        network_observations[networks_by_digest[observation.raw.sha256]].append(observation)
+        network_observations[network_by_digest[observation.raw.sha256]].append(observation)
     network_watermarks: dict[str, dict[str, object]] = {}
-    for network, records in sorted(network_observations.items()):
+    for network in sorted(observation_networks):
+        records = network_observations[network]
+        if not records:
+            network_watermarks[network] = {
+                "latest_observed_at": None,
+                "latest_available_at": None,
+                "publication_latency_seconds": None,
+                "source_gap": True,
+                "observation_count": 0,
+            }
+            continue
         latest_observed_at = max(item.observed_at for item in records)
-        latest_available_at = max(item.available_at for item in records)
+        freshest = [item for item in records if item.observed_at == latest_observed_at]
+        latest_available_at = max(item.available_at for item in freshest)
         network_watermarks[network] = {
             "latest_observed_at": latest_observed_at.astimezone(UTC).isoformat(),
             "latest_available_at": latest_available_at.astimezone(UTC).isoformat(),

@@ -58,7 +58,8 @@ def test_rebuild_archives_raw_replays_and_emits_capabilities(tmp_path: Path) -> 
     partner_dewpoint = next(
         item
         for item in capabilities
-        if item.source_station_id == "ON-MNRF-AFFES_GAL" and item.variable is Variable.DEW_POINT
+        if item.source_station_id == "ON-MNR-AFFES:msc_id:ON-MNRF-AFFES_GAL"
+        and item.variable is Variable.DEW_POINT
     )
     assert partner_dewpoint.state is CapabilityState.ABSENT
 
@@ -98,7 +99,7 @@ def test_freshness_watermark_exposes_latency_and_source_gap(tmp_path: Path) -> N
     assert network["source_gap"] is False
 
 
-def test_rejects_non_2026_payload_and_digest_mismatch(tmp_path: Path) -> None:
+def test_rejects_digest_mismatch(tmp_path: Path) -> None:
     payload = _payload("swob_core.xml", "MSC")
     old = SwobRawPayload(
         raw=payload.raw,

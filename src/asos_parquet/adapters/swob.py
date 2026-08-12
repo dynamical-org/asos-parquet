@@ -27,28 +27,60 @@ class _Mapping:
 
 VARIABLE_MAPPINGS = {
     "air_temp": _Mapping(
-        Variable.AIR_TEMPERATURE, "degree_Celsius", ObservationStatistic.INSTANTANEOUS
+        Variable.AIR_TEMPERATURE,
+        "degree_Celsius",
+        ObservationStatistic.INSTANTANEOUS,
     ),
-    "dwpt_temp": _Mapping(Variable.DEW_POINT, "degree_Celsius", ObservationStatistic.INSTANTANEOUS),
-    "rel_hum": _Mapping(Variable.RELATIVE_HUMIDITY, "percent", ObservationStatistic.INSTANTANEOUS),
-    "rnfl_amt_pst1hr": _Mapping(
-        Variable.PRECIPITATION_AMOUNT, "mm", ObservationStatistic.SUM, timedelta(hours=1)
+    "dwpt_temp": _Mapping(
+        Variable.DEW_POINT,
+        "degree_Celsius",
+        ObservationStatistic.INSTANTANEOUS,
+    ),
+    "rel_hum": _Mapping(
+        Variable.RELATIVE_HUMIDITY,
+        "percent",
+        ObservationStatistic.INSTANTANEOUS,
     ),
     "pcpn_amt_pst1hr": _Mapping(
-        Variable.PRECIPITATION_AMOUNT, "mm", ObservationStatistic.SUM, timedelta(hours=1)
+        Variable.PRECIPITATION_AMOUNT,
+        "mm",
+        ObservationStatistic.SUM,
+        timedelta(hours=1),
     ),
-    "prsnt_wx_1": _Mapping(Variable.PRESENT_WEATHER, "1", ObservationStatistic.INSTANTANEOUS),
+    "rnfl_amt_pst1hr": _Mapping(
+        Variable.PRECIPITATION_AMOUNT,
+        "mm",
+        ObservationStatistic.SUM,
+        timedelta(hours=1),
+    ),
+    "prsnt_wx_1": _Mapping(
+        Variable.PRESENT_WEATHER,
+        "1",
+        ObservationStatistic.INSTANTANEOUS,
+    ),
     "avg_wnd_spd_10m_pst10mts": _Mapping(
-        Variable.WIND_SPEED, "km/h", ObservationStatistic.MEAN, timedelta(minutes=10)
+        Variable.WIND_SPEED,
+        "km/h",
+        ObservationStatistic.MEAN,
+        timedelta(minutes=10),
     ),
     "avg_wnd_dir_10m_pst10mts": _Mapping(
-        Variable.WIND_DIRECTION, "degree", ObservationStatistic.MEAN, timedelta(minutes=10)
-    ),
-    "max_wnd_spd_10m_pst10mts": _Mapping(
-        Variable.WIND_GUST, "km/h", ObservationStatistic.MAXIMUM, timedelta(minutes=10)
+        Variable.WIND_DIRECTION,
+        "degree",
+        ObservationStatistic.MEAN,
+        timedelta(minutes=10),
     ),
     "max_wnd_gst_spd_10m_pst10mts": _Mapping(
-        Variable.WIND_GUST, "km/h", ObservationStatistic.MAXIMUM, timedelta(minutes=10)
+        Variable.WIND_GUST,
+        "km/h",
+        ObservationStatistic.MAXIMUM,
+        timedelta(minutes=10),
+    ),
+    "max_wnd_spd_10m_pst10mts": _Mapping(
+        Variable.WIND_GUST,
+        "km/h",
+        ObservationStatistic.MAXIMUM,
+        timedelta(minutes=10),
     ),
 }
 
@@ -65,24 +97,28 @@ def _timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation]:
-    if raw.source != "msc-swob":
-        raise ValueError(f"Expected MSC SWOB raw object, got {raw.source!r}")
-    root = ElementTree.fromstring(data)
-    observation = root.find(f"{OM}member/{OM}Observation")
-    if observation is None:
-        raise ValueError("SWOB payload has no observation")
+def _station_identity(identity: dict[str, ElementTree.Element]) -> str:
+    provider_element = identity.get("data_pvdr")
+    provider = None if provider_element is None else provider_element.get("value")
+    if not provider:
+        raise ValueError("SWOB payload has no data provider")
+    for field in ("msc_id", "tc_id", "stn_id"):
+        element = identity.get(field)
+        value = None if element is None else element.get("value")
+        if value:
+            return f"{provider}:{field}:{value}"
+    raise ValueError("SWOB payload has no station identity")
 
+
+def _normalize_observation(
+    observation: ElementTree.Element,
+    raw: RawObjectRef,
+) -> list[NormalizedObservation]:
     identity = _elements(
         observation,
         f"{OM}metadata/{POINT}set/{POINT}identification-elements/{POINT}element",
     )
-    station = next(
-        (identity[name].get("value") for name in ("msc_id", "tc_id", "stn_id") if name in identity),
-        None,
-    )
-    if not station:
-        raise ValueError("SWOB payload has no station identity")
+    station = _station_identity(identity)
     observed_value = identity.get("date_tm")
     if observed_value is None or observed_value.get("value") is None:
         raise ValueError("SWOB payload has no observation time")
@@ -91,8 +127,7 @@ def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation
     available_at = observed_at
     if result_time is not None and result_time.text:
         available_at = max(observed_at, _timestamp(result_time.text))
-    if available_at > raw.ingested_at:
-        available_at = raw.ingested_at
+    available_at = min(available_at, raw.ingested_at)
 
     values = _elements(observation, f"{OM}result/{POINT}elements/{POINT}element")
     normalized: list[NormalizedObservation] = []
@@ -108,7 +143,10 @@ def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation
         if mapping.variable is Variable.PRESENT_WEATHER:
             value = source_value.strip()
         else:
-            value = float(source_value)
+            try:
+                value = float(source_value)
+            except ValueError:
+                continue
         qualifier = next(
             (
                 item.get("value")
@@ -123,6 +161,13 @@ def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation
             else ObservationQuality.SUSPECT
         )
         source_quality = None if qualifier is None else f"qa_summary:{qualifier}"
+        if observed_at > raw.ingested_at:
+            quality = ObservationQuality.SUSPECT
+            source_quality = (
+                "future_observation"
+                if source_quality is None
+                else f"{source_quality};future_observation"
+            )
         source_record_id = f"{station}:{observed_at.isoformat()}:{mapping.variable}"
         revision_id = sha256(
             dumps(
@@ -159,3 +204,13 @@ def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation
         )
         emitted.add(mapping.variable)
     return normalized
+
+
+def normalize_swob(data: bytes, raw: RawObjectRef) -> list[NormalizedObservation]:
+    if raw.source != "msc-swob":
+        raise ValueError(f"Expected MSC SWOB raw object, got {raw.source!r}")
+    root = ElementTree.fromstring(data)
+    members = root.findall(f"{OM}member/{OM}Observation")
+    if not members:
+        raise ValueError("SWOB payload has no observation")
+    return [item for member in members for item in _normalize_observation(member, raw)]

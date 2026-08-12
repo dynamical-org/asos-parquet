@@ -53,7 +53,9 @@ def test_normalizes_partner_identity_and_marks_nonpassing_qa_suspect() -> None:
     )
     observations = normalize_swob(data, _raw(data))
 
-    assert {item.source_station_id for item in observations} == {"ON-MNRF-AFFES_GAL"}
+    assert {item.source_station_id for item in observations} == {
+        "ON-MNR-AFFES:msc_id:ON-MNRF-AFFES_GAL"
+    }
     temperature = next(item for item in observations if item.variable is Variable.AIR_TEMPERATURE)
     assert temperature.quality is ObservationQuality.SUSPECT
     assert temperature.source_quality == "qa_summary:80"
