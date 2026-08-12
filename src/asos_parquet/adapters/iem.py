@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from hashlib import sha256
 from io import StringIO
@@ -132,6 +132,44 @@ VARIABLE_MAPPINGS = {
     ),
 }
 
+IEM_PHYSICAL_BOUNDS = {
+    Variable.AIR_TEMPERATURE: (-90.0, 60.0),
+    Variable.DEW_POINT: (-100.0, 60.0),
+    Variable.RELATIVE_HUMIDITY: (0.0, 100.0),
+    Variable.PRECIPITATION_AMOUNT: (0.0, 500.0),
+    Variable.WIND_DIRECTION: (0.0, 360.0),
+    Variable.WIND_SPEED: (0.0, 200.0),
+    Variable.WIND_GUST: (0.0, 200.0),
+}
+
+
+def classify_observations(
+    observations: list[NormalizedObservation],
+) -> list[NormalizedObservation]:
+    classified: list[NormalizedObservation] = []
+    for observation in observations:
+        bounds = IEM_PHYSICAL_BOUNDS.get(observation.variable)
+        if bounds is None or not isinstance(observation.value, float):
+            classified.append(observation)
+            continue
+        lower, upper = bounds
+        if lower <= observation.value <= upper:
+            classified.append(observation)
+            continue
+        reason = (
+            "physical_bounds"
+            if observation.source_quality is None
+            else f"{observation.source_quality};physical_bounds"
+        )
+        classified.append(
+            replace(
+                observation,
+                quality=ObservationQuality.SUSPECT,
+                source_quality=reason,
+            )
+        )
+    return classified
+
 
 def normalize_observations(
     text: str,
@@ -164,10 +202,7 @@ def normalize_observations(
             elif field == "wxcodes":
                 value = str(source_value).strip()
             else:
-                numeric_value = pd.to_numeric(source_value, errors="coerce")
-                if pd.isna(numeric_value):
-                    continue
-                value = float(numeric_value)
+                value = float(str(source_value))
 
             source_record_id = f"{station}:{observed_at.isoformat()}:{mapping.variable}"
             revision_payload = dumps(
@@ -215,4 +250,4 @@ def normalize_observations(
                 )
             )
 
-    return observations
+    return classify_observations(observations)

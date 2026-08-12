@@ -1,6 +1,11 @@
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .contracts import (
     CapabilityState,
@@ -129,3 +134,62 @@ def _compress(
                 continue
         compressed.append(item)
     return compressed
+
+
+CAPABILITY_SCHEMA = pa.schema(
+    [  # type: ignore[arg-type]
+        ("source", pa.string()),
+        ("source_station_id", pa.string()),
+        ("variable", pa.string()),
+        ("state", pa.string()),
+        ("valid_from", pa.timestamp("us", tz="UTC")),
+        ("valid_to", pa.timestamp("us", tz="UTC")),
+        ("expected_count", pa.int64()),
+        ("observed_count", pa.int64()),
+        ("accepted_count", pa.int64()),
+        ("reason", pa.string()),
+    ]
+)
+
+
+def write_capabilities(capabilities: Iterable[StationVariableCapability], path: Path) -> None:
+    rows = [
+        {
+            "source": item.source,
+            "source_station_id": item.source_station_id,
+            "variable": str(item.variable),
+            "state": str(item.state),
+            "valid_from": item.valid_from,
+            "valid_to": item.valid_to,
+            "expected_count": item.expected_count,
+            "observed_count": item.observed_count,
+            "accepted_count": item.accepted_count,
+            "reason": item.reason,
+        }
+        for item in capabilities
+    ]
+    if rows:
+        table = pa.Table.from_pandas(
+            pd.DataFrame(rows), schema=CAPABILITY_SCHEMA, preserve_index=False
+        )
+    else:
+        table = pa.Table.from_batches([], schema=CAPABILITY_SCHEMA)
+    pq.write_table(table, path, compression="zstd")
+
+
+def read_capabilities(path: Path) -> list[StationVariableCapability]:
+    return [
+        StationVariableCapability(
+            source=str(row["source"]),
+            source_station_id=str(row["source_station_id"]),
+            variable=Variable(str(row["variable"])),
+            state=CapabilityState(str(row["state"])),
+            valid_from=pd.Timestamp(row["valid_from"]).to_pydatetime(),
+            valid_to=pd.Timestamp(row["valid_to"]).to_pydatetime(),
+            expected_count=int(row["expected_count"]),
+            observed_count=int(row["observed_count"]),
+            accepted_count=int(row["accepted_count"]),
+            reason=str(row["reason"]),
+        )
+        for row in pd.read_parquet(path).to_dict("records")
+    ]

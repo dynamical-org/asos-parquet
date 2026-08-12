@@ -3,8 +3,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from asos_parquet.adapters.iem import normalize_observations, parse_observations
-from asos_parquet.contracts import ObservationStatistic, RawObjectRef, Variable
+from asos_parquet.adapters.iem import (
+    classify_observations,
+    normalize_observations,
+    parse_observations,
+)
+from asos_parquet.contracts import (
+    ObservationQuality,
+    ObservationStatistic,
+    RawObjectRef,
+    Variable,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -240,3 +249,40 @@ def test_iem_duplicate_revisions_are_deduplicated_and_corrections_are_linked() -
 
     assert len(temperatures) == 2
     assert temperatures[1].supersedes_revision_id == temperatures[0].revision_id
+
+
+def test_iem_physical_bounds_are_variable_specific() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="https://mesonet.agron.iastate.edu/bounds",
+        sha256="7" * 64,
+        ingested_at=datetime(2026, 8, 1, 3, tzinfo=UTC),
+    )
+    observations = normalize_observations(
+        "station,valid,tmpf,tmpc,relh,sknt\nKJFK,2026-08-01 02:00,572,300,50,10\n",
+        "%Y-%m-%d %H:%M",
+        raw,
+    )
+    by_variable = {item.variable: item for item in observations}
+
+    assert by_variable[Variable.AIR_TEMPERATURE].quality is ObservationQuality.SUSPECT
+    assert by_variable[Variable.AIR_TEMPERATURE].source_quality == "physical_bounds"
+    assert by_variable[Variable.RELATIVE_HUMIDITY].quality is ObservationQuality.ACCEPTED
+    assert by_variable[Variable.WIND_SPEED].quality is ObservationQuality.ACCEPTED
+
+
+def test_iem_classifier_preserves_existing_suspect_quality() -> None:
+    raw = RawObjectRef(
+        source="iem",
+        uri="https://mesonet.agron.iastate.edu/future-bounds",
+        sha256="6" * 64,
+        ingested_at=datetime(2026, 8, 1, 1, 59, tzinfo=UTC),
+    )
+    observations = normalize_observations(
+        "station,valid,tmpf,tmpc\nKJFK,2026-08-01 02:00,70,21.1\n",
+        "%Y-%m-%d %H:%M",
+        raw,
+    )
+
+    assert classify_observations(observations) == observations
+    assert observations[0].quality is ObservationQuality.SUSPECT

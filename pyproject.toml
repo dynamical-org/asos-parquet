@@ -44,7 +44,7 @@ select = ["E", "F", "I", "W"]
 
 [tool.mypy]
 strict = true
-files = ["src/asos_parquet/canonical.py", "src/asos_parquet/contracts.py", "tests/test_canonical.py", "src/asos_parquet/capabilities.py", "tests/test_capabilities.py"]
+files = ["src/asos_parquet/canonical.py", "src/asos_parquet/contracts.py", "tests/test_canonical.py", "src/asos_parquet/capabilities.py", "tests/test_capabilities.py", "src/asos_parquet/adapters/iem.py", "tests/test_iem.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

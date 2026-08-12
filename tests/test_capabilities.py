@@ -1,9 +1,14 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
-from asos_parquet.capabilities import derive_daily_capabilities
+from asos_parquet.capabilities import (
+    derive_daily_capabilities,
+    read_capabilities,
+    write_capabilities,
+)
 from asos_parquet.contracts import (
     CapabilityState,
     NormalizedObservation,
@@ -105,3 +110,23 @@ def test_suspect_values_degrade_only_their_variable() -> None:
 def test_capability_threshold_is_validated() -> None:
     with pytest.raises(ValueError, match="accepted_ratio_threshold"):
         derive_daily_capabilities([], [Variable.AIR_TEMPERATURE], 0)
+
+
+def test_capabilities_round_trip_with_fixed_schema(tmp_path: Path) -> None:
+    capabilities = derive_daily_capabilities(
+        [observation(1, 0, Variable.AIR_TEMPERATURE, "a")],
+        [Variable.AIR_TEMPERATURE, Variable.PRECIPITATION_AMOUNT],
+    )
+    path = tmp_path / "capabilities.parquet"
+
+    write_capabilities(capabilities, path)
+
+    assert read_capabilities(path) == capabilities
+
+
+def test_empty_capability_file_is_readable(tmp_path: Path) -> None:
+    path = tmp_path / "empty.parquet"
+
+    write_capabilities([], path)
+
+    assert read_capabilities(path) == []
