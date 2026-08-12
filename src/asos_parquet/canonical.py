@@ -1,5 +1,7 @@
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 
 import pandas as pd
@@ -87,16 +89,29 @@ def _write_frame(frame: pd.DataFrame, schema: pa.Schema, path: Path) -> None:
     pq.write_table(table, path, compression="zstd")
 
 
-def _assert_utc(value: datetime) -> None:
-    assert value.tzinfo is not None
-    assert value.utcoffset() == timedelta(0)
+def _require_utc(value: datetime) -> None:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError(f"Timestamp must be UTC-aware, got {value!r}")
 
 
 def normalized_to_frame(observations: Iterable[NormalizedObservation]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for observation in observations:
-        value_float = observation.value if isinstance(observation.value, float) else None
-        value_text = observation.value if isinstance(observation.value, str) else None
+        if isinstance(observation.value, bool):
+            raise ValueError("Boolean observation values are not supported")
+        if isinstance(observation.value, Real):
+            value_float = float(observation.value)
+            if not isfinite(value_float):
+                raise ValueError(f"Numeric observation value must be finite, got {value_float!r}")
+            value_text = None
+        elif isinstance(observation.value, str):
+            value_float = None
+            value_text = observation.value
+        elif observation.value is None:
+            value_float = None
+            value_text = None
+        else:
+            raise ValueError(f"Unsupported observation value type: {type(observation.value)!r}")
         rows.append(
             {
                 "station_id": observation.station_id,
@@ -188,7 +203,8 @@ def write_normalized(
     observations: Iterable[NormalizedObservation],
     path: Path,
 ) -> None:
-    _write_frame(normalized_to_frame(observations), NORMALIZED_SCHEMA, path)
+    ordered = sorted(observations, key=_canonical_sort_key)
+    _write_frame(normalized_to_frame(ordered), NORMALIZED_SCHEMA, path)
 
 
 def read_normalized(path: Path) -> list[NormalizedObservation]:
@@ -224,22 +240,36 @@ def select_canonical(
     as_of: datetime,
     source_precedence: Mapping[str, int],
 ) -> list[NormalizedObservation]:
-    _assert_utc(as_of)
+    """Select one active record per key; lower source rank wins.
+
+    Reproducing a snapshot requires the same pinned source_precedence mapping.
+    """
+    _require_utc(as_of)
     eligible = [
         observation
         for observation in observations
-        if observation.available_at <= as_of
-        and observation.raw.ingested_at <= as_of
+        if observation.raw.ingested_at <= as_of
         and observation.quality is not ObservationQuality.REJECTED
     ]
-    assert all(observation.raw.source in source_precedence for observation in eligible)
+    unknown_sources = {
+        observation.raw.source
+        for observation in eligible
+        if observation.raw.source not in source_precedence
+    }
+    if unknown_sources:
+        raise ValueError(f"Missing source precedence for: {sorted(unknown_sources)}")
 
     superseded = {
-        observation.supersedes_revision_id
+        (observation.raw.source, _canonical_key(observation), observation.supersedes_revision_id)
         for observation in eligible
         if observation.supersedes_revision_id is not None
     }
-    active = [observation for observation in eligible if observation.revision_id not in superseded]
+    active = [
+        observation
+        for observation in eligible
+        if (observation.raw.source, _canonical_key(observation), observation.revision_id)
+        not in superseded
+    ]
 
     grouped: dict[
         tuple[str, Variable, datetime, timedelta | None, ObservationStatistic],
@@ -253,6 +283,8 @@ def select_canonical(
             candidates,
             key=lambda observation: (
                 source_precedence[observation.raw.source],
+                observation.quality is not ObservationQuality.ACCEPTED,
+                observation.value_state is not ValueState.OBSERVED,
                 -observation.available_at.timestamp(),
                 observation.revision_id,
             ),
