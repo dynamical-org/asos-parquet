@@ -249,7 +249,10 @@ def _backfill_year_impl(year: int):
     result = load_year(year, stations, base_path=data_dir, show_progress=True)
 
     if not result.success:
-        logger.error(f"Load failed: {result.error}")
+        try:
+            raise RuntimeError(f"Load failed: {result.error}")
+        except RuntimeError:
+            logger.exception(f"Load failed for year {year}")
         return {"status": "failed", "year": year, "error": result.error}
 
     if result.records == 0:
