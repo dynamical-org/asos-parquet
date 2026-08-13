@@ -1,3 +1,5 @@
+import logging
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -10,6 +12,10 @@ from typing import Protocol
 from urllib.parse import urlencode
 
 import requests  # type: ignore[import-untyped]
+
+from .config import MAX_BACKOFF, MAX_RETRIES, RETRY_BACKOFF
+
+logger = logging.getLogger(__name__)
 
 COLLECTION_URL = "https://api.weather.gc.ca/collections/swob-realtime/items"
 STATION_LIST_URLS = (
@@ -200,9 +206,29 @@ def _api_timestamp(value: datetime) -> str:
 
 
 def _get(client: _HttpSession, url: str) -> bytes:
-    response = client.get(url, timeout=300)
-    response.raise_for_status()
-    return response.content
+    attempt = 0
+    while True:
+        try:
+            response = client.get(url, timeout=300)
+            response.raise_for_status()
+            return response.content
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            status_code = (
+                e.response.status_code
+                if isinstance(e, requests.HTTPError) and e.response is not None
+                else None
+            )
+            if status_code is not None and status_code < 500:
+                raise
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                raise
+            wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+            logger.warning(
+                f"{url}: {type(e).__name__}, retry {attempt}/{MAX_RETRIES} "
+                f"(waiting {wait_time:.0f}s)"
+            )
+            time.sleep(wait_time)
 
 
 def _features(page: object) -> list[object]:
