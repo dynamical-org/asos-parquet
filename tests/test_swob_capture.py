@@ -3,10 +3,12 @@ from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
+import requests
 
-from asos_parquet.swob_capture import capture_swob_window
+from asos_parquet.swob_capture import _get, capture_swob_window
 
 
 class Response:
@@ -541,3 +543,47 @@ def test_split_index_manifest_must_share_manifest_parent(tmp_path: Path) -> None
 def test_capture_requires_utc_timestamps(start: datetime, end: datetime, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="UTC-aware"):
         capture_swob_window(start, end, tmp_path / "manifest.json")
+
+
+def test_get_retries_transient_errors_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("asos_parquet.swob_capture.time.sleep", lambda _: None)
+    attempts: list[str] = []
+
+    class FlakySession:
+        def get(self, url: str, timeout: int) -> Response:
+            attempts.append(url)
+            if len(attempts) < 3:
+                raise requests.ConnectTimeout("boom")
+            return Response(b"ok")
+
+    assert _get(FlakySession(), "https://example.test") == b"ok"
+    assert len(attempts) == 3
+
+
+def test_get_gives_up_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("asos_parquet.swob_capture.time.sleep", lambda _: None)
+
+    class AlwaysTimesOutSession:
+        def get(self, url: str, timeout: int) -> Response:
+            raise requests.ConnectTimeout("boom")
+
+    with pytest.raises(requests.ConnectTimeout):
+        _get(AlwaysTimesOutSession(), "https://example.test")
+
+
+def test_get_does_not_retry_client_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("asos_parquet.swob_capture.time.sleep", lambda _: None)
+    attempts: list[str] = []
+
+    class NotFoundResponse:
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError(response=SimpleNamespace(status_code=404))
+
+    class NotFoundSession:
+        def get(self, url: str, timeout: int) -> NotFoundResponse:
+            attempts.append(url)
+            return NotFoundResponse()
+
+    with pytest.raises(requests.HTTPError):
+        _get(NotFoundSession(), "https://example.test")
+    assert len(attempts) == 1
