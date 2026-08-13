@@ -59,10 +59,10 @@ image = (
 logger = logging.getLogger(__name__)
 
 
-def _legacy_s3_prefix() -> str:
-    from asos_parquet.config import LEGACY_S3_PREFIX
+def _asos_parquet_s3_prefix() -> str:
+    from asos_parquet.config import ASOS_PARQUET_S3_PREFIX
 
-    return os.environ.get("ASOS_S3_PREFIX", LEGACY_S3_PREFIX).strip("/")
+    return os.environ.get("ASOS_S3_PREFIX", ASOS_PARQUET_S3_PREFIX).strip("/")
 
 
 # Modal tears containers down by raising into the running input: a
@@ -161,18 +161,18 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     from botocore.config import Config
     from botocore.exceptions import ClientError
 
+    from asos_parquet.composers import (
+        AsosParquetComposer,
+        ParquetPublisher,
+        SourceFrame,
+    )
     from asos_parquet.config import get_all_network_ids
     from asos_parquet.fetch import fetch_observations_batch
-    from asos_parquet.load import (
-        enrich_with_station_metadata,
-        merge_observations,
-        write_year_partition,
-    )
     from asos_parquet.stations import fetch_all_stations
 
     # Configuration from environment
     s3_bucket = os.environ.get("ASOS_S3_BUCKET")
-    s3_prefix = _legacy_s3_prefix()
+    s3_prefix = _asos_parquet_s3_prefix()
     s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
@@ -244,8 +244,6 @@ def _update_asos_data_impl(lookback_hours: int = 2):
         pd.Timestamp(now),
         show_progress=False,  # No terminal in Modal
     )
-    observations = observations.drop(columns="wxcodes", errors="ignore")
-
     if observations.empty:
         logger.info("No new observations returned")
         return {"status": "no_observations", "observations": 0}
@@ -253,12 +251,15 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     logger.info(f"Fetched {len(observations):,} observations")
 
     # Step 4: Merge with existing data and enrich with station metadata
-    merged_gdf = merge_observations(existing_gdf, observations)
-    merged_gdf = enrich_with_station_metadata(merged_gdf, stations)
+    merged_gdf = AsosParquetComposer().compose(
+        existing_gdf,
+        {"iem": SourceFrame("iem", observations)},
+        stations,
+    )
     logger.info(f"Merged data: {len(merged_gdf):,} total records")
 
     # Step 5: Write to local file (GeoParquet with covering bbox)
-    output_path = write_year_partition(merged_gdf, current_year, base_path=data_dir)
+    output_path = ParquetPublisher(data_dir).publish(merged_gdf, current_year)
     logger.info(f"Wrote {output_path.name}")
 
     # Step 6: Upload to S3
