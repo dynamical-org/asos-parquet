@@ -61,7 +61,10 @@ Iowa Mesonet API  →  fetch.py  →  load.py  →  data/asos/year=YYYY/data.par
 
 ### Modal Deployment
 
-- **`modal_app.py`**: Serverless hourly updates - downloads current year from S3, fetches new observations, merges, uploads back
+- **`modal_app.py`** (app `asos-parquet-update`): Serverless hourly updates for the legacy `asos-parquet` dataset - downloads current year from S3, fetches new observations, merges, uploads back. **Deployed by CI on every push to main**, so any cron added here goes live on merge.
+- **`modal_obs_app.py`** (app `obs-parquet-update`): obs-parquet v1 ingest - hourly MSC SWOB capture and year backfill. **Not deployed by CI**; deploy deliberately with `uv run modal deploy modal_obs_app.py`.
+
+New scheduled work on obs-parquet belongs in `modal_obs_app.py`, never in `modal_app.py`.
 
 ### Partitioning Strategy
 

@@ -50,6 +50,26 @@ modal secret create sentry-asos-parquet \
 modal deploy modal_app.py
 ```
 
+## Apps
+
+Two Modal apps, deployed separately on purpose:
+
+| App | File | Publishes | Deployed by |
+|-----|------|-----------|-------------|
+| `asos-parquet-update` | `modal_app.py` | legacy `asos-parquet` dataset | CI, on every push to main |
+| `obs-parquet-update` | `modal_obs_app.py` | `obs-parquet/v1` (MSC SWOB capture, year backfill) | by hand |
+
+Deploying an app registers every cron in its file. Keeping obs-parquet in its
+own app means work-in-progress ingest cannot go live on merge, cannot stall the
+ASOS publisher, and cannot report its failures against the ASOS deployment.
+
+`modal_obs_app.py` is deliberately absent from `.github/workflows/deploy.yml`.
+Deploy it when you mean to:
+
+```bash
+uv run modal deploy modal_obs_app.py
+```
+
 ## Testing
 
 ```bash
@@ -84,6 +104,11 @@ configured in `obs.py` / `modal_app.py`:
 - **Cron monitoring** — `update_asos_data` sends a Sentry cron check-in
   (`asos-parquet-update` monitor) around each run, alerting on a missed or
   overrunning run in addition to raised exceptions.
+
+`modal_obs_app.py` checks in to a separate `obs-parquet-swob-update` monitor.
+While the obs app is undeployed that monitor gets no check-ins, so disable it
+in Sentry until SWOB ingest is deployed for real — otherwise it alerts hourly
+on missed runs.
 
 `SENTRY_DSN` lives in the `sentry-asos-parquet` Modal secret. When unset (e.g.
 local `make load`), `obs.py` degrades to plain stdout logging with no network

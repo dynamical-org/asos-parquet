@@ -6,7 +6,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
-import requests
+import requests  # type: ignore[import-untyped]
 
 from asos_parquet.swob_capture import _get, capture_swob_window
 
@@ -576,6 +576,8 @@ def test_get_does_not_retry_client_errors(monkeypatch: pytest.MonkeyPatch) -> No
     attempts: list[str] = []
 
     class NotFoundResponse:
+        content = b""
+
         def raise_for_status(self) -> None:
             raise requests.HTTPError(response=SimpleNamespace(status_code=404))
 
