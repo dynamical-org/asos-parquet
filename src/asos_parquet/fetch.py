@@ -728,7 +728,7 @@ def _fetch_with_rich_display(
                         logger.info(f"{station_id} ({state}): no data")
                         progress.complete_request(station_id, result="empty")
                 except Exception as e:
-                    logger.error(f"{station_id} ({state}): {e}")
+                    logger.exception(f"{station_id} ({state}): {e}")
                     progress.add_warning(f"{station_id}: {e}")
                     progress.complete_request(station_id, result="error")
 
@@ -806,7 +806,7 @@ def _fetch_simple(
                     logger.info(f"{station_id} ({state}): no data")
                     empty += 1
             except Exception as e:
-                logger.error(f"{station_id} ({state}): {e}")
+                logger.exception(f"{station_id} ({state}): {e}")
                 errors += 1
 
             # Inline progress when not using progress bar
