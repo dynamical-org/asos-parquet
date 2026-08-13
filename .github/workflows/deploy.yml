@@ -7,7 +7,10 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: deploy-modal
+  # Keyed by ref so a PR run cannot cancel an in-flight deploy of main and
+  # leave production running code older than main. Successive pushes to main
+  # still supersede each other, which is what we want: latest wins.
+  group: deploy-modal-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -25,6 +28,10 @@ jobs:
     # workflow_dispatch can target any branch; never expose prod Modal
     # credentials to a deploy from anything but main.
     if: github.ref == 'refs/heads/main'
+    # Without this, a red main still ships to Modal: on 2026-08-13 a mypy
+    # failure merged and deployed anyway. The deployed app runs the hourly
+    # ASOS publisher, so a broken deploy is a data outage, not just a red X.
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
