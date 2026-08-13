@@ -6,13 +6,14 @@ import modal
 import pytest
 
 import modal_app
-from asos_parquet.config import OBS_S3_PREFIX
+from asos_parquet.config import LEGACY_S3_PREFIX, OBS_S3_PREFIX
 from asos_parquet.partitioned import DEFAULT_DATASET_PATH, LEGACY_DATASET_PATH
 from asos_parquet.swob_capture import CaptureResult
 from modal_app import (
     _SWOB_CRON_SCHEDULE,
     _backfill_year_impl,
     _is_lifecycle_interruption,
+    _legacy_s3_prefix,
     _swob_capture_bounds,
     _update_swob_data_impl,
 )
@@ -31,9 +32,25 @@ def test_ordinary_exception_is_not_lifecycle_interruption():
 
 
 def test_obs_parquet_v1_is_published_beside_legacy_dataset() -> None:
+    assert LEGACY_S3_PREFIX == "asos-parquet"
     assert OBS_S3_PREFIX == "obs-parquet/v1"
     assert DEFAULT_DATASET_PATH.as_posix() == "data/obs-parquet/v1"
     assert LEGACY_DATASET_PATH.as_posix() == "data/asos"
+
+
+def test_scheduled_updater_ignores_obs_parquet_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASOS_S3_PREFIX", raising=False)
+    monkeypatch.setenv("OBS_S3_PREFIX", "obs-parquet/v99")
+
+    assert _legacy_s3_prefix() == "asos-parquet"
+
+
+def test_scheduled_updater_allows_explicit_legacy_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ASOS_S3_PREFIX", "/legacy-test/")
+
+    assert _legacy_s3_prefix() == "legacy-test"
 
 
 def test_obs_parquet_backfill_rejects_pre_2026(monkeypatch: pytest.MonkeyPatch) -> None:
