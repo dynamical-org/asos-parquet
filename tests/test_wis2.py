@@ -1,7 +1,7 @@
 import base64
 import json
 from datetime import UTC, datetime, timedelta
-from hashlib import sha512
+from hashlib import sha256, sha512
 from pathlib import Path
 
 import pytest
@@ -157,3 +157,70 @@ def test_integrity_failure_is_archived_as_notification_only(tmp_path: Path) -> N
 
     assert len(list((tmp_path / "raw" / "notifications").glob("*.json"))) == 1
     assert not list((tmp_path / "raw" / "bufr").glob("*.bufr"))
+
+
+def test_latency_and_duplicate_notifications_are_recorded(tmp_path: Path) -> None:
+    collector = Wis2Collector(tmp_path, RecordingDecoder(decoded()))
+    received = PUBLISHED_AT + timedelta(seconds=30)
+    collector.process(PUBLISHER_TOPIC, notification(b"BUFRpayload"), received)
+    collector.process(PUBLISHER_TOPIC, notification(b"BUFRpayload"), received)
+
+    measurements = collector.measurements()
+    latency = measurements["publish_to_receive_seconds"]
+    assert latency["samples"] == 1
+    assert latency["mean"] == pytest.approx(30.0, abs=0.01)
+    assert measurements["duplicate_notifications"] == 1
+    assert measurements["publishers"]["fr-meteofrance"]["duplicate_notifications"] == 1
+
+
+def test_non_utc_offsets_and_sha256_integrity_are_accepted(tmp_path: Path) -> None:
+    payload = b"BUFRpayload"
+    body = json.loads(notification(payload))
+    body["properties"]["datetime"] = "2026-08-12T14:00:00+02:00"
+    body["properties"]["integrity"] = {
+        "method": "sha256",
+        "value": base64.b64encode(sha256(payload).digest()).decode(),
+    }
+    body["links"][0]["type"] = "application/x-bufr"
+    collector = Wis2Collector(tmp_path, RecordingDecoder(decoded()))
+
+    result = collector.process(PUBLISHER_TOPIC, json.dumps(body).encode(), PUBLISHED_AT)
+
+    assert result.status == "decoded"
+    assert (
+        collector.measurements()["publishers"]["fr-meteofrance"]["latest_observed_at"]
+        == "2026-08-12T12:00:00+00:00"
+    )
+
+
+def test_failed_payload_is_retried_after_redelivery(tmp_path: Path) -> None:
+    collector = Wis2Collector(tmp_path, RecordingDecoder(UnknownBufrTemplate("999999")))
+    first = collector.process(
+        PUBLISHER_TOPIC, notification(b"BUFRpayload", message_id="one"), PUBLISHED_AT
+    )
+    collector.decoder = RecordingDecoder(decoded())
+    second = collector.process(
+        PUBLISHER_TOPIC, notification(b"BUFRpayload", message_id="two"), PUBLISHED_AT
+    )
+
+    assert first.status == "decoder_failure"
+    assert second.status == "decoded"
+
+
+def test_canonical_download_is_deferred_until_after_duplicate_check(tmp_path: Path) -> None:
+    body = json.loads(notification(b"BUFRpayload"))
+    del body["properties"]["content"]
+    raw = json.dumps(body).encode()
+    calls: list[str] = []
+
+    def fetch(url: str) -> bytes:
+        calls.append(url)
+        return b"BUFRpayload"
+
+    collector = Wis2Collector(tmp_path, RecordingDecoder(decoded()))
+    assert collector.process(PUBLISHER_TOPIC, raw, PUBLISHED_AT, fetch).status == "decoded"
+    assert (
+        collector.process(PUBLISHER_TOPIC, raw, PUBLISHED_AT, fetch).status
+        == "duplicate_notification"
+    )
+    assert calls == ["https://example.test/station.bufr4"]
