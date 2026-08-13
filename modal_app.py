@@ -16,7 +16,8 @@ Setup:
        modal secret create source-coop-asos-s3 \\
          ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx \\
          ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
-         ASOS_S3_BUCKET=your-bucket OBS_S3_PREFIX=obs-parquet/v1
+         ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos-parquet \\
+         OBS_S3_PREFIX=obs-parquet/v1
        modal secret create sentry-asos-parquet SENTRY_DSN=xxx
        (log streaming + error tracking + cron monitoring via Sentry; see obs.py.)
     3. Deploy: modal deploy modal_app.py
@@ -56,6 +57,12 @@ image = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _legacy_s3_prefix() -> str:
+    from asos_parquet.config import LEGACY_S3_PREFIX
+
+    return os.environ.get("ASOS_S3_PREFIX", LEGACY_S3_PREFIX).strip("/")
 
 
 # Modal tears containers down by raising into the running input: a
@@ -154,7 +161,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     from botocore.config import Config
     from botocore.exceptions import ClientError
 
-    from asos_parquet.config import OBS_S3_PREFIX, get_all_network_ids
+    from asos_parquet.config import get_all_network_ids
     from asos_parquet.fetch import fetch_observations_batch
     from asos_parquet.load import (
         enrich_with_station_metadata,
@@ -165,7 +172,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
 
     # Configuration from environment
     s3_bucket = os.environ.get("ASOS_S3_BUCKET")
-    s3_prefix = os.environ.get("OBS_S3_PREFIX", OBS_S3_PREFIX).strip("/")
+    s3_prefix = _legacy_s3_prefix()
     s3_endpoint = os.environ.get("ASOS_AWS_ENDPOINT_URL")
 
     if not s3_bucket:
@@ -181,7 +188,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     )
 
     # Set up local paths (flat path avoids pyarrow Hive partition inference)
-    data_dir = Path("/tmp/obs-parquet-v1")
+    data_dir = Path("/tmp/asos-parquet")
     data_dir.mkdir(parents=True, exist_ok=True)
     data_file = data_dir / "data.parquet"
     s3_key = f"{s3_prefix}/year={current_year}/data.parquet"
@@ -214,8 +221,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
         error_code = e.response["Error"]["Code"]
         if error_code in ("404", "NoSuchKey"):
             raise ValueError(
-                f"Missing seeded obs-parquet partition {s3_key}; "
-                f"run backfill_year({current_year}) before deploying the hourly updater"
+                f"Missing legacy ASOS partition {s3_key}; refusing to replace its history"
             )
         else:
             raise
@@ -238,6 +244,7 @@ def _update_asos_data_impl(lookback_hours: int = 2):
         pd.Timestamp(now),
         show_progress=False,  # No terminal in Modal
     )
+    observations = observations.drop(columns="wxcodes", errors="ignore")
 
     if observations.empty:
         logger.info("No new observations returned")
