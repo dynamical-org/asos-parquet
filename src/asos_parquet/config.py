@@ -10,7 +10,7 @@ OBSERVATION_DATA_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.p
 OBS_DATASET_VERSION = "v1"
 OBS_DATASET_START_YEAR = 2026
 OBS_S3_PREFIX = f"obs-parquet/{OBS_DATASET_VERSION}"
-LEGACY_S3_PREFIX = "asos-parquet"
+ASOS_PARQUET_S3_PREFIX = "asos-parquet"
 
 # Rate limiting
 MAX_CONCURRENT_REQUESTS = 5  # Keep low to avoid overwhelming Iowa Mesonet server
