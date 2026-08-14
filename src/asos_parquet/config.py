@@ -19,6 +19,12 @@ RETRY_BACKOFF = 3.0  # seconds (base for exponential backoff)
 MAX_BACKOFF = 300.0  # seconds (5 minutes) - cap for exponential backoff
 REQUEST_TIMEOUT = 120  # seconds - monthly requests can be large
 
+# SWOB capture (Environment Canada) runs hourly under a tight cron budget, so a
+# stalled connection must fail fast rather than tie up MAX_RETRIES worth of
+# attempts. The read side stays generous since a connected transfer can be slow.
+SWOB_CONNECT_TIMEOUT = 15  # seconds
+SWOB_READ_TIMEOUT = 300  # seconds
+
 # Columns in the immutable legacy asos-parquet dataset.
 LEGACY_DATA_FIELDS = [
     "tmpf",  # Air Temperature (F)
