@@ -11,7 +11,7 @@ from tempfile import NamedTemporaryFile
 from typing import Protocol
 from urllib.parse import urlencode
 
-import requests  # type: ignore[import-untyped]
+import requests
 
 from .config import MAX_BACKOFF, MAX_RETRIES, RETRY_BACKOFF
 
@@ -25,14 +25,19 @@ STATION_LIST_URLS = (
 )
 
 
+# requests ships inline types as of 2.34, so these protocols are now checked against
+# the real Session/Response rather than Any: content has to be a read-only property
+# (Response.content is one) and timeout keyword-only (Session.get takes it via
+# **kwargs), or requests.Session no longer satisfies _HttpSession.
 class _Response(Protocol):
-    content: bytes
+    @property
+    def content(self) -> bytes: ...
 
     def raise_for_status(self) -> None: ...
 
 
 class _HttpSession(Protocol):
-    def get(self, url: str, timeout: int) -> _Response: ...
+    def get(self, url: str, *, timeout: int) -> _Response: ...
 
 
 @dataclass(frozen=True, slots=True)

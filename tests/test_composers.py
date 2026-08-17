@@ -106,5 +106,7 @@ def test_parquet_publisher_uses_explicit_destination(tmp_path: Path) -> None:
     path = ParquetPublisher(tmp_path / "asos-parquet").publish(observations, 2026)
 
     assert path == tmp_path / "asos-parquet" / "year=2026" / "data.parquet"
+    # year is carried by the Hive directory name, not by a column in the file, so
+    # reading the file back yields exactly the composed frame.
     stored = gpd.read_parquet(path)
-    assert_frame_equal(stored.drop(columns="year"), observations)
+    assert_frame_equal(stored, observations)
