@@ -6,7 +6,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
-import requests  # type: ignore[import-untyped]
+import requests
 
 from asos_parquet.swob_capture import _get, capture_swob_window
 
