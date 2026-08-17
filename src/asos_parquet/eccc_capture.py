@@ -6,7 +6,7 @@ from json import dumps, loads
 from pathlib import Path
 from typing import Protocol
 
-import requests  # type: ignore[import-untyped]
+import requests
 
 
 class _Response(Protocol):
