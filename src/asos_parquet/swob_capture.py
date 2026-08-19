@@ -13,7 +13,13 @@ from urllib.parse import urlencode
 
 import requests
 
-from .config import MAX_BACKOFF, MAX_RETRIES, RETRY_BACKOFF
+from .config import (
+    MAX_BACKOFF,
+    MAX_RETRIES,
+    RETRY_BACKOFF,
+    SWOB_CONNECT_TIMEOUT,
+    SWOB_READ_TIMEOUT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +43,7 @@ class _Response(Protocol):
 
 
 class _HttpSession(Protocol):
-    def get(self, url: str, *, timeout: int) -> _Response: ...
+    def get(self, url: str, *, timeout: tuple[int, int]) -> _Response: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,7 +220,7 @@ def _get(client: _HttpSession, url: str) -> bytes:
     attempt = 0
     while True:
         try:
-            response = client.get(url, timeout=300)
+            response = client.get(url, timeout=(SWOB_CONNECT_TIMEOUT, SWOB_READ_TIMEOUT))
             response.raise_for_status()
             return response.content
         except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:

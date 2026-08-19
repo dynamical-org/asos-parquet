@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 
+from asos_parquet.config import SWOB_CONNECT_TIMEOUT, SWOB_READ_TIMEOUT
 from asos_parquet.swob_capture import _get, capture_swob_window
 
 
@@ -24,8 +25,8 @@ class Session:
         self.responses = responses
         self.requested: list[str] = []
 
-    def get(self, url: str, timeout: int) -> Response:
-        assert timeout == 300
+    def get(self, url: str, timeout: tuple[int, int]) -> Response:
+        assert timeout == (SWOB_CONNECT_TIMEOUT, SWOB_READ_TIMEOUT)
         self.requested.append(url)
         return Response(self.responses[url])
 
@@ -38,7 +39,7 @@ class OutOfOrderSession(Session):
         self.fast_finished = Event()
         self.completion_order: list[str] = []
 
-    def get(self, url: str, timeout: int) -> Response:
+    def get(self, url: str, timeout: tuple[int, int]) -> Response:
         if url == self.slow_url:
             assert self.fast_finished.wait(timeout=2)
             self.completion_order.append(url)
@@ -550,7 +551,7 @@ def test_get_retries_transient_errors_then_succeeds(monkeypatch: pytest.MonkeyPa
     attempts: list[str] = []
 
     class FlakySession:
-        def get(self, url: str, timeout: int) -> Response:
+        def get(self, url: str, timeout: tuple[int, int]) -> Response:
             attempts.append(url)
             if len(attempts) < 3:
                 raise requests.ConnectTimeout("boom")
@@ -564,7 +565,7 @@ def test_get_gives_up_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr("asos_parquet.swob_capture.time.sleep", lambda _: None)
 
     class AlwaysTimesOutSession:
-        def get(self, url: str, timeout: int) -> Response:
+        def get(self, url: str, timeout: tuple[int, int]) -> Response:
             raise requests.ConnectTimeout("boom")
 
     with pytest.raises(requests.ConnectTimeout):
@@ -582,7 +583,7 @@ def test_get_does_not_retry_client_errors(monkeypatch: pytest.MonkeyPatch) -> No
             raise requests.HTTPError(response=SimpleNamespace(status_code=404))
 
     class NotFoundSession:
-        def get(self, url: str, timeout: int) -> NotFoundResponse:
+        def get(self, url: str, timeout: tuple[int, int]) -> NotFoundResponse:
             attempts.append(url)
             return NotFoundResponse()
 
