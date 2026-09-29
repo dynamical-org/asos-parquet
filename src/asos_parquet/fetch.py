@@ -46,6 +46,19 @@ BULK_REQUEST_TIMEOUT = 300  # Bulk requests may take longer
 BULK_MAX_WORKERS = 3  # Stay under IEM's 6-cursor-per-subnet limit
 
 
+class IncompleteFetchError(RuntimeError):
+    """Raised when a fetch returned less than was requested."""
+
+
+@dataclass(frozen=True)
+class BulkFetchResult:
+    """Observations from a bulk fetch plus an account of what failed."""
+
+    observations: pd.DataFrame
+    tasks: int  # number of (station chunk × period) requests
+    errors: tuple[str, ...]  # one "Chunk N [...]: <error>" per chunk that failed after retries
+
+
 @dataclass
 class RequestStatus:
     """Track status of an in-flight request."""
@@ -252,6 +265,30 @@ def split_date_range_monthly(
     return periods
 
 
+def _describe_chunk(
+    chunk_id: int,
+    station_ids: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> str:
+    """Label a bulk task uniquely: chunk ids repeat across fetch windows."""
+    period = f"{start_date:%Y-%m-%dT%H:%MZ}–{end_date:%Y-%m-%dT%H:%MZ}"
+    stations = f"{len(station_ids)} stations {station_ids[0]}–{station_ids[-1]}"
+    return f"Chunk {chunk_id} [{period}, {stations}]"
+
+
+def _is_empty_result(text: str) -> bool:
+    """Whether a response body is IEM's way of saying there is no data."""
+    if "No results found" in text:
+        return True
+    lines = text.splitlines()
+    return (
+        bool(lines)
+        and lines[0].startswith("station,valid")
+        and not any(line.strip() for line in lines[1:])
+    )
+
+
 def fetch_bulk_chunk(
     station_ids: list[str],
     start_date: pd.Timestamp,
@@ -270,6 +307,7 @@ def fetch_bulk_chunk(
         Tuple of (chunk_id, DataFrame or None, error message or None)
     """
     url = build_bulk_observation_url(station_ids, start_date, end_date)
+    label = _describe_chunk(chunk_id, station_ids, start_date, end_date)
 
     attempt = 0
     while True:
@@ -285,37 +323,56 @@ def fetch_bulk_chunk(
                     return (chunk_id, None, f"Server error after {MAX_RETRIES} retries: {text!r}")
                 wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 logger.warning(
-                    f"Chunk {chunk_id}: server error in body ({text!r}), "
+                    f"{label}: server error in body ({text!r}), "
                     f"retry {attempt}/{MAX_RETRIES} (waiting {wait_time:.0f}s)"
                 )
                 time.sleep(wait_time)
                 continue
 
             # Check for empty response
-            if "No results found" in text or len(text) < 50:
+            if _is_empty_result(text):
                 return (chunk_id, None, None)
 
-            df = parse_observations(response.text, timestamp_format="mixed")
+            # Anything else that doesn't parse (e.g. an HTML error page served
+            # with 200) is a bad payload, not an empty chunk: retry it.
+            try:
+                df = parse_observations(response.text, timestamp_format="mixed")
+            except (pd.errors.ParserError, ValueError):
+                df = None
             if df is None:
-                return (chunk_id, None, None)
+                attempt += 1
+                if attempt > MAX_RETRIES:
+                    return (
+                        chunk_id,
+                        None,
+                        f"Bad payload after {MAX_RETRIES} retries: {text[:200]!r}",
+                    )
+                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+                logger.warning(
+                    f"{label}: unparseable body ({text[:200]!r}), "
+                    f"retry {attempt}/{MAX_RETRIES} (waiting {wait_time:.0f}s)"
+                )
+                time.sleep(wait_time)
+                continue
 
             return (chunk_id, df, None)
 
         except requests.HTTPError as e:
-            status_code = e.response.status_code if e.response else None
+            # A Response is falsy for 4xx/5xx, so test identity, not truthiness.
+            status_code = e.response.status_code if e.response is not None else None
 
             if status_code == 414:
                 # URL too long - this shouldn't happen with proper chunking
                 return (chunk_id, None, f"URL too long ({len(url)} chars)")
 
-            # Retry on server errors (5xx) or when response is unavailable
-            if status_code is None or status_code >= 500:
+            # Retry on server errors (5xx), rate limiting, or when response is unavailable
+            if status_code is None or status_code == 429 or status_code >= 500:
                 attempt += 1
                 if attempt > MAX_RETRIES:
                     return (chunk_id, None, f"HTTP {status_code} after {MAX_RETRIES} retries")
                 wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
                 logger.warning(
-                    f"Chunk {chunk_id}: HTTP {status_code} error, retry {attempt}/{MAX_RETRIES} "
+                    f"{label}: HTTP {status_code} error, retry {attempt}/{MAX_RETRIES} "
                     f"(waiting {wait_time:.0f}s)"
                 )
                 time.sleep(wait_time)
@@ -330,7 +387,7 @@ def fetch_bulk_chunk(
                 return (chunk_id, None, f"{type(e).__name__} after {MAX_RETRIES} retries")
             wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
             logger.warning(
-                f"Chunk {chunk_id}: {type(e).__name__}, retry {attempt}/{MAX_RETRIES} "
+                f"{label}: {type(e).__name__}, retry {attempt}/{MAX_RETRIES} "
                 f"(waiting {wait_time:.0f}s)"
             )
             time.sleep(wait_time)
@@ -485,6 +542,31 @@ def fetch_observations_bulk(
 ) -> pd.DataFrame:
     """Fetch observations using bulk multi-station requests.
 
+    Failed chunks are logged and dropped; use fetch_observations_bulk_result
+    to find out which ones failed.
+    """
+    return fetch_observations_bulk_result(
+        stations,
+        start_date,
+        end_date,
+        show_progress=show_progress,
+        description=description,
+        chunk_size=chunk_size,
+        max_workers=max_workers,
+    ).observations
+
+
+def fetch_observations_bulk_result(
+    stations: pd.DataFrame,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    show_progress: bool = True,
+    description: str = "",
+    chunk_size: int | None = None,
+    max_workers: int | None = None,
+) -> BulkFetchResult:
+    """Fetch observations using bulk multi-station requests.
+
     This is significantly faster than per-station fetching because it:
     1. Makes fewer HTTP requests (chunks of stations instead of individual)
     2. Uses parallel chunk fetching for throughput
@@ -501,7 +583,8 @@ def fetch_observations_bulk(
         max_workers: Override default parallel workers (default: 5)
 
     Returns:
-        Combined DataFrame with all observations
+        BulkFetchResult with the combined observations, the number of tasks,
+        and one error string per task that failed after retries
     """
     # Build station -> state mapping if state column exists
     station_state_map = {}
@@ -512,7 +595,7 @@ def fetch_observations_bulk(
     num_stations = len(station_ids)
 
     if num_stations == 0:
-        return pd.DataFrame()
+        return BulkFetchResult(pd.DataFrame(), 0, ())
 
     # Calculate optimal chunk size if not specified
     if chunk_size is None:
@@ -578,8 +661,8 @@ def fetch_observations_bulk(
                     completed += 1
 
                     if error:
-                        errors.append(f"Chunk {chunk_id}: {error}")
-                        logger.warning(f"Chunk {chunk_id} failed: {error}")
+                        errors.append(f"{_describe_chunk(chunk_id, *tasks[chunk_id])}: {error}")
+                        logger.warning(f"{errors[-1]} (failed)")
                     elif df is not None and not df.empty:
                         all_observations.append(df)
                         total_records += len(df)
@@ -616,8 +699,8 @@ def fetch_observations_bulk(
                 completed += 1
 
                 if error:
-                    errors.append(f"Chunk {chunk_id}: {error}")
-                    logger.warning(f"Chunk {chunk_id} failed: {error}")
+                    errors.append(f"{_describe_chunk(chunk_id, *tasks[chunk_id])}: {error}")
+                    logger.warning(f"{errors[-1]} (failed)")
                 elif df is not None and not df.empty:
                     all_observations.append(df)
                     total_records += len(df)
@@ -635,7 +718,7 @@ def fetch_observations_bulk(
     logger.info(f"Bulk fetch complete: {len(all_observations)} chunks with data")
 
     if not all_observations:
-        return pd.DataFrame()
+        return BulkFetchResult(pd.DataFrame(), num_chunks, tuple(errors))
 
     result = pd.concat(all_observations, ignore_index=True)
 
@@ -643,7 +726,7 @@ def fetch_observations_bulk(
     if station_state_map and "station" in result.columns:
         result["state"] = result["station"].map(station_state_map)
 
-    return result
+    return BulkFetchResult(result, num_chunks, tuple(errors))
 
 
 def _fetch_with_rich_display(
