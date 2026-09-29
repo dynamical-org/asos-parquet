@@ -97,4 +97,16 @@ class AsosParquetComposer:
         unexpected = sorted(set(enriched.columns) - allowed)
         if unexpected:
             raise ValueError(f"asos-parquet composition has unexpected columns: {unexpected}")
+        if existing is not None and "country" in existing:
+            before = existing["country"].notna().groupby(existing["station"]).sum().astype(int)
+            after = enriched["country"].notna().groupby(enriched["station"]).sum().astype(int)
+            lost = (before - after.reindex(before.index, fill_value=0)).loc[lambda d: d > 0]
+            if not lost.empty:
+                shown = ", ".join(
+                    f"{station} ({count} rows)" for station, count in lost.head(10).items()
+                )
+                raise ValueError(
+                    f"asos-parquet composition lost station metadata for {len(lost)} stations: "
+                    f"{shown}"
+                )
         return gpd.GeoDataFrame(enriched, geometry="geometry", crs="EPSG:4326")

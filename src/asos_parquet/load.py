@@ -25,14 +25,22 @@ def enrich_with_station_metadata(
 ) -> pd.DataFrame | gpd.GeoDataFrame:
     """Join station metadata columns onto observation rows.
 
-    Drops any existing metadata columns first to ensure fresh values,
-    then left-joins from the stations DataFrame on the 'station' column.
+    Left-joins metadata from the stations DataFrame on the 'station' column.
+    Stations present in `stations` take its values for every metadata column,
+    even null ones. Rows for stations absent from `stations` (e.g. re-keyed at
+    IEM) keep whatever metadata values they already had in `df`.
     """
     metadata = stations[["station", *STATION_METADATA_COLUMNS]].drop_duplicates(subset="station")
     drop_cols = [c for c in STATION_METADATA_COLUMNS if c in df.columns]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    return df.merge(metadata, on="station", how="left")
+    if not drop_cols:
+        return df.merge(metadata, on="station", how="left")
+    absent = ~df["station"].isin(metadata["station"]).to_numpy()
+    prior = {c: df[c].to_numpy() for c in drop_cols}
+    enriched = df.drop(columns=drop_cols).merge(metadata, on="station", how="left")
+    if absent.any():
+        for column, values in prior.items():
+            enriched[column] = enriched[column].where(~absent, values)
+    return enriched
 
 
 @dataclass
