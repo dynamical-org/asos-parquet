@@ -1198,3 +1198,25 @@ def test_rebased_candidate_must_keep_the_other_writers_rows() -> None:
     assert "in geometry" in concurrent_change_violations(moved, current, withheld, FP_WINDOWS)[0]
     assert "reappear" in concurrent_change_violations(resurrected, current, withheld, FP_WINDOWS)[0]
     assert "missing" in concurrent_change_violations(dropped, current, withheld, FP_WINDOWS)[0]
+
+
+def test_withheld_keys_stay_withheld_across_rebases() -> None:
+    # A key touched on an earlier rebase stays withheld even when the latest base
+    # matches the first read again (a correction reverted, or an insert deleted).
+    base0 = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0))
+    touched = _fp_base(("KAAA", "2026-02-10T01:53Z", 75.0), ("KCCC", "2026-02-10T02:53Z", 80.0))
+    reverted = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0))
+    fp0 = window_fingerprint(base0, FP_WINDOWS)
+
+    _, first = withhold_concurrent_changes(_fetched(), fp0, window_fingerprint(touched, FP_WINDOWS))
+    kept, second = withhold_concurrent_changes(
+        _fetched(), fp0, window_fingerprint(reverted, FP_WINDOWS), previous=first
+    )
+
+    assert first.counts() == {"added": 1, "changed": 1, "removed": 0}
+    assert second.counts() == {"added": 1, "changed": 1, "removed": 0}
+    assert len(kept) == len(_fetched()) - 2
+    assert set(zip(kept["station"], kept["valid"].dt.strftime("%H:%M"))) == {
+        ("KAAA", "02:53"),
+        ("KBBB", "01:53"),
+    }

@@ -290,10 +290,15 @@ class Withheld:
         }
 
 
+def _no_keys() -> pd.MultiIndex:
+    return pd.MultiIndex.from_arrays([[], []], names=list(_KEY_COLUMNS))
+
+
 def withhold_concurrent_changes(
     observations: pd.DataFrame,
     base_fingerprint: pd.Series,
     current_fingerprint: pd.Series,
+    previous: Withheld | None = None,
 ) -> tuple[pd.DataFrame, Withheld]:
     """Drop fetched rows whose key another writer touched since the base was read.
 
@@ -302,6 +307,11 @@ def withhold_concurrent_changes(
     removed). The other writer's version of a touched key wins, including its
     absence; every other fetched row is kept. Always compare against the original
     base's fingerprint, not an intermediate one.
+
+    Withholding is sticky: keys in ``previous`` (an earlier rebase of the same run)
+    stay withheld, under the kind first observed, even if the current base matches
+    the original again. The returned ``Withheld`` is cumulative. A change that
+    happens and fully reverts between two reads is invisible to snapshots.
     """
     shared = base_fingerprint.index.intersection(current_fingerprint.index)
     differs = (
@@ -311,15 +321,18 @@ def withhold_concurrent_changes(
     added = cast(pd.MultiIndex, current_fingerprint.index.difference(base_fingerprint.index))
     removed = cast(pd.MultiIndex, base_fingerprint.index.difference(current_fingerprint.index))
     changed = cast(pd.MultiIndex, shared[differs])
-    fetched = (
-        _key_index(observations)
-        if not observations.empty
-        else pd.MultiIndex.from_arrays([[], []], names=list(_KEY_COLUMNS))
-    )
+    fetched = _key_index(observations) if not observations.empty else _no_keys()
+    earlier = previous if previous is not None else Withheld(_no_keys(), _no_keys(), _no_keys())
+    prior = earlier.keys
+
+    def cumulative(before: pd.MultiIndex, now: pd.MultiIndex) -> pd.MultiIndex:
+        new = now[now.isin(fetched) & ~now.isin(prior)]
+        return before.append(new)
+
     withheld = Withheld(
-        added=added[added.isin(fetched)],
-        changed=changed[changed.isin(fetched)],
-        removed=removed[removed.isin(fetched)],
+        added=cumulative(earlier.added, added),
+        changed=cumulative(earlier.changed, changed),
+        removed=cumulative(earlier.removed, removed),
     )
     if not len(withheld.keys):
         return observations, withheld
