@@ -166,8 +166,8 @@ def _update_asos_data_impl(lookback_hours: int = 2):
         SourceFrame,
     )
     from asos_parquet.config import get_all_network_ids
-    from asos_parquet.fetch import fetch_observations_batch
-    from asos_parquet.stations import fetch_all_stations
+    from asos_parquet.fetch import IncompleteFetchError, fetch_observations_bulk_result
+    from asos_parquet.stations import fetch_all_stations_result
 
     # Configuration from environment
     s3_bucket = os.environ.get("ASOS_S3_BUCKET")
@@ -228,24 +228,34 @@ def _update_asos_data_impl(lookback_hours: int = 2):
     # Step 2: Fetch station metadata
     networks = get_all_network_ids()
     logger.info(f"Fetching station metadata for {len(networks)} networks...")
-    stations = fetch_all_stations(networks=networks, online_only=True)
+    station_result = fetch_all_stations_result(networks=networks, online_only=True)
+    stations = station_result.stations
+    failed_networks = station_result.failed_networks
     logger.info(f"Found {len(stations)} online stations")
 
     if stations.empty:
-        logger.warning("No online stations found")
-        return {"status": "no_stations", "observations": 0}
+        raise IncompleteFetchError(
+            f"No online stations found ({len(failed_networks)}/{len(networks)} networks failed)"
+        )
 
     # Step 3: Fetch new observations
     logger.info("Fetching observations from Iowa Mesonet...")
-    observations = fetch_observations_batch(
+    window = f"{lookback_start.isoformat()} to {now.isoformat()}"
+    fetch_result = fetch_observations_bulk_result(
         stations,
         pd.Timestamp(lookback_start),
         pd.Timestamp(now),
         show_progress=False,  # No terminal in Modal
     )
+    observations = fetch_result.observations
+    fetch_summary = (
+        f"{len(fetch_result.errors)}/{fetch_result.tasks} chunks failed, "
+        f"{len(failed_networks)}/{len(networks)} networks failed"
+    )
     if observations.empty:
-        logger.info("No new observations returned")
-        return {"status": "no_observations", "observations": 0}
+        raise IncompleteFetchError(
+            f"No observations fetched for {window} from {len(stations)} stations ({fetch_summary})"
+        )
 
     logger.info(f"Fetched {len(observations):,} observations")
 
@@ -269,6 +279,15 @@ def _update_asos_data_impl(lookback_hours: int = 2):
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=existing_etag)
     file_size = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Uploaded year={current_year} ({file_size:.1f} MB)")
+
+    # Publish what we have first so a partial outage doesn't stall fresh data,
+    # then fail the run so the gap is reported.
+    if fetch_result.errors or failed_networks:
+        details = [*fetch_result.errors[:3], *(f"network {n}" for n in failed_networks[:3])]
+        raise IncompleteFetchError(
+            f"Incomplete fetch for {window} ({fetch_summary}); "
+            f"published {len(observations):,} observations. First failures: {'; '.join(details)}"
+        )
 
     logger.info("ASOS update complete")
 
