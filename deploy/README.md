@@ -155,13 +155,11 @@ This ensures the current year's data stays up-to-date with minimal compute costs
 
 ## New Year Rollover
 
-At midnight UTC on Jan 1, the function automatically starts a new year partition:
-
-1. Finds no existing data in S3 for the new year
-2. Fetches observations for the new year
-3. Creates and uploads a new partition
-
-No manual intervention needed.
+The updater does **not** create a new year's partition. When `year=YYYY/data.parquet` is missing it
+refuses to run ("Missing legacy ASOS partition ... refusing to replace its history"), so every run fails from
+00:20 UTC on Jan 1 until the partition is seeded. Windows never cross a year boundary: runs early on Jan 1
+fetch only from 00:00 UTC, so reports from the last hours of Dec 31 that IEM publishes late are not picked up
+by the scheduled runs. Seed the new partition before Jan 1, and reconcile the tail of Dec 31 manually if needed.
 
 ## Troubleshooting
 
