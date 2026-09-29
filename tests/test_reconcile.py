@@ -16,9 +16,11 @@ from asos_parquet.config import LEGACY_DATA_FIELDS
 from asos_parquet.load import STATION_METADATA_COLUMNS
 from asos_parquet.reconcile import (
     Window,
+    Withheld,
     combine_hour_counts,
     combine_shard_diffs,
     compose_partition,
+    concurrent_change_violations,
     coverage_report,
     diff_partitions,
     fetch_windows,
@@ -32,7 +34,9 @@ from asos_parquet.reconcile import (
     run_shard,
     station_shards,
     unresolved_station_ids,
+    window_fingerprint,
     window_hour_counts,
+    withhold_concurrent_changes,
     written_file_violations,
 )
 from asos_parquet.stations import StationFetchResult
@@ -1044,3 +1048,153 @@ def test_dry_run_single_candidate_passes_on_a_clean_repair(
     assert summary["verification"] == "single candidate"
     assert summary["diff"]["metadata_restored_by_station"] == {"PBI": 6}
     assert all("us_stations_iem" in row for row in summary["hour_counts"])
+
+
+# --- three-way rebase ----------------------------------------------------------
+
+FP_WINDOWS = [window("2026-02-10T01:00Z", "2026-02-10T04:00Z")]
+
+
+def _fp_base(*rows: tuple[str, str, float]) -> pd.DataFrame:
+    frame = pd.concat(
+        [observations([(station, valid)], tmpf=tmpf) for station, valid, tmpf in rows],
+        ignore_index=True,
+    )
+    frame["name"] = None  # null metadata must compare equal to itself
+    return frame
+
+
+def _fetched() -> pd.DataFrame:
+    return observations(
+        [
+            ("KAAA", "2026-02-10T01:53Z"),
+            ("KAAA", "2026-02-10T02:53Z"),
+            ("KBBB", "2026-02-10T01:53Z"),
+            ("KCCC", "2026-02-10T02:53Z"),
+        ],
+        tmpf=68.0,
+    )
+
+
+def _withhold(base0: pd.DataFrame, base_n: pd.DataFrame) -> tuple[pd.DataFrame, Withheld]:
+    return withhold_concurrent_changes(
+        _fetched(),
+        window_fingerprint(base0, FP_WINDOWS),
+        window_fingerprint(base_n, FP_WINDOWS),
+    )
+
+
+def _withheld_keys(base0: pd.DataFrame, base_n: pd.DataFrame) -> tuple[set[tuple[str, str]], int]:
+    kept, withheld = _withhold(base0, base_n)
+    all_keys = {(s, v.isoformat()) for s, v in zip(_fetched()["station"], _fetched()["valid"])}
+    kept_keys = {(s, v.isoformat()) for s, v in zip(kept["station"], kept["valid"])}
+    assert len(withheld.keys) == len(all_keys - kept_keys)
+    return all_keys - kept_keys, len(withheld.keys)
+
+
+def test_identical_bases_withhold_nothing_even_with_nans() -> None:
+    base = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KBBB", "2026-02-10T01:53Z", 60.0))
+    assert base["gust"].isna().all()
+
+    assert _withheld_keys(base, base.copy()) == (set(), 0)
+
+
+def test_changed_row_is_withheld() -> None:
+    base0 = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KAAA", "2026-02-10T02:53Z", 60.0))
+    base_n = _fp_base(("KAAA", "2026-02-10T01:53Z", 75.0), ("KAAA", "2026-02-10T02:53Z", 60.0))
+
+    assert _withheld_keys(base0, base_n) == ({("KAAA", "2026-02-10T01:53:00+00:00")}, 1)
+
+
+def test_removed_and_new_keys_are_withheld() -> None:
+    base0 = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KBBB", "2026-02-10T01:53Z", 60.0))
+    base_n = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KCCC", "2026-02-10T02:53Z", 80.0))
+
+    assert _withheld_keys(base0, base_n) == (
+        {("KBBB", "2026-02-10T01:53:00+00:00"), ("KCCC", "2026-02-10T02:53:00+00:00")},
+        2,
+    )
+
+
+def test_fingerprint_covers_only_window_rows_and_ignores_geometry() -> None:
+    base0 = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KAAA", "2026-02-11T01:53Z", 60.0))
+    base_n = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KAAA", "2026-02-11T01:53Z", 99.0))
+    base0 = gpd.GeoDataFrame(base0, geometry=gpd.points_from_xy([0, 0], [0, 0]))
+    base_n = gpd.GeoDataFrame(base_n, geometry=gpd.points_from_xy([1, 1], [1, 1]))
+
+    fingerprint = window_fingerprint(base0, FP_WINDOWS)
+
+    assert len(fingerprint) == 1
+    assert _withheld_keys(base0, base_n) == (set(), 0)
+
+
+def test_fingerprint_matches_across_timestamp_units() -> None:
+    base0 = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0))
+    base_n = base0.copy()
+    base_n["valid"] = base_n["valid"].dt.as_unit("ns")
+    base0["valid"] = base0["valid"].dt.as_unit("us")
+
+    assert _withheld_keys(base0, base_n) == (set(), 0)
+
+
+def test_withheld_keys_are_classified_with_samples() -> None:
+    base0 = _fp_base(
+        ("KAAA", "2026-02-10T01:53Z", 60.0),
+        ("KAAA", "2026-02-10T02:53Z", 60.0),
+        ("KBBB", "2026-02-10T01:53Z", 60.0),
+    )
+    base_n = _fp_base(
+        ("KAAA", "2026-02-10T01:53Z", 75.0),
+        ("KAAA", "2026-02-10T02:53Z", 60.0),
+        ("KCCC", "2026-02-10T02:53Z", 80.0),
+        ("KZZZ", "2026-02-10T02:53Z", 80.0),  # added but not fetched: not ours to withhold
+    )
+
+    _, withheld = _withhold(base0, base_n)
+
+    assert withheld.counts() == {"added": 1, "changed": 1, "removed": 1}
+    assert withheld.samples() == {
+        "added": ["KCCC@2026-02-10T02:53:00+00:00"],
+        "changed": ["KAAA@2026-02-10T01:53:00+00:00"],
+        "removed": ["KBBB@2026-02-10T01:53:00+00:00"],
+    }
+
+
+def test_all_null_row_differs_from_absent_row() -> None:
+    null_row = _fp_base(("KBBB", "2026-02-10T01:53Z", float("nan")))
+    for column in LEGACY_DATA_FIELDS:
+        null_row[column] = float("nan")
+    absent = null_row.iloc[:0]
+
+    assert _withheld_keys(null_row, absent) == ({("KBBB", "2026-02-10T01:53:00+00:00")}, 1)
+    assert _withheld_keys(absent, null_row) == ({("KBBB", "2026-02-10T01:53:00+00:00")}, 1)
+
+
+def _geo(frame: pd.DataFrame) -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        frame, geometry=gpd.points_from_xy(frame["longitude"], frame["latitude"]), crs="EPSG:4326"
+    )
+
+
+def test_rebased_candidate_must_keep_the_other_writers_rows() -> None:
+    base0 = _fp_base(("KAAA", "2026-02-10T01:53Z", 60.0), ("KBBB", "2026-02-10T01:53Z", 60.0))
+    current = _geo(
+        _fp_base(("KAAA", "2026-02-10T01:53Z", 75.0), ("KCCC", "2026-02-10T02:53Z", 80.0))
+    )
+    _, withheld = _withhold(base0, current)
+    good = current.copy()
+    good["name"] = "refreshed metadata is allowed"
+
+    assert concurrent_change_violations(good, current, withheld, FP_WINDOWS) == ()
+
+    stale = good.copy()
+    stale.loc[stale["station"] == "KAAA", "tmpf"] = 68.0
+    moved = good.copy()
+    moved["geometry"] = gpd.points_from_xy([1.0, 1.0], [1.0, 1.0])
+    resurrected = pd.concat([good, _geo(_fp_base(("KBBB", "2026-02-10T01:53Z", 68.0)))])
+    dropped = good[good["station"] != "KCCC"]
+
+    assert "in tmpf" in concurrent_change_violations(stale, current, withheld, FP_WINDOWS)[0]
+    assert "in geometry" in concurrent_change_violations(moved, current, withheld, FP_WINDOWS)[0]
+    assert "reappear" in concurrent_change_violations(resurrected, current, withheld, FP_WINDOWS)[0]
+    assert "missing" in concurrent_change_violations(dropped, current, withheld, FP_WINDOWS)[0]

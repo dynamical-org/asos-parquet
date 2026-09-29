@@ -225,6 +225,176 @@ def unresolved_station_ids(
     return sorted(str(station) for station in expected - got)
 
 
+# --- three-way rebase --------------------------------------------------------
+
+
+def _key_index(frame: pd.DataFrame) -> pd.MultiIndex:
+    """(station, valid as UTC microseconds): unit-independent row keys."""
+    return pd.MultiIndex.from_arrays(
+        [frame["station"].astype(str).to_numpy(), _valid_us(frame)], names=list(_KEY_COLUMNS)
+    )
+
+
+def window_fingerprint(frame: pd.DataFrame, windows: Sequence[Window]) -> pd.Series:
+    """Hash of each row inside the windows, keyed by (station, valid).
+
+    Covers every column except the key, geometry and bbox; NaN/None hash equal to
+    themselves. Used as the merge base of a three-way rebase: rows whose hash
+    differs between two reads of the partition were touched by another writer.
+    """
+    inside = _in_windows(_valid_us(frame), normalize_windows(windows))
+    rows = frame.loc[inside]
+    columns = sorted(
+        column
+        for column in rows.columns
+        # geometry derives from longitude/latitude, which are hashed
+        if column not in (_GEOMETRY, "bbox") and column not in _KEY_COLUMNS
+    )
+    hashes = pd.util.hash_pandas_object(pd.DataFrame(rows[columns]), index=False)
+    fingerprint = pd.Series(hashes.to_numpy(), index=_key_index(rows), name="fingerprint")
+    return fingerprint[~fingerprint.index.duplicated(keep="last")]
+
+
+def _format_key(key: tuple[str, int]) -> str:
+    station, valid_us = key
+    return f"{station}@{pd.Timestamp(valid_us, unit='us', tz='UTC').isoformat()}"
+
+
+@dataclass(frozen=True)
+class Withheld:
+    """Fetched keys withheld because another writer touched them since the base read."""
+
+    added: pd.MultiIndex  # absent from the base, present now
+    changed: pd.MultiIndex  # present in both, row differs
+    removed: pd.MultiIndex  # present in the base, absent now
+
+    @property
+    def keys(self) -> pd.MultiIndex:
+        return self.added.append([self.changed, self.removed])
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "added": len(self.added),
+            "changed": len(self.changed),
+            "removed": len(self.removed),
+        }
+
+    def samples(self, limit: int = 10) -> dict[str, list[str]]:
+        return {
+            kind: [_format_key(key) for key in keys[:limit]]
+            for kind, keys in (
+                ("added", self.added),
+                ("changed", self.changed),
+                ("removed", self.removed),
+            )
+        }
+
+
+def withhold_concurrent_changes(
+    observations: pd.DataFrame,
+    base_fingerprint: pd.Series,
+    current_fingerprint: pd.Series,
+) -> tuple[pd.DataFrame, Withheld]:
+    """Drop fetched rows whose key another writer touched since the base was read.
+
+    Three-way rule with the base read as the merge base: a key is touched when its
+    current row differs from the base's, or exists in only one of the two (added or
+    removed). The other writer's version of a touched key wins, including its
+    absence; every other fetched row is kept. Always compare against the original
+    base's fingerprint, not an intermediate one.
+    """
+    shared = base_fingerprint.index.intersection(current_fingerprint.index)
+    differs = (
+        base_fingerprint.reindex(shared).to_numpy()
+        != current_fingerprint.reindex(shared).to_numpy()
+    )
+    added = cast(pd.MultiIndex, current_fingerprint.index.difference(base_fingerprint.index))
+    removed = cast(pd.MultiIndex, base_fingerprint.index.difference(current_fingerprint.index))
+    changed = cast(pd.MultiIndex, shared[differs])
+    fetched = (
+        _key_index(observations)
+        if not observations.empty
+        else pd.MultiIndex.from_arrays([[], []], names=list(_KEY_COLUMNS))
+    )
+    withheld = Withheld(
+        added=added[added.isin(fetched)],
+        changed=changed[changed.isin(fetched)],
+        removed=removed[removed.isin(fetched)],
+    )
+    if not len(withheld.keys):
+        return observations, withheld
+    kept = ~fetched.isin(withheld.keys)
+    return observations.loc[kept].reset_index(drop=True), withheld
+
+
+def _same(left: pd.Series, right: pd.Series) -> npt.NDArray[np.bool_]:
+    if isinstance(left, gpd.GeoSeries) or left.name == _GEOMETRY:
+        left_wkb = gpd.GeoSeries(left).to_wkb().to_numpy()
+        right_wkb = gpd.GeoSeries(right).to_wkb().to_numpy()
+        return np.asarray(left_wkb == right_wkb, dtype=bool)
+    equal = left.to_numpy() == right.to_numpy()
+    both_null = left.isna().to_numpy() & right.isna().to_numpy()
+    return np.asarray(equal | both_null, dtype=bool)
+
+
+def concurrent_change_violations(
+    candidate: pd.DataFrame,
+    current: pd.DataFrame,
+    withheld: Withheld,
+    windows: Sequence[Window],
+) -> tuple[str, ...]:
+    """Check a rebased candidate kept the other writer's version of withheld keys.
+
+    Withheld keys present in ``current`` must match it in every non-metadata column
+    (geometry included); withheld keys absent from ``current`` must stay absent.
+    """
+    keys = withheld.keys
+    if not len(keys):
+        return ()
+    windows = normalize_windows(windows)
+    candidate_rows = candidate.loc[_in_windows(_valid_us(candidate), windows)]
+    current_rows = current.loc[_in_windows(_valid_us(current), windows)]
+    candidate_rows = candidate_rows.set_axis(_key_index(candidate_rows))
+    current_rows = current_rows.set_axis(_key_index(current_rows))
+    violations: list[str] = []
+
+    absent = keys[~keys.isin(current_rows.index)]
+    leaked = absent[absent.isin(candidate_rows.index)]
+    if len(leaked):
+        violations.append(
+            f"{len(leaked)} withheld keys removed by another writer reappear in the candidate, "
+            f"e.g. {[_format_key(key) for key in leaked[:5]]}"
+        )
+    present = keys[keys.isin(current_rows.index)]
+    missing = present[~present.isin(candidate_rows.index)]
+    if len(missing):
+        violations.append(
+            f"{len(missing)} withheld keys from another writer are missing from the candidate, "
+            f"e.g. {[_format_key(key) for key in missing[:5]]}"
+        )
+    present = present[present.isin(candidate_rows.index)]
+    theirs = current_rows.loc[present]
+    ours = candidate_rows.loc[present]
+    columns = [
+        column
+        for column in current_rows.columns
+        if column not in STATION_METADATA_COLUMNS
+        and column != "bbox"
+        and column not in _KEY_COLUMNS
+    ]
+    for column in columns:
+        if column not in ours.columns:
+            violations.append(f"candidate lacks column {column}")
+            continue
+        differs = ~_same(ours[column], theirs[column])
+        if differs.any():
+            violations.append(
+                f"{int(differs.sum())} withheld keys differ from another writer's row in {column}, "
+                f"e.g. {[_format_key(key) for key in present[differs][:5]]}"
+            )
+    return tuple(violations)
+
+
 # --- composing ---------------------------------------------------------------
 
 
