@@ -5,8 +5,13 @@ right-labelled hour from :func:`hour_label`, so before/after/IEM comparisons sha
 bucket definition.
 """
 
+import hashlib
+import io
 import json
 import logging
+import resource
+import time
+import zlib
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +25,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from .composers import AsosParquetComposer, SourceFrame
+from .composers import AsosParquetComposer, ParquetPublisher, SourceFrame
 from .load import STATION_METADATA_COLUMNS
 from .station_aliases import (
     STATION_ALIASES,
@@ -709,3 +714,221 @@ def written_file_violations(reference: Path, candidate: Path) -> tuple[str, ...]
         if "covering" not in written:
             violations.append(f"geo covering missing for {column}")
     return tuple(violations)
+
+
+# --- sharded verification ----------------------------------------------------
+#
+# Compose (dedup on (station, valid)), metadata enrichment and every diff check are
+# per-station, so a partition split into station-disjoint shards verifies exactly like
+# the whole, provided each alias family shares a shard and every base and fetched row
+# lands in exactly one shard.
+
+
+def station_shards(
+    station_ids: Iterable[str],
+    shards: int,
+    aliases: Sequence[StationAlias] = STATION_ALIASES,
+) -> list[list[str]]:
+    """Split alias-normalized station IDs into stable, station-disjoint shards.
+
+    A successor ID hashes as its predecessor, so each alias family shares a shard.
+    """
+    if shards < 1:
+        raise ValueError("shards must be >= 1")
+    family = {alias.new_id: alias.old_id for alias in aliases}
+    buckets: list[list[str]] = [[] for _ in range(shards)]
+    for station in sorted(set(station_ids)):
+        key = family.get(station, station)
+        buckets[zlib.crc32(key.encode()) % shards].append(station)
+    return buckets
+
+
+def observations_sha256(observations: pd.DataFrame) -> str:
+    """Digest of observations sorted by (station, valid), serialized as parquet."""
+    ordered = observations.sort_values(["station", "valid"], kind="stable").reset_index(drop=True)
+    buffer = io.BytesIO()
+    ordered.to_parquet(buffer, index=False)
+    return hashlib.sha256(buffer.getvalue()).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def reference_hour_counts(
+    observations: pd.DataFrame,
+    online: pd.DataFrame,
+    windows: Sequence[Window],
+    aliases: Sequence[StationAlias] = STATION_ALIASES,
+) -> pd.DataFrame:
+    """IEM's own US distinct-station counts per hour from alias-normalized fetched rows.
+
+    A station is US when the online table says so; alias old IDs (absent from that
+    table) take their recorded country.
+    """
+    retired = retired_station_metadata(aliases)
+    retired = retired[~retired["station"].isin(online["station"])]
+    countries = pd.concat([online[["station", "country"]], retired[["station", "country"]]])
+    country_of = countries.drop_duplicates("station").set_index("station")["country"]
+    if observations.empty:
+        frame = pd.DataFrame(
+            {
+                "station": pd.Series(dtype="str"),
+                "valid": pd.Series(dtype="datetime64[us, UTC]"),
+                "country": pd.Series(dtype="str"),
+            }
+        )
+    else:
+        frame = observations[["station", "valid"]].copy()
+        frame["country"] = frame["station"].map(country_of)
+    return window_hour_counts(frame, windows)
+
+
+def combine_hour_counts(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Sum station-disjoint shards' distinct-station counts per hour label."""
+    combined = pd.concat(frames).groupby("hour_label", sort=True)["us_stations"].sum()
+    result: pd.DataFrame = combined.astype("int64").reset_index()
+    return result
+
+
+def _sum_counts(parts: Iterable[dict[str, int]]) -> dict[str, int]:
+    total: dict[str, int] = {}
+    for part in parts:
+        for key, value in part.items():
+            total[key] = total.get(key, 0) + value
+    return dict(sorted(total.items()))
+
+
+def combine_shard_diffs(diffs: Sequence[PartitionDiff]) -> PartitionDiff:
+    """Aggregate station-disjoint shard diffs into the whole-partition diff."""
+    return PartitionDiff(
+        rows_before=sum(diff.rows_before for diff in diffs),
+        rows_after=sum(diff.rows_after for diff in diffs),
+        removed_keys=sum(diff.removed_keys for diff in diffs),
+        added_in_windows=sum(diff.added_in_windows for diff in diffs),
+        added_outside_windows=sum(diff.added_outside_windows for diff in diffs),
+        added_by_hour=_sum_counts(diff.added_by_hour for diff in diffs),
+        measurement_changes_in_windows=sum(diff.measurement_changes_in_windows for diff in diffs),
+        measurement_changes_outside_windows=sum(
+            diff.measurement_changes_outside_windows for diff in diffs
+        ),
+        measurement_changes_by_column=_sum_counts(
+            diff.measurement_changes_by_column for diff in diffs
+        ),
+        metadata_changes_by_station=_sum_counts(diff.metadata_changes_by_station for diff in diffs),
+        metadata_restored_by_station=_sum_counts(
+            diff.metadata_restored_by_station for diff in diffs
+        ),
+        duplicate_keys_after=sum(diff.duplicate_keys_after for diff in diffs),
+        after_sorted=all(diff.after_sorted for diff in diffs),
+        successor_rows_before_boundary=_sum_counts(
+            diff.successor_rows_before_boundary for diff in diffs
+        ),
+        alias_overlaps=_sum_counts(diff.alias_overlaps for diff in diffs),
+        violations=tuple(violation for diff in diffs for violation in diff.violations),
+    )
+
+
+@dataclass(frozen=True)
+class ShardResult:
+    shard: int
+    stations: int | None  # None: the whole partition
+    rows_before: int
+    fetched_rows: int
+    candidate: Path
+    candidate_bytes: int
+    candidate_sha256: str
+    written_file_violations: tuple[str, ...]
+    diff: PartitionDiff
+    hour_counts_before: pd.DataFrame
+    hour_counts_after: pd.DataFrame
+    peak_rss_mib: float
+    wall_seconds: float
+
+
+def _conform_to_base(composed: gpd.GeoDataFrame, base: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Give a shard composed purely from fetched rows the base's column order and dtypes.
+
+    With base rows present, the composer's concat already does this.
+    """
+    shared = [column for column in base.columns if column in composed.columns]
+    order = shared + [column for column in composed.columns if column not in shared]
+    dtypes = {
+        column: base[column].dtype
+        for column in shared
+        if column not in _IGNORED_DIFF_COLUMNS and composed[column].dtype != base[column].dtype
+    }
+    conformed = composed[order].astype(dtypes)
+    return gpd.GeoDataFrame(conformed, geometry="geometry", crs=composed.crs)
+
+
+def run_shard(
+    partition: Path,
+    station_ids: Sequence[str] | None,
+    observations: pd.DataFrame,
+    online: pd.DataFrame,
+    windows: Sequence[Window],
+    *,
+    restore_retired_metadata: bool,
+    out_dir: Path,
+    shard: int = 0,
+) -> ShardResult:
+    """Compose, write, re-read and diff one station shard (``None``: whole partition).
+
+    ``online`` is the enrichment table (never the fetch set). Everything this reads is
+    released on return, so shards can run one after another in bounded memory.
+    """
+    started = time.monotonic()
+    windows = normalize_windows(windows)
+    year = partition_year(windows)
+    if station_ids is None:
+        existing = gpd.read_parquet(partition)
+        fetched = observations
+    else:
+        ids = list(station_ids)
+        station_type = pq.read_schema(partition).field("station").type
+        in_shard = pc.field("station").isin(pa.array(ids, type=station_type))
+        existing = gpd.read_parquet(partition, filters=in_shard)
+        fetched = (
+            observations[observations["station"].isin(ids)]
+            if not observations.empty
+            else observations
+        )
+    composed = compose_partition(
+        existing, fetched, online, restore_retired_metadata=restore_retired_metadata
+    )
+    if existing.empty and not composed.empty:
+        composed = _conform_to_base(composed, existing)
+    candidate = ParquetPublisher(out_dir).publish(composed, year)
+    del composed
+
+    columns = [
+        name for name in pq.read_schema(candidate).names if name not in _IGNORED_DIFF_COLUMNS
+    ]
+    before = pd.DataFrame(existing[[column for column in existing.columns if column in columns]])
+    del existing
+    after = pd.read_parquet(candidate, columns=columns)
+    expected = retired_station_metadata() if restore_retired_metadata else None
+    diff = diff_partitions(before, after, windows, expected_metadata=expected)
+    added = diff.added_in_windows + diff.added_outside_windows
+    if diff.rows_before + added - diff.removed_keys != diff.rows_after:
+        raise AssertionError(f"shard {shard}: base + added - removed != candidate rows ({diff})")
+    return ShardResult(
+        shard=shard,
+        stations=None if station_ids is None else len(station_ids),
+        rows_before=len(before),
+        fetched_rows=len(fetched),
+        candidate=candidate,
+        candidate_bytes=candidate.stat().st_size,
+        candidate_sha256=file_sha256(candidate),
+        written_file_violations=written_file_violations(partition, candidate),
+        diff=diff,
+        hour_counts_before=window_hour_counts(before, windows),
+        hour_counts_after=window_hour_counts(after, windows),
+        peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        wall_seconds=time.monotonic() - started,
+    )

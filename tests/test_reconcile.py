@@ -11,15 +11,21 @@ from asos_parquet.config import LEGACY_DATA_FIELDS
 from asos_parquet.load import STATION_METADATA_COLUMNS
 from asos_parquet.reconcile import (
     Window,
+    combine_hour_counts,
+    combine_shard_diffs,
     compose_partition,
     coverage_report,
     diff_partitions,
     fetch_windows,
     hour_label,
     normalize_windows,
+    observations_sha256,
     parse_windows,
     partition_year,
     reconcile_fetch_stations,
+    reference_hour_counts,
+    run_shard,
+    station_shards,
     unresolved_station_ids,
     window_hour_counts,
     written_file_violations,
@@ -675,3 +681,195 @@ def test_unresolved_station_ids_lists_existing_in_window_ids_with_no_returned_ro
 
     assert unresolved_station_ids(existing, returned, WINDOWS) == ["KBBB"]
     assert unresolved_station_ids(existing, pd.DataFrame(), WINDOWS) == ["KAAA", "KBBB", "PBI"]
+
+
+# --- sharding ------------------------------------------------------------------
+
+
+def test_station_shards_are_deterministic_disjoint_and_keep_alias_families_together() -> None:
+    ids = ["DJT", "PBI", "RYA", "2V5", *[f"K{i:03d}" for i in range(40)]]
+
+    shards = station_shards(ids, 4)
+
+    assert shards == station_shards(list(reversed(ids)), 4)
+    assert sorted(station for shard in shards for station in shard) == sorted(ids)
+    assert len(shards) == 4 and all(shards)
+    for old, new in [("PBI", "DJT"), ("2V5", "RYA")]:
+        assert [old in shard for shard in shards] == [new in shard for shard in shards]
+    assert station_shards(ids, 1) == [sorted(ids)]
+
+
+def _synthetic_partition(tmp_path: Path) -> Path:
+    stations = ["KAAA", "KBBB", "KCCC", "KDDD", "KEEE", "PBI", "DJT", "CYYZ"]
+    rows = [
+        (station, f"2026-07-09T{hour:02d}:53Z")
+        for station in stations
+        for hour in range(8, 16)
+        if not (station == "PBI" and hour >= 14)
+        and not (station == "DJT" and hour < 14)
+        and not (station == "KBBB" and hour == 12)
+    ]
+    table = stations_table(*[s for s in stations if s not in ("PBI", "CYYZ")])
+    table["wfo"] = table["wfo"].where(table["station"] != "KEEE", None)
+    canada = stations_table("CYYZ")
+    canada["country"] = "CA"
+    existing = compose_partition(None, observations(rows), pd.concat([table, canada]))
+    return ParquetPublisher(tmp_path / "base").publish(existing, 2026)
+
+
+def _synthetic_fetch() -> pd.DataFrame:
+    rows = [
+        (station, f"2026-07-09T{hour:02d}:53Z")
+        for station in ["KAAA", "KBBB", "KCCC", "KDDD", "KEEE", "DJT", "CYYZ", "KNEW"]
+        for hour in (11, 12, 13)
+    ]
+    fetched = observations(rows, tmpf=71.0)
+    fetched["drct"] = 180  # IEM parses an all-present column as int64
+    fetched["station"] = fetched["station"].where(
+        ~((fetched["station"] == "DJT") & (fetched["valid"] < ts("2026-07-09T14:53Z"))), "PBI"
+    )
+    return fetched
+
+
+def _online() -> pd.DataFrame:
+    online = stations_table("KAAA", "KBBB", "KCCC", "KDDD", "KEEE", "DJT", "CYYZ", "KNEW")
+    online.loc[online["station"] == "CYYZ", "country"] = "CA"
+    # A shard holding only KEEE writes an all-null wfo column.
+    online["wfo"] = online["wfo"].where(online["station"] != "KEEE", None)
+    return online
+
+
+def test_sharded_run_matches_unsharded(tmp_path: Path) -> None:
+    partition = _synthetic_partition(tmp_path)
+    windows = [window("2026-07-09T11:00Z", "2026-07-09T14:00Z")]
+    fetched = _synthetic_fetch()
+    base_ids = set(pd.read_parquet(partition, columns=["station"])["station"])
+    ids = sorted(base_ids | set(fetched["station"]))
+    assert "KNEW" in ids and "KNEW" not in base_ids
+
+    whole = run_shard(
+        partition,
+        None,
+        fetched,
+        _online(),
+        windows,
+        restore_retired_metadata=True,
+        out_dir=tmp_path / "whole",
+    )
+    parts = [
+        run_shard(
+            partition,
+            shard,
+            fetched,
+            _online(),
+            windows,
+            restore_retired_metadata=True,
+            out_dir=tmp_path / "shards" / str(k),
+            shard=k,
+        )
+        for k, shard in enumerate(station_shards(ids, 3))
+    ]
+
+    assert whole.diff.violations == ()
+    assert whole.diff.measurement_changes_in_windows > 0
+    assert whole.diff.added_in_windows > 0
+    assert whole.diff.metadata_restored_by_station == {"PBI": 6}
+    assert sum(part.rows_before for part in parts) == whole.rows_before
+    combined = combine_shard_diffs([part.diff for part in parts])
+    assert combined == whole.diff
+    for column in ("before", "after"):
+        expected = getattr(whole, f"hour_counts_{column}")
+        actual = combine_hour_counts([getattr(part, f"hour_counts_{column}") for part in parts])
+        pd.testing.assert_frame_equal(actual, expected)
+    assert all(part.written_file_violations == () for part in parts)
+    assert sum(part.diff.rows_after for part in parts) == whole.diff.rows_after
+    for result in [whole, *parts]:
+        diff = result.diff
+        added = diff.added_in_windows + diff.added_outside_windows
+        assert diff.rows_before + added - diff.removed_keys == diff.rows_after
+
+
+def test_run_shard_with_a_lone_all_null_column_station_keeps_the_base_schema(
+    tmp_path: Path,
+) -> None:
+    partition = _synthetic_partition(tmp_path)
+    windows = [window("2026-07-09T11:00Z", "2026-07-09T14:00Z")]
+
+    result = run_shard(
+        partition,
+        ["KEEE"],
+        _synthetic_fetch(),
+        _online(),
+        windows,
+        restore_retired_metadata=False,
+        out_dir=tmp_path / "keee",
+    )
+
+    assert result.written_file_violations == ()
+    assert pd.read_parquet(result.candidate)["wfo"].isna().all()
+
+
+def test_run_shard_of_only_incoming_stations_conforms_to_the_base_schema(tmp_path: Path) -> None:
+    partition = _synthetic_partition(tmp_path)
+    windows = [window("2026-07-09T11:00Z", "2026-07-09T14:00Z")]
+
+    result = run_shard(
+        partition,
+        ["KNEW"],
+        _synthetic_fetch(),
+        _online(),
+        windows,
+        restore_retired_metadata=False,
+        out_dir=tmp_path / "knew",
+    )
+
+    assert result.rows_before == 0
+    assert result.diff.added_in_windows == 3
+    assert result.written_file_violations == ()
+    assert result.diff.violations == ()
+
+
+def test_combine_shard_diffs_unions_violations_and_ands_sortedness(tmp_path: Path) -> None:
+    before = observations([("KAAA", "2026-07-09T08:53Z"), ("KBBB", "2026-07-09T08:53Z")])
+    windows = [window("2026-07-09T11:00Z", "2026-07-09T14:00Z")]
+    removed = diff_partitions(before, before.iloc[1:], windows, expected_metadata=None)
+    clean = diff_partitions(before, before, windows, expected_metadata=None)
+
+    combined = combine_shard_diffs([removed, clean])
+
+    assert combined.removed_keys == 1
+    assert combined.rows_before == 4
+    assert combined.violations == removed.violations
+    assert combined.after_sorted
+
+
+def test_reference_hour_counts_use_online_countries_and_aliases() -> None:
+    fetched = observations(
+        [
+            ("KAAA", "2026-07-09T11:53Z"),
+            ("PBI", "2026-07-09T11:53Z"),
+            ("CYYZ", "2026-07-09T11:53Z"),
+            ("KOLD", "2026-07-09T11:53Z"),
+            ("KAAA", "2026-07-09T12:53Z"),
+        ]
+    )
+
+    actual = reference_hour_counts(
+        fetched, _online(), [window("2026-07-09T11:00Z", "2026-07-09T13:00Z")]
+    )
+
+    assert actual["hour_label"].tolist() == [
+        ts("2026-07-09T11:00Z"),
+        ts("2026-07-09T12:00Z"),
+        ts("2026-07-09T13:00Z"),
+    ]
+    assert actual["us_stations"].tolist() == [0, 2, 1]
+
+
+def test_observations_sha256_ignores_row_order() -> None:
+    fetched = _synthetic_fetch()
+
+    shuffled = fetched.sample(frac=1.0, random_state=1)
+
+    assert observations_sha256(fetched) == observations_sha256(shuffled)
+    assert observations_sha256(fetched) != observations_sha256(fetched.iloc[1:])
