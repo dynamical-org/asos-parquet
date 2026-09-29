@@ -110,3 +110,137 @@ def test_parquet_publisher_uses_explicit_destination(tmp_path: Path) -> None:
     # reading the file back yields exactly the composed frame.
     stored = gpd.read_parquet(path)
     assert_frame_equal(stored, observations)
+
+
+_METADATA_COLUMNS = ["name", "elevation", "country", "county", "wfo", "tzname"]
+
+
+def _two_station_observations(*, temperature: float, hour: int) -> pd.DataFrame:
+    kaaa = _observations(temperature=temperature)
+    kbbb = _observations(temperature=temperature).assign(station="KBBB")
+    both = pd.concat([kaaa, kbbb], ignore_index=True)
+    return both.assign(valid=pd.Timestamp(f"2026-08-13T{hour:02d}:00:00Z"))
+
+
+def _two_station_table() -> pd.DataFrame:
+    kbbb = pd.DataFrame(
+        {
+            "station": ["KBBB"],
+            "name": ["Old Name"],
+            "elevation": [10.0],
+            "country": ["US"],
+            "county": ["Palm Beach"],
+            "wfo": ["MFL"],
+            "tzname": ["America/New_York"],
+        }
+    )
+    return pd.concat([_stations(), kbbb], ignore_index=True)
+
+
+def _existing_two_station_partition() -> gpd.GeoDataFrame:
+    observations = _two_station_observations(temperature=60.0, hour=0).drop(columns="wxcodes")
+    enriched = enrich_with_station_metadata(
+        merge_observations(None, observations), _two_station_table()
+    )
+    return gpd.GeoDataFrame(enriched, geometry="geometry", crs="EPSG:4326")
+
+
+def test_asos_composer_keeps_metadata_for_station_absent_from_fresh_table() -> None:
+    existing = _existing_two_station_partition()
+    # KBBB was re-keyed at IEM (like PBI -> DJT) so it no longer appears; KAAA's name changed.
+    fresh = _stations().assign(name="Renamed")
+    incoming = _observations(temperature=68.0).assign(valid=pd.Timestamp("2026-08-13T01:00:00Z"))
+
+    actual = AsosParquetComposer().compose(existing, {"iem": SourceFrame("iem", incoming)}, fresh)
+
+    kbbb = actual[actual["station"] == "KBBB"]
+    assert len(kbbb) == 1
+    assert kbbb[_METADATA_COLUMNS].iloc[0].tolist() == [
+        "Old Name",
+        10.0,
+        "US",
+        "Palm Beach",
+        "MFL",
+        "America/New_York",
+    ]
+    kaaa = actual[actual["station"] == "KAAA"]
+    assert len(kaaa) == 2
+    assert kaaa["name"].tolist() == ["Renamed", "Renamed"]
+    assert kaaa["country"].tolist() == ["US", "US"]
+
+
+def test_asos_composer_rejects_losing_country_for_present_station() -> None:
+    existing = _existing_two_station_partition()
+    fresh = _two_station_table()
+    fresh.loc[fresh["station"] == "KAAA", "country"] = None
+
+    with pytest.raises(ValueError, match="KAAA"):
+        AsosParquetComposer().compose(
+            existing,
+            {"iem": SourceFrame("iem", _observations(temperature=68.0))},
+            fresh,
+        )
+
+
+def test_asos_composer_fills_new_rows_for_absent_station_from_last_known() -> None:
+    earlier = _two_station_observations(temperature=59.0, hour=0).drop(columns="wxcodes")
+    later = _two_station_observations(temperature=60.0, hour=1).drop(columns="wxcodes")
+    existing = gpd.GeoDataFrame(
+        enrich_with_station_metadata(
+            merge_observations(merge_observations(None, earlier), later), _two_station_table()
+        ),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    # KBBB is absent from the fresh table; its re-served (hour 1) and new (hour 2) rows
+    # carry no metadata. KCCC is absent and never had metadata, so it stays null.
+    incoming = pd.concat(
+        [
+            _two_station_observations(temperature=61.0, hour=1).iloc[[1]],
+            _two_station_observations(temperature=68.0, hour=2),
+            _observations(temperature=70.0).assign(station="KCCC"),
+        ],
+        ignore_index=True,
+    )
+
+    actual = AsosParquetComposer().compose(
+        existing, {"iem": SourceFrame("iem", incoming)}, _stations()
+    )
+
+    kbbb = actual[actual["station"] == "KBBB"]
+    assert kbbb["tmpf"].tolist() == [59.0, 61.0, 68.0]
+    assert kbbb["name"].tolist() == ["Old Name"] * 3
+    assert kbbb["elevation"].tolist() == [10.0] * 3
+    assert kbbb["county"].tolist() == ["Palm Beach"] * 3
+    kccc = actual[actual["station"] == "KCCC"]
+    assert len(kccc) == 1
+    assert kccc[_METADATA_COLUMNS].isna().all(axis=None)
+
+
+def test_enrich_without_metadata_columns_matches_plain_merge() -> None:
+    observations = merge_observations(
+        None, _two_station_observations(temperature=60.0, hour=0).drop(columns="wxcodes")
+    )
+    stations = _stations()
+
+    actual = enrich_with_station_metadata(observations, stations)
+
+    expected = observations.merge(
+        stations[["station", *_METADATA_COLUMNS]], on="station", how="left"
+    )
+    assert_frame_equal(actual, expected)
+
+
+def test_asos_composer_tolerates_rows_already_missing_country() -> None:
+    # Prod partitions already hold blanked rows for re-keyed stations (PBI, 2V5);
+    # carrying those nulls forward is not a loss.
+    existing = _existing_two_station_partition()
+    existing.loc[existing["station"] == "KBBB", _METADATA_COLUMNS] = None
+
+    actual = AsosParquetComposer().compose(
+        existing,
+        {"iem": SourceFrame("iem", _observations(temperature=68.0))},
+        _stations(),
+    )
+
+    assert actual.loc[actual["station"] == "KBBB", "country"].isna().all()
