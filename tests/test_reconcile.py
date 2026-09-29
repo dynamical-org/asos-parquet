@@ -1,9 +1,14 @@
-from collections.abc import Sequence
+import importlib.util
+import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 
 from asos_parquet.composers import ParquetPublisher
@@ -30,6 +35,7 @@ from asos_parquet.reconcile import (
     window_hour_counts,
     written_file_violations,
 )
+from asos_parquet.stations import StationFetchResult
 
 
 def ts(value: str) -> pd.Timestamp:
@@ -642,14 +648,44 @@ def test_column_order_and_dtype_changes_are_violations() -> None:
     assert any("dtype" in violation and "tmpf" in violation for violation in diff.violations)
 
 
-def test_diff_ignores_geometry_and_bbox() -> None:
+def test_diff_rejects_geometry_changes_outside_windows() -> None:
     before = _existing_with_null_pbi_metadata()
     after = before.copy()
     after["geometry"] = gpd.points_from_xy([0.0] * len(after), [0.0] * len(after))
 
     diff = diff_partitions(before, after, WINDOWS, expected_metadata=None)
 
+    assert diff.measurement_changes_by_column == {"geometry": 3}
+    assert diff.measurement_changes_outside_windows == 3
+    assert any("outside" in violation for violation in diff.violations)
+
+
+def test_geometry_changes_inside_windows_count_as_measurement_changes() -> None:
+    before = _existing_with_null_pbi_metadata()
+    after = before.copy()
+    after["geometry"] = gpd.points_from_xy([0.0] * len(after), [0.0] * len(after))
+    windows = [window("2026-07-09T11:00Z", "2026-07-09T16:00Z")]
+
+    diff = diff_partitions(before, after, windows, expected_metadata=None)
+
+    assert diff.measurement_changes_in_windows == 3
     assert diff.violations == ()
+
+
+def test_diff_compares_decoded_geometry_with_stored_wkb_and_null_equals_null(
+    tmp_path: Path,
+) -> None:
+    before = _existing_with_null_pbi_metadata()
+    before.loc[0, ["longitude", "latitude"]] = float("nan")
+    before.loc[0, "geometry"] = None
+    written = ParquetPublisher(tmp_path).publish(before, 2026)
+    after = pd.read_parquet(written)[list(before.columns)]
+    assert isinstance(after["geometry"].iloc[1], bytes)
+
+    diff = diff_partitions(before, after, WINDOWS, expected_metadata=None)
+
+    assert diff.violations == ()
+    assert diff.measurement_changes_by_column == {}
 
 
 # --- written file ------------------------------------------------------------
@@ -666,6 +702,44 @@ def test_written_file_violations(tmp_path: Path) -> None:
     changed = ParquetPublisher(tmp_path / "changed").publish(retyped, 2026)
     violations = written_file_violations(reference, changed)
     assert any("valid" in violation for violation in violations)
+
+
+def _with_geo(source: Path, target: Path, edit: Callable[[dict[str, Any]], None]) -> Path:
+    table = pq.read_table(source)
+    metadata = dict(table.schema.metadata or {})
+    geo = json.loads(metadata[b"geo"])
+    edit(geo)
+    metadata[b"geo"] = json.dumps(geo).encode()
+    pq.write_table(table.replace_schema_metadata(metadata), target)
+    return target
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (
+            lambda geo: geo["columns"]["geometry"]["covering"]["bbox"].update(xmin=["bbox", "x0"]),
+            "covering",
+        ),
+        (
+            lambda geo: geo["columns"]["geometry"]["covering"]["bbox"].update(ymax=["box", "ymax"]),
+            "covering",
+        ),
+        (lambda geo: geo.update(primary_column="geom"), "primary_column"),
+        (lambda geo: geo["columns"]["geometry"].update(encoding="point"), "encoding"),
+    ],
+)
+def test_written_file_violations_checks_geo_metadata(
+    tmp_path: Path, edit: Callable[[dict[str, Any]], None], message: str
+) -> None:
+    reference = ParquetPublisher(tmp_path / "reference").publish(
+        _existing_with_null_pbi_metadata(), 2026
+    )
+    tampered = _with_geo(reference, tmp_path / "tampered.parquet", edit)
+
+    violations = written_file_violations(reference, tampered)
+
+    assert any(message in violation for violation in violations), violations
 
 
 def test_unresolved_station_ids_lists_existing_in_window_ids_with_no_returned_rows() -> None:
@@ -873,3 +947,94 @@ def test_observations_sha256_ignores_row_order() -> None:
 
     assert observations_sha256(fetched) == observations_sha256(shuffled)
     assert observations_sha256(fetched) != observations_sha256(fetched.iloc[1:])
+
+
+def test_window_hour_counts_counts_a_station_once_across_windows_in_one_hour() -> None:
+    reports = observations([("ORD", "2026-02-10T06:10Z"), ("ORD", "2026-02-10T06:40Z")])
+    reports["country"] = "US"
+    windows = [
+        window("2026-02-10T06:05Z", "2026-02-10T06:15Z"),
+        window("2026-02-10T06:35Z", "2026-02-10T06:45Z"),
+    ]
+
+    actual = window_hour_counts(reports, windows)
+
+    assert actual["hour_label"].tolist() == [ts("2026-02-10T07:00Z")]
+    assert actual["us_stations"].tolist() == [1]
+    assert reference_hour_counts(reports, _online(), windows)["us_stations"].tolist() == [0]
+    ord_online = pd.concat([_online(), stations_table("ORD")], ignore_index=True)
+    assert reference_hour_counts(reports, ord_online, windows)["us_stations"].tolist() == [1]
+
+
+# --- dry run script ------------------------------------------------------------
+
+
+def _dry_run() -> ModuleType:
+    path = Path(__file__).resolve().parents[1] / "scripts" / "reconcile_dry_run.py"
+    spec = importlib.util.spec_from_file_location("reconcile_dry_run", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+DRY_RUN_WINDOWS = "2026-07-09T11:00Z/2026-07-09T14:00Z"
+
+
+def _patched_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    fetch: FakeResult,
+    failed_networks: tuple[str, ...] = (),
+) -> ModuleType:
+    dry = _dry_run()
+    monkeypatch.setattr(
+        dry, "fetch_online_stations", lambda: StationFetchResult(_online(), failed_networks)
+    )
+    monkeypatch.setattr(dry, "fetch_iem", lambda *args: fetch)
+    return dry
+
+
+@pytest.mark.parametrize(
+    ("fetch", "failed_networks", "status"),
+    [
+        (FakeResult(pd.DataFrame()), (), "aborted: no observations fetched"),
+        (
+            FakeResult(_synthetic_fetch(), errors=("Chunk 0: HTTP 503",)),
+            (),
+            "aborted: fetch errors",
+        ),
+        (FakeResult(_synthetic_fetch()), ("FL_ASOS",), "aborted: station discovery incomplete"),
+    ],
+)
+def test_dry_run_aborts_before_composing_on_incomplete_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fetch: FakeResult,
+    failed_networks: tuple[str, ...],
+    status: str,
+) -> None:
+    dry = _patched_dry_run(monkeypatch, fetch, failed_networks)
+
+    code = dry.run(_synthetic_partition(tmp_path), DRY_RUN_WINDOWS, False, tmp_path / "out")
+
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert code == 2
+    assert summary["status"] == status
+    assert summary["violations"]
+    assert "candidate" not in summary and "shards" not in summary
+
+
+def test_dry_run_single_candidate_passes_on_a_clean_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dry = _patched_dry_run(monkeypatch, FakeResult(_synthetic_fetch()))
+
+    code = dry.run(
+        _synthetic_partition(tmp_path), DRY_RUN_WINDOWS, True, tmp_path / "out", reference=True
+    )
+
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert code == 0, summary["violations"]
+    assert summary["verification"] == "single candidate"
+    assert summary["diff"]["metadata_restored_by_station"] == {"PBI": 6}
+    assert all("us_stations_iem" in row for row in summary["hour_counts"])

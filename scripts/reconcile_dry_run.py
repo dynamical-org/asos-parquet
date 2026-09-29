@@ -249,6 +249,15 @@ def run(
     summary["unresolved_ids"] = unresolved_station_ids(base_keys, observations, windows)
     base_ids = set(base_keys["station"].unique())
     del base_keys
+    # Same completeness rules as modal_app's manual reconcile: nothing is composed unless
+    # the fetch returned rows and every chunk succeeded.
+    if observations.empty:
+        summary |= {
+            "status": "aborted: no observations fetched",
+            "violations": [f"no observations fetched from {len(requested)} stations"],
+        }
+        write_summary(out, summary, started)
+        return 2
     if not fetched.complete:
         summary |= {"status": "aborted: fetch errors", "violations": list(fetched.errors)}
         write_summary(out, summary, started)

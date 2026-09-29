@@ -24,6 +24,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import shapely
 
 from .composers import AsosParquetComposer, ParquetPublisher, SourceFrame
 from .load import STATION_METADATA_COLUMNS
@@ -38,7 +39,9 @@ logger = logging.getLogger(__name__)
 
 _HOUR = pd.Timedelta(hours=1)
 _LABEL_UNIT: Literal["us"] = "us"
-_IGNORED_DIFF_COLUMNS = frozenset({"geometry", "bbox"})
+# bbox is regenerated from geometry on write; geometry itself is compared as WKB.
+_IGNORED_DIFF_COLUMNS = frozenset({"bbox"})
+_GEOMETRY = "geometry"
 _KEY_COLUMNS = ("station", "valid")
 
 
@@ -321,17 +324,22 @@ def coverage_report(
 
 
 def window_hour_counts(gdf: pd.DataFrame, windows: Sequence[Window]) -> pd.DataFrame:
-    """US distinct-station counts per right-labelled hour, inside the windows, full grid."""
-    series: list[pd.Series] = []
-    for window in normalize_windows(windows):
-        inside = gdf[(gdf["valid"] >= window.start) & (gdf["valid"] < window.end)]
+    """US distinct-station counts per right-labelled hour, inside the windows, full grid.
+
+    Rows from every window are pooled before counting, so a station reporting in two
+    windows that share an hour label counts once.
+    """
+    windows = normalize_windows(windows)
+    inside = pd.Series(False, index=gdf.index)
+    grid = pd.DatetimeIndex([], dtype=f"datetime64[{_LABEL_UNIT}, UTC]", name="hour_label")
+    for window in windows:
+        inside |= (gdf["valid"] >= window.start) & (gdf["valid"] < window.end)
         first = _label_of(window.start)
         last = _label_of(window.end - pd.Timedelta(1, "ns"))
-        series.append(_us_hour_counts(inside, first, last))
-    if not series:
-        return pd.DataFrame({"hour_label": [], "us_stations": []})
-    counts = pd.concat(series)
-    counts = counts.groupby(level=0).sum()
+        grid = grid.union(_hour_grid(first, last))
+    rows = gdf.loc[inside & (gdf["country"] == "US"), ["station", "valid"]]
+    counts = rows.groupby(hour_label(rows["valid"]))["station"].nunique()
+    counts = counts.reindex(grid, fill_value=0).astype("int64")
     result: pd.DataFrame = counts.rename("us_stations").rename_axis("hour_label").reset_index()
     return result
 
@@ -454,6 +462,15 @@ def _indices(rows: npt.NDArray[np.int64]) -> pa.Int64Array:
     return pa.array(rows, type=pa.int64())
 
 
+def _wkb_at(series: pd.Series, rows: npt.NDArray[np.int64]) -> "pa.Array[Any]":
+    """WKB bytes of the geometry at ``rows``, from shapely geometries or stored WKB."""
+    if isinstance(series.dtype, gpd.array.GeometryDtype):
+        values = shapely.to_wkb(np.asarray(series.array)[rows])
+    else:
+        values = series.to_numpy(dtype=object)[rows]
+    return pa.array(values, type=pa.binary())
+
+
 def _changed(
     before: pd.Series,
     after: pd.Series,
@@ -461,8 +478,12 @@ def _changed(
     after_rows: npt.NDArray[np.int64],
 ) -> npt.NDArray[np.bool_]:
     """Row-aligned inequality where null/NaN equals null/NaN."""
-    left = pc.take(_arrow(before), _indices(before_rows))
-    right = pc.take(_arrow(after), _indices(after_rows))
+    if before.name == _GEOMETRY:
+        left = _wkb_at(before, before_rows)
+        right = _wkb_at(after, after_rows)
+    else:
+        left = pc.take(_arrow(before), _indices(before_rows))
+        right = pc.take(_arrow(after), _indices(after_rows))
     equal = cast(pa.BooleanArray, pc.fill_null(pc.equal(left, right), pa.scalar(False)))
     both_null = pc.and_(pc.is_null(left, nan_is_null=True), pc.is_null(right, nan_is_null=True))
     same = pc.or_(equal, both_null)
@@ -532,7 +553,9 @@ def diff_partitions(
         )
     common = [column for column in before.columns if column in after.columns]
     for column in common:
-        if before[column].dtype != after[column].dtype:
+        # Geometry may be decoded on one side and stored WKB on the other; it is compared
+        # as WKB below and its written Arrow type is checked by written_file_violations.
+        if column != _GEOMETRY and before[column].dtype != after[column].dtype:
             violations.append(
                 f"dtype changed for {column}: {before[column].dtype} -> {after[column].dtype}"
             )
@@ -629,7 +652,7 @@ def diff_partitions(
         if column not in _IGNORED_DIFF_COLUMNS
         and column not in STATION_METADATA_COLUMNS
         and column not in _KEY_COLUMNS
-        and before[column].dtype == after[column].dtype
+        and (column == _GEOMETRY or before[column].dtype == after[column].dtype)
     ]
     measurement_changed = np.zeros(len(before_rows), dtype=bool)
     by_column: dict[str, int] = {}
@@ -711,9 +734,47 @@ def written_file_violations(reference: Path, candidate: Path) -> tuple[str, ...]
             continue
         if written.get("crs") != spec.get("crs"):
             violations.append(f"geo CRS changed for {column}")
+        if written.get("encoding") != spec.get("encoding"):
+            violations.append(
+                f"geo encoding changed for {column}: {spec.get('encoding')} -> "
+                f"{written.get('encoding')}"
+            )
         if "covering" not in written:
             violations.append(f"geo covering missing for {column}")
+            continue
+        violations += [
+            f"geo covering for {column}: {problem}"
+            for problem in _covering_problems(written["covering"], actual)
+        ]
+    if actual_geo.get("primary_column") != expected_geo.get("primary_column"):
+        violations.append(
+            f"geo primary_column changed: {expected_geo.get('primary_column')} -> "
+            f"{actual_geo.get('primary_column')}"
+        )
     return tuple(violations)
+
+
+def _covering_problems(covering: object, schema: pa.Schema) -> list[str]:
+    """Each covering bbox path must name a double field that exists in the schema."""
+    if not isinstance(covering, dict) or not isinstance(covering.get("bbox"), dict):
+        return [f"no bbox covering in {covering!r}"]
+    bbox = covering["bbox"]
+    problems: list[str] = []
+    for key in ("xmin", "ymin", "xmax", "ymax"):
+        path = bbox.get(key)
+        if not isinstance(path, list) or len(path) != 2:
+            problems.append(f"{key} path {path!r} is not [column, field]")
+            continue
+        column, child = path
+        if column not in schema.names:
+            problems.append(f"{key} path {path} names missing column {column!r}")
+            continue
+        column_type = schema.field(column).type
+        if not pa.types.is_struct(column_type) or column_type.get_field_index(child) < 0:
+            problems.append(f"{key} path {path} names missing field {child!r}")
+        elif not pa.types.is_floating(column_type.field(child).type):
+            problems.append(f"{key} path {path} is not floating point")
+    return problems
 
 
 # --- sharded verification ----------------------------------------------------
@@ -860,7 +921,7 @@ def _conform_to_base(composed: gpd.GeoDataFrame, base: pd.DataFrame) -> gpd.GeoD
     dtypes = {
         column: base[column].dtype
         for column in shared
-        if column not in _IGNORED_DIFF_COLUMNS and composed[column].dtype != base[column].dtype
+        if column not in (_GEOMETRY, "bbox") and composed[column].dtype != base[column].dtype
     }
     conformed = composed[order].astype(dtypes)
     return gpd.GeoDataFrame(conformed, geometry="geometry", crs=composed.crs)
