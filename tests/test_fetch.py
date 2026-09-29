@@ -199,6 +199,21 @@ def test_bulk_chunk_header_only_csv_is_empty(monkeypatch: pytest.MonkeyPatch) ->
     assert len(get.calls) == 1
 
 
+def test_bulk_chunk_csv_with_only_wind_reports_is_empty(
+    monkeypatch: pytest.MonkeyPatch, no_sleep: None
+) -> None:
+    # parse_observations drops rows without tmpf; a chunk of only wind-only
+    # reports is a legitimate empty chunk, not a bad payload.
+    lines = (FIXTURES / "iem_observations.csv").read_text().splitlines()
+    wind_only = [line for line in lines[1:] if line.split(",")[2] == ""]
+    assert wind_only
+    get = RecordingGet(FakeResponse("\n".join([lines[0], *wind_only]) + "\n"))
+    monkeypatch.setattr("asos_parquet.fetch.requests.get", get)
+
+    assert fetch_bulk_chunk(["KJFK"], START, END, chunk_id=5) == (5, None, None)
+    assert len(get.calls) == 1
+
+
 def test_bulk_chunk_retries_unparseable_ok_body(
     monkeypatch: pytest.MonkeyPatch, no_sleep: None
 ) -> None:

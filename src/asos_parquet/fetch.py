@@ -277,18 +277,6 @@ def _describe_chunk(
     return f"Chunk {chunk_id} [{period}, {stations}]"
 
 
-def _is_empty_result(text: str) -> bool:
-    """Whether a response body is IEM's way of saying there is no data."""
-    if "No results found" in text:
-        return True
-    lines = text.splitlines()
-    return (
-        bool(lines)
-        and lines[0].startswith("station,valid")
-        and not any(line.strip() for line in lines[1:])
-    )
-
-
 def fetch_bulk_chunk(
     station_ids: list[str],
     start_date: pd.Timestamp,
@@ -330,15 +318,21 @@ def fetch_bulk_chunk(
                 continue
 
             # Check for empty response
-            if _is_empty_result(text):
+            if "No results found" in text:
                 return (chunk_id, None, None)
 
-            # Anything else that doesn't parse (e.g. an HTML error page served
-            # with 200) is a bad payload, not an empty chunk: retry it.
+            # IEM's CSV that parses to None (header-only, or every row lacks
+            # tmpf) is a legitimate empty chunk. Anything that isn't IEM's CSV
+            # (e.g. an HTML error page served with 200) or fails to parse is a
+            # bad payload: retry it.
+            is_iem_csv = text.startswith("station,valid")
             try:
                 df = parse_observations(response.text, timestamp_format="mixed")
             except (pd.errors.ParserError, ValueError):
                 df = None
+                is_iem_csv = False
+            if df is None and is_iem_csv:
+                return (chunk_id, None, None)
             if df is None:
                 attempt += 1
                 if attempt > MAX_RETRIES:
