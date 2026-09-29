@@ -746,6 +746,12 @@ def written_file_violations(reference: Path, candidate: Path) -> tuple[str, ...]
             f"geo covering for {column}: {problem}"
             for problem in _covering_problems(written["covering"], actual)
         ]
+        # Paths can exist and still point at the wrong bound (x vs y); the publisher
+        # regenerates the same bbox struct, so the mapping must match the reference.
+        if "covering" in spec and written["covering"] != spec["covering"]:
+            violations.append(
+                f"geo covering changed for {column}: {spec['covering']} -> {written['covering']}"
+            )
     if actual_geo.get("primary_column") != expected_geo.get("primary_column"):
         violations.append(
             f"geo primary_column changed: {expected_geo.get('primary_column')} -> "

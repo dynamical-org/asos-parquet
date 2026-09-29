@@ -725,6 +725,12 @@ def _with_geo(source: Path, target: Path, edit: Callable[[dict[str, Any]], None]
             lambda geo: geo["columns"]["geometry"]["covering"]["bbox"].update(ymax=["box", "ymax"]),
             "covering",
         ),
+        (
+            lambda geo: geo["columns"]["geometry"]["covering"]["bbox"].update(
+                xmin=["bbox", "ymin"], xmax=["bbox", "ymax"]
+            ),
+            "covering",
+        ),
         (lambda geo: geo.update(primary_column="geom"), "primary_column"),
         (lambda geo: geo["columns"]["geometry"].update(encoding="point"), "encoding"),
     ],
