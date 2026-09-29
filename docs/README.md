@@ -56,11 +56,13 @@ Replace `{YOUR_BUCKET}` with your S3 or R2 bucket name. See [R2/S3 Configuration
 
 ### Update Frequency
 
-- **Current year**: Updated hourly (at minute 5 of each hour)
+- **Current year**: Updated twice an hour (at minutes 20 and 50, UTC)
 - **Historical years**: Static after year ends
-- **Latency**: ~5-10 minutes after observation time
+- **Latency**: ~30-60 minutes from observation to availability (IEM itself lags ~25-40 minutes)
 
 Updates are performed via serverless functions that fetch recent observations from Iowa Mesonet, merge with existing data, and upload to S3.
+
+**Late reports and revisions:** Each run re-fetches the last 6 hours, and a daily run (05:35 UTC) re-fetches the last 72 hours, so reports IEM publishes up to ~48 hours late are picked up. Older gaps are only filled by a manual reconcile. A re-fetched report replaces the stored row for the same `(station, valid)`, so rows can be revised by later fetches.
 
 ### Partitioning Strategy
 
@@ -122,7 +124,7 @@ conn.execute("SET s3_url_style = 'path';")
 
 | Dimension | Description | Example |
 |-----------|-------------|---------|
-| `station` | ICAO station identifier | `KJFK`, `KLAX`, `KORD` |
+| `station` | IEM station identifier (usually 3 letters for US sites, not ICAO) | `JFK`, `LAX`, `ORD` |
 | `valid` | Observation timestamp (UTC) | `2024-01-15 14:53:00+00:00` |
 | `year` | Partition key (from Hive path) | `2024` |
 
@@ -147,6 +149,14 @@ conn.execute("SET s3_url_style = 'path';")
 | `longitude` | Station longitude | degrees |
 | `state` | US state code | 2-letter |
 | `geometry` | Point geometry (GeoParquet) | WKB |
+
+### Station Identity and Metadata
+
+`station` is the Iowa Environmental Mesonet identifier, not the ICAO code: `JFK`, not `KJFK`.
+
+IEM occasionally re-keys a station and then serves its whole history under the new ID (PBI→DJT on 2026-07-09, 2V5→RYA on 2026-08-28). Historical IDs are not rewritten. Reports IEM now serves under the new ID from before the re-key boundary are stored under the old ID, so a re-keyed station appears under the old ID up to the boundary and the new ID after it. The alias table lives in [`src/asos_parquet/station_aliases.py`](../src/asos_parquet/station_aliases.py); it is not yet published as a data file.
+
+Station metadata columns (`name`, `elevation`, `state`, `country`, `county`, `wfo`, `tzname`) hold the latest known values for the station, not the values in effect at observation time. A station that disappears from IEM's station tables keeps its last-known values.
 
 ### Data Completeness by Field
 

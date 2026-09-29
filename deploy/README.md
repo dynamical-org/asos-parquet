@@ -73,8 +73,8 @@ uv run modal deploy modal_obs_app.py
 ## Testing
 
 ```bash
-# Run once manually (without waiting for schedule)
-modal run modal_app.py --lookback 2
+# Run the update once manually (without waiting for schedule)
+modal run modal_app.py::main --lookback 6
 
 # View logs
 modal app logs asos-parquet-update
@@ -82,6 +82,22 @@ modal app logs asos-parquet-update
 # Check deployment status
 modal app list
 ```
+
+### Manual reconcile
+
+To heal a gap older than the daily reconcile's 72 hours, re-fetch explicit UTC
+windows (`[start, end)`, each endpoint with a zone; comma-separate several):
+
+```bash
+modal run modal_app.py::reconcile --windows 2026-02-10T02:00Z/2026-02-10T16:00Z
+modal run modal_app.py::reconcile --windows START/END[,START/END...] --restore-retired-metadata
+```
+
+Manual runs are strict: a failed fetch chunk or station network aborts the run,
+and an acceptance gate (diff against the base, written-file schema) must pass
+before the conditional PUT. Nothing is published on either failure.
+`--restore-retired-metadata` restores the recorded last-known metadata for
+re-keyed stations' old IDs (see `src/asos_parquet/station_aliases.py`).
 
 ## Updating
 
@@ -103,7 +119,15 @@ configured in `obs.py` / `modal_app.py`:
   `asos-parquet` project.
 - **Cron monitoring** — `update_asos_data` sends a Sentry cron check-in
   (`asos-parquet-update` monitor) around each run, alerting on a missed or
-  overrunning run in addition to raised exceptions.
+  overrunning run in addition to raised exceptions. The scheduled daily
+  reconcile checks in to a separate `asos-parquet-reconcile` monitor; manual
+  reconciles do not check in.
+- **Loud failures** — a run fails when any fetch chunk or station network
+  fails, or when it fetches zero observations. Scheduled runs still publish
+  what they fetched before failing.
+- **Coverage check** — after publishing, a run logs an error when a recent hour
+  has fewer than 50% of the usual number of US stations. This is advisory: it
+  does not fail the run.
 
 `modal_obs_app.py` checks in to a separate `obs-parquet-swob-update` monitor.
 While the obs app is undeployed that monitor gets no check-ins, so disable it
@@ -116,24 +140,26 @@ calls.
 
 ## How It Works
 
-The Modal function runs hourly and:
+The Modal function runs at :20 and :50 each hour and:
 
 1. Downloads current year partition from S3 (if exists)
-2. Fetches recent observations from Iowa Mesonet (last 2 hours)
-3. Merges new data with existing, deduplicating on (station, timestamp)
-4. Uploads updated partition back to S3
+2. Fetches recent observations from Iowa Mesonet (last 6 hours)
+3. Merges new data with existing, deduplicating on (station, timestamp) and keeping the newest fetch
+4. Uploads updated partition back to S3 with a conditional PUT
+
+A daily reconcile at 05:35 UTC does the same over the last 72 hours, picking up
+reports IEM publishes up to ~48 hours late. Older gaps need a
+[manual reconcile](#manual-reconcile).
 
 This ensures the current year's data stays up-to-date with minimal compute costs.
 
 ## New Year Rollover
 
-At midnight UTC on Jan 1, the function automatically starts a new year partition:
-
-1. Finds no existing data in S3 for the new year
-2. Fetches observations for the new year
-3. Creates and uploads a new partition
-
-No manual intervention needed.
+The updater does **not** create a new year's partition. When `year=YYYY/data.parquet` is missing it
+refuses to run ("Missing legacy ASOS partition ... refusing to replace its history"), so every run fails from
+00:20 UTC on Jan 1 until the partition is seeded. Windows never cross a year boundary: runs early on Jan 1
+fetch only from 00:00 UTC, so reports from the last hours of Dec 31 that IEM publishes late are not picked up
+by the scheduled runs. Seed the new partition before Jan 1, and reconcile the tail of Dec 31 manually if needed.
 
 ## Troubleshooting
 

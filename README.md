@@ -99,7 +99,7 @@ ORDER BY valid
 - **Stations**: Global ASOS/AWOS airport stations
 - **Time range**: 1940 to present
 - **Resolution**: Hourly (METAR reports)
-- **Updates**: Hourly
+- **Updates**: Twice an hour (:20 and :50 UTC); expect ~30–60 minutes from observation to availability
 - **Format**: Year-partitioned GeoParquet (`year=YYYY/data.parquet`)
 
 Observations are sourced from the [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/) at Iowa State University with no resampling, interpolation, or quality-control filtering applied. Full details on schema, fields, data quality, and access patterns are in the [documentation](https://dynamical.org/catalog/asos-parquet/).
@@ -108,7 +108,7 @@ Observations are sourced from the [Iowa Environmental Mesonet](https://mesonet.a
 
 | Field | Description | Units |
 |-------|-------------|-------|
-| `station` | ICAO identifier | e.g., JFK |
+| `station` | IEM station identifier (usually 3 letters for US sites, not ICAO) | e.g., JFK, ORD |
 | `valid` | Observation time (UTC) | timestamp |
 | `tmpf` / `tmpc` | Air temperature | °F / °C |
 | `dwpf` / `dwpc` | Dew point | °F / °C |
@@ -128,6 +128,11 @@ Observations are sourced from the [Iowa Environmental Mesonet](https://mesonet.a
 | `tzname` | Station timezone | e.g., America/New_York |
 | `longitude` / `latitude` | Station coordinates | decimal degrees |
 | `geometry` | Station location | GeoParquet Point |
+
+Station metadata columns hold the latest known values for the station, not values as of the
+observation. IEM occasionally re-keys a station (PBI→DJT on 2026-07-09, 2V5→RYA on 2026-08-28);
+historical IDs are not rewritten, so a re-keyed station appears under both IDs. See
+[docs/README.md](docs/README.md#station-identity-and-metadata) for details.
 
 ## Build the dataset yourself
 
