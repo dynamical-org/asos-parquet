@@ -2,6 +2,7 @@
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
 import pandas as pd
 import requests
@@ -14,6 +15,14 @@ from .config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StationFetchResult:
+    """Station metadata plus the networks whose metadata could not be fetched."""
+
+    stations: pd.DataFrame
+    failed_networks: tuple[str, ...]
 
 
 def _parse_network_id(network_id: str) -> tuple[str, str]:
@@ -88,6 +97,9 @@ def fetch_all_stations(
 ) -> pd.DataFrame:
     """Fetch station metadata for ASOS networks.
 
+    Networks that fail to fetch are logged and skipped; use
+    fetch_all_stations_result to find out which ones.
+
     Args:
         networks: List of network ID strings to fetch. Defaults to US-only networks.
         online_only: If True, only return currently online stations.
@@ -95,10 +107,27 @@ def fetch_all_stations(
     Returns:
         DataFrame with all station metadata
     """
+    return fetch_all_stations_result(networks=networks, online_only=online_only).stations
+
+
+def fetch_all_stations_result(
+    networks: list[str] | None = None,
+    online_only: bool = False,
+) -> StationFetchResult:
+    """Fetch station metadata for ASOS networks, reporting failed networks.
+
+    Args:
+        networks: List of network ID strings to fetch. Defaults to US-only networks.
+        online_only: If True, only return currently online stations.
+
+    Returns:
+        StationFetchResult with all station metadata and the failed network IDs
+    """
     if networks is None:
         networks = get_all_network_ids()
 
     all_stations: list[pd.DataFrame] = []
+    failed_networks: list[str] = []
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS * 2) as executor:
         futures = {
@@ -113,9 +142,11 @@ def fetch_all_stations(
                     all_stations.append(df)
             except Exception as e:
                 logger.warning(f"failed to fetch {network_id} stations: {e}")
+                failed_networks.append(network_id)
 
+    failed = tuple(sorted(failed_networks))
     if not all_stations:
-        return pd.DataFrame()
+        return StationFetchResult(pd.DataFrame(), failed)
 
     stations = pd.concat(all_stations, ignore_index=True)
 
@@ -130,7 +161,9 @@ def fetch_all_stations(
     if online_only:
         stations = stations[stations["online"] == True]  # noqa: E712
 
-    return stations.sort_values(["state", "station"]).reset_index(drop=True)
+    return StationFetchResult(
+        stations.sort_values(["state", "station"]).reset_index(drop=True), failed
+    )
 
 
 def get_stations_for_period(
