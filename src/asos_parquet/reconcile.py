@@ -428,20 +428,36 @@ def compose_partition(
         retired = retired_station_metadata()
         retired = retired[~retired["station"].isin(stations["station"])]
         enrichment = pd.concat([stations, retired], ignore_index=True)
-    if existing is not None and not existing.empty and not observations.empty:
-        observations = observations.copy()
-        observations["valid"] = observations["valid"].astype(existing["valid"].dtype)
-    composed = AsosParquetComposer().compose(
+    if existing is not None and not existing.empty:
+        enrichment = _text_metadata_as(existing, enrichment)
+        if not observations.empty:
+            observations = observations.copy()
+            observations["valid"] = observations["valid"].astype(existing["valid"].dtype)
+    return AsosParquetComposer().compose(
         existing, {"iem": SourceFrame("iem", observations)}, enrichment
     )
-    if existing is None or existing.empty:
-        return composed
-    # IEM's station table can type string columns (county, wfo) as object; keep the
-    # partition's own dtypes so the in-memory candidate matches what it will store.
-    for column, dtype in existing.dtypes.items():
-        if column in composed and column != "geometry" and composed[column].dtype != dtype:
-            composed[column] = composed[column].astype(dtype)
-    return composed
+
+
+def _text_metadata_as(existing: pd.DataFrame, stations: pd.DataFrame) -> pd.DataFrame:
+    """Give the station table's text metadata the partition's string dtype.
+
+    IEM's station table can type text columns (county, wfo) as object while the stored
+    partition reads them back as pandas strings; enrichment would otherwise hand the
+    candidate object columns. Only object -> string is converted, and only when every
+    non-null value is already a str: anything else is left for the gate to reject.
+    """
+    stations = stations.copy()
+    for column in STATION_METADATA_COLUMNS:
+        if column not in existing or column not in stations:
+            continue
+        target = existing[column].dtype
+        if not isinstance(target, pd.StringDtype) or stations[column].dtype != object:
+            continue
+        values = stations[column].dropna()
+        if not values.map(lambda value: isinstance(value, str)).all():
+            raise ValueError(f"station metadata column {column!r} holds non-string values")
+        stations[column] = stations[column].astype(target)
+    return stations
 
 
 # --- coverage ----------------------------------------------------------------

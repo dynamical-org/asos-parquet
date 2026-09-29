@@ -1245,3 +1245,37 @@ def test_compose_keeps_the_base_dtypes_when_iem_metadata_is_object(tmp_path: Pat
     assert candidate[list(base.columns)].dtypes.to_dict() == base.dtypes.to_dict()
     diff = diff_partitions(base, candidate, WINDOWS, expected_metadata=None)
     assert not [v for v in diff.violations if "dtype" in v], diff.violations
+
+
+def test_compose_rejects_non_string_iem_text_metadata(tmp_path: Path) -> None:
+    written = ParquetPublisher(tmp_path / "base").publish(
+        compose_partition(
+            None, observations([("KAAA", "2026-02-10T00:53Z")]), stations_table("KAAA")
+        ),
+        2026,
+    )
+    base = gpd.read_parquet(written)
+    fresh = stations_table("KAAA")
+    fresh["county"] = pd.Series([123], dtype=object)
+
+    with pytest.raises(ValueError, match="county"):
+        compose_partition(base, observations([("KAAA", "2026-02-10T01:53Z")]), fresh)
+
+
+def test_compose_leaves_numeric_dtype_changes_to_the_gate(tmp_path: Path) -> None:
+    written = ParquetPublisher(tmp_path / "base").publish(
+        compose_partition(
+            None, observations([("KAAA", "2026-02-10T00:53Z")]), stations_table("KAAA")
+        ),
+        2026,
+    )
+    base = gpd.read_parquet(written)
+    base["elevation"] = base["elevation"].astype("int64")
+    fresh = stations_table("KAAA")
+    fresh["elevation"] = 10.9
+
+    candidate = compose_partition(base, observations([("KAAA", "2026-02-10T01:53Z")]), fresh)
+
+    assert (candidate["elevation"] == 10.9).all()
+    diff = diff_partitions(base, candidate, WINDOWS, expected_metadata=None)
+    assert any("elevation" in violation for violation in diff.violations), diff.violations
