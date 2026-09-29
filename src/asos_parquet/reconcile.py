@@ -202,6 +202,21 @@ def reconcile_fetch_stations(
     return pd.concat([requested, extras], ignore_index=True)
 
 
+def unresolved_station_ids(
+    existing: pd.DataFrame | None,
+    returned: pd.DataFrame,
+    windows: Sequence[Window],
+) -> list[str]:
+    """Station IDs with existing rows inside the windows but no returned (aliased) rows."""
+    if existing is None or existing.empty:
+        return []
+    windows = normalize_windows(windows)
+    inside = _in_windows(_valid_us(existing), windows)
+    expected = set(existing.loc[inside, "station"].unique())
+    got = set(returned["station"].unique()) if "station" in returned.columns else set()
+    return sorted(str(station) for station in expected - got)
+
+
 # --- composing ---------------------------------------------------------------
 
 
@@ -349,9 +364,62 @@ def _valid_us(frame: pd.DataFrame) -> npt.NDArray[np.int64]:
     return np.asarray(naive.to_numpy().view(np.int64), dtype=np.int64)
 
 
-def _station_codes(frame: pd.DataFrame, categories: pd.Index) -> npt.NDArray[np.int64]:
-    codes = pd.Categorical(frame["station"], categories=categories).codes
-    return np.asarray(codes, dtype=np.int64)
+def _station_codes(stations: "pa.Array[Any]", categories: "pa.Array[Any]") -> npt.NDArray[np.int32]:
+    codes = pc.index_in(stations, value_set=categories)
+    if codes.null_count:
+        raise ValueError("station column contains nulls")
+    return np.asarray(codes.to_numpy(zero_copy_only=False), dtype=np.int32)
+
+
+def _pack_keys(
+    codes: npt.NDArray[np.int32], valid_us: npt.NDArray[np.int64], span: int, origin: int
+) -> npt.NDArray[np.int64]:
+    """One int64 per row that sorts like (station, valid)."""
+    keys = codes.astype(np.int64)
+    keys *= span
+    keys += valid_us
+    keys -= origin
+    return keys
+
+
+def _sort_order(keys: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
+    """None when keys are already non-decreasing (the normal, sorted partition)."""
+    if bool((keys[1:] >= keys[:-1]).all()):
+        return None
+    order: npt.NDArray[np.int64] = np.argsort(keys, kind="stable")
+    return order
+
+
+def _alias_checks(
+    codes: npt.NDArray[np.int32],
+    valid_us: npt.NDArray[np.int64],
+    categories: list[str],
+    aliases: Sequence[StationAlias],
+) -> tuple[dict[str, int], dict[str, int], list[str]]:
+    """Successor rows before their boundary, and old/new rows sharing a valid time."""
+    code_of = {station: code for code, station in enumerate(categories)}
+    empty = valid_us[:0]
+    successor_rows: dict[str, int] = {}
+    overlaps: dict[str, int] = {}
+    violations: list[str] = []
+    for alias in aliases:
+        new_code = code_of.get(alias.new_id)
+        old_code = code_of.get(alias.old_id)
+        new_valid = empty if new_code is None else valid_us[codes == new_code]
+        old_valid = empty if old_code is None else valid_us[codes == old_code]
+        early = int((new_valid < _to_us(alias.boundary)).sum())
+        if early:
+            successor_rows[alias.new_id] = early
+            violations.append(
+                f"{early} {alias.new_id} rows before its alias boundary {alias.boundary}"
+            )
+        overlap = len(np.intersect1d(new_valid, old_valid))
+        if overlap:
+            overlaps[f"{alias.old_id}/{alias.new_id}"] = overlap
+            violations.append(
+                f"{overlap} times with both {alias.old_id} and {alias.new_id} rows (alias overlap)"
+            )
+    return successor_rows, overlaps, violations
 
 
 def _to_us(value: pd.Timestamp) -> int:
@@ -464,11 +532,25 @@ def diff_partitions(
                 f"dtype changed for {column}: {before[column].dtype} -> {after[column].dtype}"
             )
 
-    categories = pd.Index(sorted(set(before["station"].unique()) | set(after["station"].unique())))
-    before_codes = _station_codes(before, categories)
-    after_codes = _station_codes(after, categories)
+    before_station = _arrow(before["station"])
+    after_station = _arrow(after["station"])
+    station_ids = {
+        str(station)
+        for column in (before_station, after_station)
+        for station in pc.unique(column).to_pylist()
+        if station is not None
+    }
+    station_names = sorted(station_ids)
+    categories = pa.array(station_names, type=pa.string())
     before_valid = _valid_us(before)
     after_valid = _valid_us(after)
+    before_codes = _station_codes(before_station, categories)
+    after_codes = _station_codes(after_station, categories)
+    del before_station, after_station
+
+    successor_rows, overlaps, alias_violations = _alias_checks(
+        after_codes, after_valid, station_names, aliases
+    )
 
     origin = min(
         before_valid.min(initial=np.iinfo(np.int64).max),
@@ -477,45 +559,49 @@ def diff_partitions(
     span = max(before_valid.max(initial=origin), after_valid.max(initial=origin)) - int(origin) + 1
     if len(categories) and span > np.iinfo(np.int64).max // len(categories):
         raise ValueError("valid range too wide to pack (station, valid) keys into int64")
-    before_keys = before_codes * span + (before_valid - origin)
-    after_keys = after_codes * span + (after_valid - origin)
-    del before_codes
+    before_keys = _pack_keys(before_codes, before_valid, span, int(origin))
+    after_keys = _pack_keys(after_codes, after_valid, span, int(origin))
+    del before_codes, after_codes
 
-    after_steps = np.diff(after_keys)
-    after_sorted = bool((after_steps >= 0).all())
+    after_order = _sort_order(after_keys)
+    after_sorted = after_order is None
     if not after_sorted:
         violations.append("after is not sorted by (station, valid)")
-    after_order = (
-        np.arange(len(after_keys)) if after_sorted else np.argsort(after_keys, kind="stable")
-    )
-    after_sorted_keys = after_keys if after_sorted else after_keys[after_order]
-    duplicate_keys_after = int((np.diff(after_sorted_keys) == 0).sum())
-    del after_steps
+    after_sorted_keys = after_keys if after_order is None else after_keys[after_order]
+    del after_keys
+    duplicate_keys_after = int((after_sorted_keys[1:] == after_sorted_keys[:-1]).sum())
     if duplicate_keys_after:
         violations.append(f"after has {duplicate_keys_after} duplicate (station, valid) keys")
 
-    before_order = np.argsort(before_keys, kind="stable")
-    before_sorted_keys = before_keys[before_order]
+    before_order = _sort_order(before_keys)
+    before_sorted_keys = before_keys if before_order is None else before_keys[before_order]
     del before_keys
 
     # Before rows -> matching after rows.
     position = np.searchsorted(after_sorted_keys, before_sorted_keys)
-    clipped = np.minimum(position, max(len(after_sorted_keys) - 1, 0))
+    np.minimum(position, max(len(after_sorted_keys) - 1, 0), out=position)
     found = (
-        (position < len(after_sorted_keys)) & (after_sorted_keys[clipped] == before_sorted_keys)
+        after_sorted_keys[position] == before_sorted_keys
         if len(after_sorted_keys)
         else np.zeros(len(before_sorted_keys), dtype=bool)
     )
+    del after_sorted_keys, before_sorted_keys
     removed_keys = int((~found).sum())
     if removed_keys:
-        sample = before.iloc[before_order[~found][:5]][list(_KEY_COLUMNS)]
+        missing = np.flatnonzero(~found)[:5]
+        missing = missing if before_order is None else before_order[missing]
+        sample = before.iloc[missing][list(_KEY_COLUMNS)]
         violations.append(f"{removed_keys} keys removed, e.g. {sample.astype(str).values.tolist()}")
-    before_rows = np.asarray(before_order[found], dtype=np.int64)
-    after_rows = np.asarray(after_order[clipped[found]], dtype=np.int64)
-    del position, clipped, found, before_order, before_sorted_keys
+    matched = np.flatnonzero(found)
+    del found
+    before_rows = matched if before_order is None else before_order[matched]
+    after_positions = position[matched]
+    del position, matched, before_order
+    after_rows = after_positions if after_order is None else after_order[after_positions]
+    del after_positions, after_order
 
     # After rows absent from before.
-    added_mask = np.ones(len(after_keys), dtype=bool)
+    added_mask = np.ones(len(after_valid), dtype=bool)
     added_mask[after_rows] = False
     added_inside = added_mask & _in_windows(after_valid, windows)
     added_outside = int((added_mask & ~added_inside).sum())
@@ -562,26 +648,7 @@ def diff_partitions(
     )
     violations.extend(metadata_violations)
 
-    successor_rows: dict[str, int] = {}
-    overlaps: dict[str, int] = {}
-    after_stations = pd.Index(categories)
-    for alias in aliases:
-        new_code = after_stations.get_indexer([alias.new_id])[0]
-        old_code = after_stations.get_indexer([alias.old_id])[0]
-        new_valid = after_valid[after_codes == new_code] if new_code >= 0 else after_valid[:0]
-        old_valid = after_valid[after_codes == old_code] if old_code >= 0 else after_valid[:0]
-        early = int((new_valid < _to_us(alias.boundary)).sum())
-        if early:
-            successor_rows[alias.new_id] = early
-            violations.append(
-                f"{early} {alias.new_id} rows before its alias boundary {alias.boundary}"
-            )
-        overlap = len(np.intersect1d(new_valid, old_valid))
-        if overlap:
-            overlaps[f"{alias.old_id}/{alias.new_id}"] = overlap
-            violations.append(
-                f"{overlap} times with both {alias.old_id} and {alias.new_id} rows (alias overlap)"
-            )
+    violations.extend(alias_violations)
 
     return PartitionDiff(
         rows_before=len(before),

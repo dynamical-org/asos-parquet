@@ -20,6 +20,7 @@ from asos_parquet.reconcile import (
     parse_windows,
     partition_year,
     reconcile_fetch_stations,
+    unresolved_station_ids,
     window_hour_counts,
     written_file_violations,
 )
@@ -659,3 +660,18 @@ def test_written_file_violations(tmp_path: Path) -> None:
     changed = ParquetPublisher(tmp_path / "changed").publish(retyped, 2026)
     violations = written_file_violations(reference, changed)
     assert any("valid" in violation for violation in violations)
+
+
+def test_unresolved_station_ids_lists_existing_in_window_ids_with_no_returned_rows() -> None:
+    existing = observations(
+        [
+            ("KAAA", "2026-02-10T01:53Z"),
+            ("KBBB", "2026-02-10T01:53Z"),
+            ("KCCC", "2026-02-10T05:53Z"),
+            ("PBI", "2026-02-10T01:53Z"),
+        ]
+    )
+    returned = observations([("KAAA", "2026-02-10T02:53Z"), ("PBI", "2026-02-10T02:53Z")])
+
+    assert unresolved_station_ids(existing, returned, WINDOWS) == ["KBBB"]
+    assert unresolved_station_ids(existing, pd.DataFrame(), WINDOWS) == ["KAAA", "KBBB", "PBI"]
