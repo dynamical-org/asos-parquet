@@ -92,7 +92,7 @@ def _stations() -> pd.DataFrame:
     )
 
 
-def _observations(valid: str, station: str = "KAAA") -> pd.DataFrame:
+def _observations(valid: str, station: str = "KAAA", tmpf: float = 68.0) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "station": [station],
@@ -100,7 +100,7 @@ def _observations(valid: str, station: str = "KAAA") -> pd.DataFrame:
             "longitude": [-90.0],
             "latitude": [40.0],
             "state": ["IA"],
-            "tmpf": [68.0],
+            "tmpf": [tmpf],
             "tmpc": [20.0],
             "dwpf": [50.0],
             "dwpc": [10.0],
@@ -205,17 +205,24 @@ def fake_s3(s3_env: Any, tmp_path: Path) -> FakeS3:
 
 def _fake_stations(
     monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame, failed: tuple[str, ...] = ()
-) -> None:
-    monkeypatch.setattr(
-        stations,
-        "fetch_all_stations_result",
-        lambda networks=None, online_only=False: StationFetchResult(frame, failed),
-    )
+) -> list[None]:
+    calls: list[None] = []
+
+    def discover(networks: Any = None, online_only: bool = False) -> StationFetchResult:
+        calls.append(None)
+        return StationFetchResult(frame, failed)
+
+    monkeypatch.setattr(stations, "fetch_all_stations_result", discover)
+    return calls
 
 
 class RecordingFetch:
-    def __init__(self, observations: pd.DataFrame, errors: tuple[str, ...]) -> None:
-        self.observations = observations
+    """Returns ``observations`` (or the next of a list of frames, one per call)."""
+
+    def __init__(
+        self, observations: pd.DataFrame | list[pd.DataFrame], errors: tuple[str, ...]
+    ) -> None:
+        self.responses = observations if isinstance(observations, list) else [observations]
         self.errors = errors
         self.calls: list[tuple[list[str], pd.Timestamp, pd.Timestamp]] = []
 
@@ -223,11 +230,14 @@ class RecordingFetch:
         self, stations: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, **kwargs: Any
     ) -> BulkFetchResult:
         self.calls.append((list(stations["station"]), start, end))
-        return BulkFetchResult(self.observations, 4, self.errors)
+        observations = self.responses[min(len(self.calls), len(self.responses)) - 1]
+        return BulkFetchResult(observations, 4, self.errors)
 
 
 def _fake_fetch(
-    monkeypatch: pytest.MonkeyPatch, observations: pd.DataFrame, errors: tuple[str, ...] = ()
+    monkeypatch: pytest.MonkeyPatch,
+    observations: pd.DataFrame | list[pd.DataFrame],
+    errors: tuple[str, ...] = (),
 ) -> RecordingFetch:
     recording = RecordingFetch(observations, errors)
     monkeypatch.setattr(fetch, "fetch_observations_bulk_result", recording)
@@ -412,38 +422,52 @@ def test_update_publishes_then_fails_when_a_network_is_missing(
     assert len(fake_s3.puts) == 1
 
 
-def test_conflict_rebases_on_new_base_with_same_fetch(
+def test_conflict_restarts_from_discovery_and_keeps_concurrent_correction(
     monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, tmp_path: Path
 ) -> None:
-    concurrent = _observations("2026-09-28T09:00:00Z", "KCON")
+    # Our first fetch sees tmpf 68 for KAAA at _recent(); meanwhile another run
+    # publishes IEM's correction (75) for the same key, plus a KCON row. The
+    # retry must re-fetch (IEM now says 75), not overlay our stale 68.
     fake_s3.concurrent_body = _partition_bytes(
-        tmp_path, [_observations("2026-01-01T00:00:00Z"), concurrent], "concurrent"
+        tmp_path,
+        [
+            _observations("2026-01-01T00:00:00Z"),
+            _observations(_recent(), tmpf=75.0),
+            _observations("2026-09-28T09:00:00Z", "KCON"),
+        ],
+        "concurrent",
     )
-    _fake_stations(monkeypatch, _stations())
-    recording = _fake_fetch(monkeypatch, _observations(_recent()))
+    discoveries = _fake_stations(monkeypatch, _stations())
+    recording = _fake_fetch(
+        monkeypatch, [_observations(_recent(), tmpf=68.0), _observations(_recent(), tmpf=75.0)]
+    )
 
     result = modal_app._update_asos_data_impl(now=NOW)
 
     assert result["status"] == "success"
-    assert len(recording.calls) == 1
+    assert len(recording.calls) == 2
+    assert len(discoveries) == 2
+    assert fake_s3.gets == 2
     assert [put["IfMatch"] for put in fake_s3.puts] == ["etag-1", "etag-2"]
     assert result["base_etag"] == "etag-2"
     published = fake_s3.put_frame()
     assert set(published["station"]) == {"KAAA", "KCON"}
-    assert pd.Timestamp(_recent()) in set(published["valid"])
+    corrected = published[published["valid"] == pd.Timestamp(_recent())]
+    assert corrected["tmpf"].tolist() == [75.0]
     assert len(published) == 3
 
 
 def test_second_conflict_raises(monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3) -> None:
     fake_s3.put_errors = [_client_error("PreconditionFailed", 412)] * 2
     _fake_stations(monkeypatch, _stations())
-    _fake_fetch(monkeypatch, _observations(_recent()))
+    recording = _fake_fetch(monkeypatch, _observations(_recent()))
 
     with pytest.raises(ClientError, match="PreconditionFailed"):
         modal_app._update_asos_data_impl(now=NOW)
 
     assert len(fake_s3.puts) == 2
     assert fake_s3.gets == 2
+    assert len(recording.calls) == 2
 
 
 def test_other_put_error_raises(monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3) -> None:
@@ -600,13 +624,25 @@ def test_manual_gate_checks_the_written_file_before_every_put(
         checked.append((base.name, candidate.parent.parent.name))
         return ()
 
+    from asos_parquet import reconcile
+
+    diffed: list[int] = []
+    diff_partitions = reconcile.diff_partitions
+
+    def record_diff(before: pd.DataFrame, after: pd.DataFrame, *args: Any, **kwargs: Any) -> Any:
+        diffed.append(len(before))
+        return diff_partitions(before, after, *args, **kwargs)
+
     monkeypatch.setattr("asos_parquet.reconcile.written_file_violations", record)
+    monkeypatch.setattr("asos_parquet.reconcile.diff_partitions", record_diff)
     _fake_stations(monkeypatch, _stations())
-    _fake_fetch(monkeypatch, _observations("2026-09-28T07:00:00Z"))
+    recording = _fake_fetch(monkeypatch, _observations("2026-09-28T07:00:00Z"))
 
     result = _manual()
 
     assert result["status"] == "success"
+    assert len(recording.calls) == 2
+    assert diffed == [1, 2]  # second gate diffs against the concurrent (2-row) base
     assert checked == [("base-1.parquet", "candidate-1"), ("base-2.parquet", "candidate-2")]
     assert [put["IfMatch"] for put in fake_s3.puts] == ["etag-1", "etag-2"]
 

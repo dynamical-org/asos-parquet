@@ -23,8 +23,9 @@ Schedule rationale:
       write collisions (the conditional PUT does that)
 
 Every write is a conditional PUT (IfMatch) against the ETag of the exact bytes
-read. On a conflict the run re-reads the base, recomposes with the same
-fetched observations, and PUTs once more; a second conflict fails the run.
+read. On a conflict the run starts over once from station discovery (re-read
+the base, re-fetch, recompose, re-gate) so it never overlays an older fetch on
+a newer object; a second conflict fails the run.
 
 Manual reconcile over explicit UTC windows ([start, end), each endpoint with a
 zone; several comma-separated windows are fetched once each and published in
@@ -375,6 +376,17 @@ def _read_base(s3: Any, bucket: str, key: str, path: Path) -> _Base:
     return base
 
 
+@dataclass
+class _Published:
+    base: _Base
+    candidate: Any  # the published GeoDataFrame
+    file_size_mb: float
+    response: dict[str, Any]
+    observations: int
+    failures: tuple[str, ...]
+    fetch_summary: str
+
+
 def _is_precondition_failed(error: Exception) -> bool:
     from botocore.exceptions import ClientError
 
@@ -391,7 +403,10 @@ def _publish_windows(
     now: "pd.Timestamp",
     reconcile: bool = False,
 ) -> dict[str, Any]:
-    """Fetch the windows once, merge them into their year partition, and PUT it.
+    """Fetch the windows, merge them into their year partition, and PUT it.
+
+    A 412 on the conditional PUT restarts the whole attempt once (discovery,
+    base read, fetch, compose, gate, PUT); a second 412 raises.
 
     ``reconcile`` (implied by ``manual``) also requests station IDs that only the
     partition knows. ``manual`` is strict: an incomplete fetch or an acceptance
@@ -432,28 +447,28 @@ def _publish_windows(
     logger.info(f"ASOS {mode} started: windows {window_text} → s3://{s3_bucket}/{s3_key}")
     s3 = _s3_client()
 
-    # Step 1: Station metadata
-    networks = get_all_network_ids()
-    logger.info(f"Fetching station metadata for {len(networks)} networks...")
-    station_result = fetch_all_stations_result(networks=networks, online_only=True)
-    online = station_result.stations
-    failed_networks = station_result.failed_networks
-    logger.info(f"Found {len(online)} online stations")
-    if online.empty:
-        raise IncompleteFetchError(
-            f"No online stations found ({len(failed_networks)}/{len(networks)} networks failed)"
-        )
+    expected_metadata = retired_station_metadata() if restore_retired_metadata else None
 
-    # Invocation-local scratch space (flat base path avoids pyarrow Hive inference).
-    with tempfile.TemporaryDirectory(prefix="asos-parquet-") as scratch:
-        work = Path(scratch)
+    def attempt_publish(attempt: int, work: Path) -> _Published:
+        """Steps 1-8 from scratch: nothing from an earlier attempt is reused."""
+        # Step 1: Station metadata
+        networks = get_all_network_ids()
+        logger.info(f"Fetching station metadata for {len(networks)} networks...")
+        station_result = fetch_all_stations_result(networks=networks, online_only=True)
+        online = station_result.stations
+        failed_networks = station_result.failed_networks
+        logger.info(f"Found {len(online)} online stations")
+        if online.empty:
+            raise IncompleteFetchError(
+                f"No online stations found ({len(failed_networks)}/{len(networks)} networks failed)"
+            )
 
         # Step 2: Base partition
-        base = _read_base(s3, s3_bucket, s3_key, work / "base-1.parquet")
+        base = _read_base(s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet")
         existing: gpd.GeoDataFrame | None = gpd.read_parquet(base.path)
         logger.info(f"Read existing partition ({len(existing):,} records)")
 
-        # Step 3-4: Fetch each window once; reused as-is if we have to rebase.
+        # Step 3-4: Fetch each window once per attempt
         requested = reconcile_fetch_stations(online, existing) if manual or reconcile else online
         logger.info(f"Fetching observations for {len(requested)} stations from Iowa Mesonet...")
         fetched = fetch_windows(
@@ -486,70 +501,86 @@ def _publish_windows(
             )
         logger.info(f"Fetched {len(observations):,} observations")
 
-        expected_metadata = retired_station_metadata() if restore_retired_metadata else None
-        for attempt in (1, 2):
-            if existing is None:
-                existing = gpd.read_parquet(base.path)
-            # Step 6: Compose against this exact base
-            candidate = compose_partition(
-                existing,
-                observations,
-                online,  # enrichment: existing-only IDs in the fetch set have no metadata
-                restore_retired_metadata=restore_retired_metadata,
+        # Step 6: Compose against this exact base
+        candidate = compose_partition(
+            existing,
+            observations,
+            online,  # enrichment: existing-only IDs in the fetch set have no metadata
+            restore_retired_metadata=restore_retired_metadata,
+        )
+        logger.info(f"Merged data: {len(candidate):,} total records")
+
+        # Step 7: Acceptance gate (manual only), relative to this base
+        violations: list[str] = []
+        if manual:
+            diff = diff_partitions(
+                existing, candidate, windows, expected_metadata=expected_metadata
             )
-            logger.info(f"Merged data: {len(candidate):,} total records")
+            violations.extend(diff.violations)
+            logger.info(
+                f"Gate diff: {diff.added_in_windows:,} added, "
+                f"{diff.measurement_changes_in_windows:,} revised in windows, "
+                f"metadata restored {diff.metadata_restored_by_station}"
+            )
+        existing = None  # never hold two full frames of the base at once
+        gc.collect()
 
-            # Step 7: Acceptance gate (manual only), relative to this base
-            violations: list[str] = []
-            if manual:
-                diff = diff_partitions(
-                    existing, candidate, windows, expected_metadata=expected_metadata
+        # Step 8: Write locally, then conditional PUT
+        output_path = ParquetPublisher(work / f"candidate-{attempt}").publish(candidate, year)
+        if manual:
+            violations.extend(written_file_violations(base.path, output_path))
+            if violations:
+                raise AcceptanceGateError(
+                    f"Candidate for {window_text} failed the acceptance gate; nothing "
+                    f"published: {'; '.join(violations)}"
                 )
-                violations.extend(diff.violations)
-                logger.info(
-                    f"Gate diff: {diff.added_in_windows:,} added, "
-                    f"{diff.measurement_changes_in_windows:,} revised in windows, "
-                    f"metadata restored {diff.metadata_restored_by_station}"
-                )
-            existing = None  # never hold two full bases at once
-            gc.collect()
+        logger.info(f"Uploading to S3 (IfMatch {base.etag})...")
+        with output_path.open("rb") as body:
+            response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=base.etag)
+        return _Published(
+            base=base,
+            candidate=candidate,
+            file_size_mb=output_path.stat().st_size / 1024 / 1024,
+            response=response,
+            observations=len(observations),
+            failures=tuple(failures),
+            fetch_summary=fetch_summary,
+        )
 
-            # Step 8: Write locally, then conditional PUT
-            output_path = ParquetPublisher(work / f"candidate-{attempt}").publish(candidate, year)
-            if manual:
-                violations.extend(written_file_violations(base.path, output_path))
-                if violations:
-                    raise AcceptanceGateError(
-                        f"Candidate for {window_text} failed the acceptance gate; nothing "
-                        f"published: {'; '.join(violations)}"
-                    )
-            logger.info(f"Uploading to S3 (IfMatch {base.etag})...")
+    # Invocation-local scratch space (flat base path avoids pyarrow Hive inference).
+    with tempfile.TemporaryDirectory(prefix="asos-parquet-") as scratch:
+        work = Path(scratch)
+        for attempt in (1, 2):
+            if attempt > 1:
+                gc.collect()  # the failed attempt's frames died with its exception
             try:
-                with output_path.open("rb") as body:
-                    response = s3.put_object(
-                        Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=base.etag
-                    )
+                published = attempt_publish(attempt, work)
                 break
             except ClientError as e:
                 if attempt == 2 or not _is_precondition_failed(e):
                     raise
-                # Step 9: Someone published since our read. Rebase on their object
-                # with the same fetched observations; never reuse this candidate.
+                # Step 9: Someone published since our read. Their object may hold
+                # newer values for our keys (and newer station metadata), so
+                # overlaying this attempt's fetch would revert them: restart from
+                # discovery against their object instead.
                 logger.warning(
-                    f"s3://{s3_bucket}/{s3_key} changed since ETag {base.etag}; "
-                    "rebasing on the current object"
+                    f"s3://{s3_bucket}/{s3_key} changed during this run (412); "
+                    "restarting from station discovery"
                 )
-                del candidate
-                gc.collect()
-                base = _read_base(s3, s3_bucket, s3_key, work / "base-2.parquet")
 
-        file_size = output_path.stat().st_size / 1024 / 1024
-        published_etag = str(response.get("ETag", "")).strip('"') or None
-        published_version_id = response.get("VersionId")
-        logger.info(
-            f"Uploaded year={year} ({file_size:.1f} MB, ETag {published_etag}, "
-            f"version {published_version_id})"
-        )
+    base = published.base
+    candidate = published.candidate
+    failures = list(published.failures)
+    fetch_summary = published.fetch_summary
+    observations = published.observations
+    file_size = published.file_size_mb
+    published_etag = str(published.response.get("ETag", "")).strip('"') or None
+    published_version_id = published.response.get("VersionId")
+    del published
+    logger.info(
+        f"Uploaded year={year} ({file_size:.1f} MB, ETag {published_etag}, "
+        f"version {published_version_id})"
+    )
 
     # Step 10: Advisory coverage check on what we published
     coverage = coverage_report(candidate, now, threshold=_COVERAGE_THRESHOLD)
@@ -581,7 +612,7 @@ def _publish_windows(
     if failures:
         raise IncompleteFetchError(
             f"Incomplete fetch for {window_text} ({fetch_summary}); "
-            f"published {len(observations):,} observations. "
+            f"published {observations:,} observations. "
             f"First failures: {'; '.join(failures[:6])}"
         )
 
@@ -589,7 +620,7 @@ def _publish_windows(
     return {
         "status": "success",
         "windows": [str(window) for window in windows],
-        "observations": len(observations),
+        "observations": observations,
         "total_records": total_records,
         "file_size_mb": round(file_size, 2),
         "base_etag": base.etag,
