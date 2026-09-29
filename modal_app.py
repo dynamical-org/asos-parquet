@@ -23,9 +23,15 @@ Schedule rationale:
       write collisions (the conditional PUT does that)
 
 Every write is a conditional PUT (IfMatch) against the ETag of the exact bytes
-read. On a conflict the run starts over once from station discovery (re-read
-the base, re-fetch, recompose, re-gate) so it never overlays an older fetch on
-a newer object; a second conflict fails the run.
+read. On a conflict (412) the run rebases three-way without re-fetching (a slow
+IEM fetch would just conflict again): it re-discovers stations, re-reads the
+current object, and withholds every fetched row whose key another writer
+touched inside the windows since the first read (changed, added or removed,
+judged against the first read's fingerprint). The other writer's version of
+those keys wins; every other key gets our fetched value. The candidate is
+recomposed, checked (withheld keys must match the current object; manual runs
+re-run the whole gate), and PUT against the new ETag. Three conflicts fail the
+run.
 
 Manual reconcile over explicit UTC windows ([start, end), each endpoint with a
 zone; several comma-separated windows are fetched once each and published in
@@ -62,7 +68,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -125,6 +131,7 @@ RECONCILE_MEMORY_MB = 65536
 HOURLY_LOOKBACK_HOURS = 6
 DAILY_RECONCILE_HOURS = 72
 _COVERAGE_THRESHOLD = 0.5
+_MAX_PUT_ATTEMPTS = 3  # the first PUT plus two rebases
 
 
 class AcceptanceGateError(RuntimeError):
@@ -382,9 +389,24 @@ class _Published:
     candidate: Any  # the published GeoDataFrame
     file_size_mb: float
     response: dict[str, Any]
-    observations: int
-    failures: tuple[str, ...]
-    fetch_summary: str
+    withheld: dict[str, int] | None  # rebased attempts: withheld keys by kind
+
+
+@dataclass
+class _FetchedRun:
+    """What one publish run fetched once and reuses across rebase attempts."""
+
+    fetched: Any = None  # WindowFetch from attempt 1
+    base_fingerprint: Any = None  # window_fingerprint of attempt 1's base: the merge base
+    failed_networks: set[str] = field(default_factory=set)
+    networks: int = 0
+    attempt_seconds: list[float] = field(default_factory=list)
+
+    def summary(self, fetched: Any) -> str:
+        return (
+            f"{len(fetched.errors)}/{fetched.tasks} chunks failed, "
+            f"{len(self.failed_networks)}/{self.networks} networks failed"
+        )
 
 
 def _is_precondition_failed(error: Exception) -> bool:
@@ -405,8 +427,11 @@ def _publish_windows(
 ) -> dict[str, Any]:
     """Fetch the windows, merge them into their year partition, and PUT it.
 
-    A 412 on the conditional PUT restarts the whole attempt once (discovery,
-    base read, fetch, compose, gate, PUT); a second 412 raises.
+    Observations are fetched once. A 412 on the conditional PUT rebases: station
+    discovery and the base read are redone, fetched rows for keys another writer
+    changed, added or removed in the windows since the first base read are
+    withheld (their row wins), and the candidate is recomposed, checked against
+    the new base and PUT with its ETag. Up to three attempts, then the 412 raises.
 
     ``reconcile`` (implied by ``manual``) also requests station IDs that only the
     partition knows. ``manual`` is strict: an incomplete fetch or an acceptance
@@ -415,6 +440,7 @@ def _publish_windows(
     """
     import gc
     import tempfile
+    import time
 
     import geopandas as gpd
     from botocore.exceptions import ClientError
@@ -424,12 +450,15 @@ def _publish_windows(
     from asos_parquet.fetch import IncompleteFetchError, fetch_observations_bulk_result
     from asos_parquet.reconcile import (
         compose_partition,
+        concurrent_change_violations,
         coverage_report,
         diff_partitions,
         fetch_windows,
         normalize_windows,
         partition_year,
         reconcile_fetch_stations,
+        window_fingerprint,
+        withhold_concurrent_changes,
         written_file_violations,
     )
     from asos_parquet.station_aliases import retired_station_metadata
@@ -449,130 +478,169 @@ def _publish_windows(
 
     expected_metadata = retired_station_metadata() if restore_retired_metadata else None
 
+    run = _FetchedRun()
+
     def attempt_publish(attempt: int, work: Path) -> _Published:
-        """Steps 1-8 from scratch: nothing from an earlier attempt is reused."""
-        # Step 1: Station metadata
+        """One read-compose-PUT attempt; observations are fetched on attempt 1 only."""
+        # Step 1: Station metadata, every attempt, so a rebased candidate is
+        # enriched from a table at least as new as a concurrent writer's.
         networks = get_all_network_ids()
         logger.info(f"Fetching station metadata for {len(networks)} networks...")
         station_result = fetch_all_stations_result(networks=networks, online_only=True)
         online = station_result.stations
         failed_networks = station_result.failed_networks
+        run.failed_networks.update(failed_networks)
+        run.networks = len(networks)
         logger.info(f"Found {len(online)} online stations")
         if online.empty:
             raise IncompleteFetchError(
                 f"No online stations found ({len(failed_networks)}/{len(networks)} networks failed)"
             )
+        if manual and failed_networks:
+            raise IncompleteFetchError(
+                f"Manual reconcile refuses incomplete station discovery for {window_text} "
+                f"({len(failed_networks)}/{len(networks)} networks failed: "
+                f"{', '.join(failed_networks[:5])}); nothing published"
+            )
 
         # Step 2: Base partition
-        base = _read_base(s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet")
-        existing: gpd.GeoDataFrame | None = gpd.read_parquet(base.path)
-        logger.info(f"Read existing partition ({len(existing):,} records)")
+        started = time.monotonic()
+        try:
+            base = _read_base(s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet")
+            existing: gpd.GeoDataFrame | None = gpd.read_parquet(base.path)
+            logger.info(f"Read existing partition ({len(existing):,} records)")
 
-        # Step 3-4: Fetch each window once per attempt
-        requested = reconcile_fetch_stations(online, existing) if manual or reconcile else online
-        logger.info(f"Fetching observations for {len(requested)} stations from Iowa Mesonet...")
-        fetched = fetch_windows(
-            requested,
-            windows,
-            fetch=lambda stations, start, end: fetch_observations_bulk_result(
-                stations,
-                start,
-                end,
-                show_progress=False,  # No terminal in Modal
-            ),
-        )
-        observations = fetched.observations
-        failures = [*fetched.errors, *(f"network {network}" for network in failed_networks)]
-        fetch_summary = (
-            f"{len(fetched.errors)}/{fetched.tasks} chunks failed, "
-            f"{len(failed_networks)}/{len(networks)} networks failed"
-        )
-
-        # Step 5: Completeness
-        if observations.empty:
-            raise IncompleteFetchError(
-                f"No observations fetched for {window_text} from {len(requested)} stations "
-                f"({fetch_summary})"
-            )
-        if manual and failures:
-            raise IncompleteFetchError(
-                f"Manual reconcile refuses an incomplete fetch for {window_text} "
-                f"({fetch_summary}); nothing published. Failures: {'; '.join(failures[:5])}"
-            )
-        logger.info(f"Fetched {len(observations):,} observations")
-
-        # Step 6: Compose against this exact base
-        candidate = compose_partition(
-            existing,
-            observations,
-            online,  # enrichment: existing-only IDs in the fetch set have no metadata
-            restore_retired_metadata=restore_retired_metadata,
-        )
-        logger.info(f"Merged data: {len(candidate):,} total records")
-
-        # Step 7: Acceptance gate (manual only), relative to this base
-        violations: list[str] = []
-        if manual:
-            diff = diff_partitions(
-                existing, candidate, windows, expected_metadata=expected_metadata
-            )
-            violations.extend(diff.violations)
-            logger.info(
-                f"Gate diff: {diff.added_in_windows:,} added, "
-                f"{diff.measurement_changes_in_windows:,} revised in windows, "
-                f"metadata restored {diff.metadata_restored_by_station}"
-            )
-        existing = None  # never hold two full frames of the base at once
-        gc.collect()
-
-        # Step 8: Write locally, then conditional PUT
-        output_path = ParquetPublisher(work / f"candidate-{attempt}").publish(candidate, year)
-        if manual:
-            violations.extend(written_file_violations(base.path, output_path))
-            if violations:
-                raise AcceptanceGateError(
-                    f"Candidate for {window_text} failed the acceptance gate; nothing "
-                    f"published: {'; '.join(violations)}"
+            withheld = None
+            if run.fetched is None:
+                # Step 3-4: Fetch each window once per run
+                requested = (
+                    reconcile_fetch_stations(online, existing) if manual or reconcile else online
                 )
-        logger.info(f"Uploading to S3 (IfMatch {base.etag})...")
-        with output_path.open("rb") as body:
-            response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=base.etag)
-        return _Published(
-            base=base,
-            candidate=candidate,
-            file_size_mb=output_path.stat().st_size / 1024 / 1024,
-            response=response,
-            observations=len(observations),
-            failures=tuple(failures),
-            fetch_summary=fetch_summary,
-        )
+                logger.info(
+                    f"Fetching observations for {len(requested)} stations from Iowa Mesonet..."
+                )
+                fetched = fetch_windows(
+                    requested,
+                    windows,
+                    fetch=lambda stations, start, end: fetch_observations_bulk_result(
+                        stations,
+                        start,
+                        end,
+                        show_progress=False,  # No terminal in Modal
+                    ),
+                )
+                # Step 5: Completeness
+                if fetched.observations.empty:
+                    raise IncompleteFetchError(
+                        f"No observations fetched for {window_text} from {len(requested)} "
+                        f"stations ({run.summary(fetched)})"
+                    )
+                if manual and fetched.errors:
+                    raise IncompleteFetchError(
+                        f"Manual reconcile refuses an incomplete fetch for {window_text} "
+                        f"({run.summary(fetched)}); nothing published. "
+                        f"Failures: {'; '.join(fetched.errors[:5])}"
+                    )
+                logger.info(f"Fetched {len(fetched.observations):,} observations")
+                run.fetched = fetched
+                # The merge base for any later rebase; never replaced.
+                run.base_fingerprint = window_fingerprint(existing, windows)
+                observations = fetched.observations
+            else:
+                # Step 9 (rebase): someone published since the first read. Keep their
+                # version of every key they touched in the windows; ours elsewhere.
+                assert run.base_fingerprint is not None
+                observations, withheld = withhold_concurrent_changes(
+                    run.fetched.observations,
+                    run.base_fingerprint,
+                    window_fingerprint(existing, windows),
+                )
+                logger.warning(
+                    f"Rebase attempt {attempt}: withheld {len(withheld.keys):,} fetched rows "
+                    f"changed concurrently {withheld.counts()}; samples {withheld.samples()}"
+                )
+
+            # Step 6: Compose against this exact base
+            candidate = compose_partition(
+                existing,
+                observations,
+                online,  # enrichment: existing-only IDs in the fetch set have no metadata
+                restore_retired_metadata=restore_retired_metadata,
+            )
+            del observations
+            logger.info(f"Merged data: {len(candidate):,} total records")
+
+            # Step 7: Checks relative to this base. A rebased candidate must carry
+            # the other writer's rows for every withheld key (all modes).
+            violations: list[str] = []
+            if withheld is not None:
+                conflicts = concurrent_change_violations(candidate, existing, withheld, windows)
+                if conflicts:
+                    raise AcceptanceGateError(
+                        f"Rebased candidate for {window_text} overwrote concurrent changes; "
+                        f"nothing published: {'; '.join(conflicts)}"
+                    )
+            if manual:
+                diff = diff_partitions(
+                    existing, candidate, windows, expected_metadata=expected_metadata
+                )
+                violations.extend(diff.violations)
+                logger.info(
+                    f"Gate diff: {diff.added_in_windows:,} added, "
+                    f"{diff.measurement_changes_in_windows:,} revised in windows, "
+                    f"metadata restored {diff.metadata_restored_by_station}"
+                )
+            existing = None  # never hold two full frames of the base at once
+            gc.collect()
+
+            # Step 8: Write locally, then conditional PUT
+            output_path = ParquetPublisher(work / f"candidate-{attempt}").publish(candidate, year)
+            if manual:
+                violations.extend(written_file_violations(base.path, output_path))
+                if violations:
+                    raise AcceptanceGateError(
+                        f"Candidate for {window_text} failed the acceptance gate; nothing "
+                        f"published: {'; '.join(violations)}"
+                    )
+            logger.info(f"Uploading to S3 (IfMatch {base.etag})...")
+            with output_path.open("rb") as body:
+                response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=base.etag)
+            return _Published(
+                base=base,
+                candidate=candidate,
+                file_size_mb=output_path.stat().st_size / 1024 / 1024,
+                response=response,
+                withheld=withheld.counts() if withheld is not None else None,
+            )
+        finally:
+            run.attempt_seconds.append(round(time.monotonic() - started, 1))
+            logger.info(f"Attempt {attempt}: base read → PUT took {run.attempt_seconds[-1]}s")
 
     # Invocation-local scratch space (flat base path avoids pyarrow Hive inference).
     with tempfile.TemporaryDirectory(prefix="asos-parquet-") as scratch:
         work = Path(scratch)
-        for attempt in (1, 2):
+        for attempt in range(1, _MAX_PUT_ATTEMPTS + 1):
             if attempt > 1:
                 gc.collect()  # the failed attempt's frames died with its exception
             try:
                 published = attempt_publish(attempt, work)
                 break
             except ClientError as e:
-                if attempt == 2 or not _is_precondition_failed(e):
+                if attempt == _MAX_PUT_ATTEMPTS or not _is_precondition_failed(e):
                     raise
-                # Step 9: Someone published since our read. Their object may hold
-                # newer values for our keys (and newer station metadata), so
-                # overlaying this attempt's fetch would revert them: restart from
-                # discovery against their object instead.
                 logger.warning(
                     f"s3://{s3_bucket}/{s3_key} changed during this run (412); "
-                    "restarting from station discovery"
+                    "rebasing on the current object without re-fetching"
                 )
 
+    assert run.fetched is not None
+    failures = [*run.fetched.errors, *(f"network {n}" for n in sorted(run.failed_networks))]
+    fetch_summary = run.summary(run.fetched)
+    observations = len(run.fetched.observations)
+    run.fetched = None
     base = published.base
     candidate = published.candidate
-    failures = list(published.failures)
-    fetch_summary = published.fetch_summary
-    observations = published.observations
+    withheld_concurrent = published.withheld
     file_size = published.file_size_mb
     published_etag = str(published.response.get("ETag", "")).strip('"') or None
     published_version_id = published.response.get("VersionId")
@@ -627,6 +695,8 @@ def _publish_windows(
         "base_version_id": base.version_id,
         "published_etag": published_etag,
         "published_version_id": published_version_id,
+        "withheld_concurrent": withheld_concurrent,
+        "attempt_seconds": run.attempt_seconds,
         "coverage": {
             "low_hours": len(low),
             "insufficient_baseline": coverage.insufficient_baseline,
