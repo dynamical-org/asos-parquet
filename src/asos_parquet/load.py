@@ -27,20 +27,25 @@ def enrich_with_station_metadata(
 
     Left-joins metadata from the stations DataFrame on the 'station' column.
     Stations present in `stations` take its values for every metadata column,
-    even null ones. Rows for stations absent from `stations` (e.g. re-keyed at
-    IEM) keep whatever metadata values they already had in `df`.
+    even null ones. Stations absent from `stations` (e.g. re-keyed at IEM) take
+    their last-known metadata from `df`: the most recent row with a non-null
+    'country' (`df` is sorted by station, valid). Absent stations with no such
+    row get nulls.
     """
     metadata = stations[["station", *STATION_METADATA_COLUMNS]].drop_duplicates(subset="station")
     drop_cols = [c for c in STATION_METADATA_COLUMNS if c in df.columns]
     if not drop_cols:
         return df.merge(metadata, on="station", how="left")
-    absent = ~df["station"].isin(metadata["station"]).to_numpy()
-    prior = {c: df[c].to_numpy() for c in drop_cols}
-    enriched = df.drop(columns=drop_cols).merge(metadata, on="station", how="left")
-    if absent.any():
-        for column, values in prior.items():
-            enriched[column] = enriched[column].where(~absent, values)
-    return enriched
+    if "country" in df.columns:
+        absent = ~df["station"].isin(metadata["station"]) & df["country"].notna()
+        last_known = df.loc[absent, ["station", *drop_cols]].drop_duplicates(
+            subset="station", keep="last"
+        )
+        if not last_known.empty:
+            metadata = pd.concat([metadata, last_known], ignore_index=True).astype(
+                metadata.dtypes.to_dict()
+            )
+    return df.drop(columns=drop_cols).merge(metadata, on="station", how="left")
 
 
 @dataclass

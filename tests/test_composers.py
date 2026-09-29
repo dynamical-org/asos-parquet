@@ -182,19 +182,39 @@ def test_asos_composer_rejects_losing_country_for_present_station() -> None:
         )
 
 
-def test_asos_composer_leaves_new_rows_for_absent_station_null() -> None:
-    existing = _existing_two_station_partition()
-    incoming = _two_station_observations(temperature=68.0, hour=1)
+def test_asos_composer_fills_new_rows_for_absent_station_from_last_known() -> None:
+    earlier = _two_station_observations(temperature=59.0, hour=0).drop(columns="wxcodes")
+    later = _two_station_observations(temperature=60.0, hour=1).drop(columns="wxcodes")
+    existing = gpd.GeoDataFrame(
+        enrich_with_station_metadata(
+            merge_observations(merge_observations(None, earlier), later), _two_station_table()
+        ),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    # KBBB is absent from the fresh table; its re-served (hour 1) and new (hour 2) rows
+    # carry no metadata. KCCC is absent and never had metadata, so it stays null.
+    incoming = pd.concat(
+        [
+            _two_station_observations(temperature=61.0, hour=1).iloc[[1]],
+            _two_station_observations(temperature=68.0, hour=2),
+            _observations(temperature=70.0).assign(station="KCCC"),
+        ],
+        ignore_index=True,
+    )
 
     actual = AsosParquetComposer().compose(
         existing, {"iem": SourceFrame("iem", incoming)}, _stations()
     )
 
-    kbbb = actual[actual["station"] == "KBBB"].set_index("valid")
-    old = pd.Timestamp("2026-08-13T00:00:00Z")
-    new = pd.Timestamp("2026-08-13T01:00:00Z")
-    assert kbbb.loc[old, "country"] == "US"
-    assert kbbb.loc[new, _METADATA_COLUMNS].isna().all()
+    kbbb = actual[actual["station"] == "KBBB"]
+    assert kbbb["tmpf"].tolist() == [59.0, 61.0, 68.0]
+    assert kbbb["name"].tolist() == ["Old Name"] * 3
+    assert kbbb["elevation"].tolist() == [10.0] * 3
+    assert kbbb["county"].tolist() == ["Palm Beach"] * 3
+    kccc = actual[actual["station"] == "KCCC"]
+    assert len(kccc) == 1
+    assert kccc[_METADATA_COLUMNS].isna().all(axis=None)
 
 
 def test_enrich_without_metadata_columns_matches_plain_merge() -> None:
