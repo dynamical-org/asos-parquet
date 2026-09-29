@@ -24,14 +24,25 @@ Schedule rationale:
 
 Every write is a conditional PUT (IfMatch) against the ETag of the exact bytes
 read. On a conflict (412) the run rebases three-way without re-fetching (a slow
-IEM fetch would just conflict again): it re-discovers stations, re-reads the
-current object, and withholds every fetched row whose key another writer
-touched inside the windows since the first read (changed, added or removed,
-judged against the first read's fingerprint). The other writer's version of
-those keys wins; every other key gets our fetched value. The candidate is
-recomposed, checked (withheld keys must match the current object; manual runs
-re-run the whole gate), and PUT against the new ETag. Three conflicts fail the
-run.
+IEM fetch would just conflict again): it re-reads the current object, then
+re-discovers stations, recomposes and PUTs against the new ETag. Three
+conflicts fail the run.
+
+Concurrency guarantee (snapshot-based):
+    - Observations: a fetched row is withheld if its key, inside the windows,
+      differs between our first read and any later read of this run (changed,
+      added or removed). Once withheld it stays withheld for the rest of the
+      run, and the published candidate must carry the latest read's version of
+      it (or its absence) in every non-metadata column; otherwise the run fails
+      before the PUT. All other keys get our fetched values. A change that
+      happens and fully reverts between two of our reads is invisible to
+      snapshots and can be overwritten by our older fetch.
+    - Station metadata is not merged: every attempt re-enriches the whole
+      partition from a station table discovered after that attempt's base read.
+      Whoever wrote that base discovered before their PUT, which preceded our
+      read, so our table is at least as new as theirs provided IEM's table only
+      moves forward. If IEM serves an older table, scheduled runs publish it
+      (fresh table wins); the manual gate rejects the metadata change.
 
 Manual reconcile over explicit UTC windows ([start, end), each endpoint with a
 zone; several comma-separated windows are fetched once each and published in
@@ -398,6 +409,7 @@ class _FetchedRun:
 
     fetched: Any = None  # WindowFetch from attempt 1
     base_fingerprint: Any = None  # window_fingerprint of attempt 1's base: the merge base
+    withheld: Any = None  # cumulative Withheld across rebases; keys never un-withheld
     failed_networks: set[str] = field(default_factory=set)
     networks: int = 0
     attempt_seconds: list[float] = field(default_factory=list)
@@ -427,11 +439,12 @@ def _publish_windows(
 ) -> dict[str, Any]:
     """Fetch the windows, merge them into their year partition, and PUT it.
 
-    Observations are fetched once. A 412 on the conditional PUT rebases: station
-    discovery and the base read are redone, fetched rows for keys another writer
-    changed, added or removed in the windows since the first base read are
-    withheld (their row wins), and the candidate is recomposed, checked against
-    the new base and PUT with its ETag. Up to three attempts, then the 412 raises.
+    Observations are fetched once. A 412 on the conditional PUT rebases: the base
+    read, then station discovery, are redone; fetched rows for keys that differ
+    in the windows between the first base read and any later read are withheld
+    for the rest of the run (the latest base's row wins), and the candidate is
+    recomposed, checked against the new base and PUT with its ETag. Up to three
+    attempts, then the 412 raises. See the module docstring for the limits.
 
     ``reconcile`` (implied by ``manual``) also requests station IDs that only the
     partition knows. ``manual`` is strict: an incomplete fetch or an acceptance
@@ -482,33 +495,36 @@ def _publish_windows(
 
     def attempt_publish(attempt: int, work: Path) -> _Published:
         """One read-compose-PUT attempt; observations are fetched on attempt 1 only."""
-        # Step 1: Station metadata, every attempt, so a rebased candidate is
-        # enriched from a table at least as new as a concurrent writer's.
-        networks = get_all_network_ids()
-        logger.info(f"Fetching station metadata for {len(networks)} networks...")
-        station_result = fetch_all_stations_result(networks=networks, online_only=True)
-        online = station_result.stations
-        failed_networks = station_result.failed_networks
-        run.failed_networks.update(failed_networks)
-        run.networks = len(networks)
-        logger.info(f"Found {len(online)} online stations")
-        if online.empty:
-            raise IncompleteFetchError(
-                f"No online stations found ({len(failed_networks)}/{len(networks)} networks failed)"
-            )
-        if manual and failed_networks:
-            raise IncompleteFetchError(
-                f"Manual reconcile refuses incomplete station discovery for {window_text} "
-                f"({len(failed_networks)}/{len(networks)} networks failed: "
-                f"{', '.join(failed_networks[:5])}); nothing published"
-            )
-
-        # Step 2: Base partition
+        # Step 1: Base partition
         started = time.monotonic()
         try:
             base = _read_base(s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet")
             existing: gpd.GeoDataFrame | None = gpd.read_parquet(base.path)
             logger.info(f"Read existing partition ({len(existing):,} records)")
+
+            # Step 2: Station metadata, every attempt and AFTER the base read. Whoever
+            # wrote the base we read discovered before their PUT, which precedes our
+            # GET, so (if IEM's table only moves forward) our table is at least as
+            # new as theirs; anyone publishing after our GET makes our PUT 412.
+            networks = get_all_network_ids()
+            logger.info(f"Fetching station metadata for {len(networks)} networks...")
+            station_result = fetch_all_stations_result(networks=networks, online_only=True)
+            online = station_result.stations
+            failed_networks = station_result.failed_networks
+            run.failed_networks.update(failed_networks)
+            run.networks = len(networks)
+            logger.info(f"Found {len(online)} online stations")
+            if online.empty:
+                raise IncompleteFetchError(
+                    f"No online stations found "
+                    f"({len(failed_networks)}/{len(networks)} networks failed)"
+                )
+            if manual and failed_networks:
+                raise IncompleteFetchError(
+                    f"Manual reconcile refuses incomplete station discovery for {window_text} "
+                    f"({len(failed_networks)}/{len(networks)} networks failed: "
+                    f"{', '.join(failed_networks[:5])}); nothing published"
+                )
 
             withheld = None
             if run.fetched is None:
@@ -554,10 +570,13 @@ def _publish_windows(
                     run.fetched.observations,
                     run.base_fingerprint,
                     window_fingerprint(existing, windows),
+                    previous=run.withheld,
                 )
+                run.withheld = withheld  # sticky for the rest of the run
                 logger.warning(
                     f"Rebase attempt {attempt}: withheld {len(withheld.keys):,} fetched rows "
-                    f"changed concurrently {withheld.counts()}; samples {withheld.samples()}"
+                    f"changed concurrently so far {withheld.counts()}; "
+                    f"samples {withheld.samples()}"
                 )
 
             # Step 6: Compose against this exact base

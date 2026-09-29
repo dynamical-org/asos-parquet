@@ -531,6 +531,122 @@ def test_rebase_uses_rediscovered_station_metadata(
     assert pd.Timestamp(_recent()) in set(published["valid"])
 
 
+def test_withheld_insert_then_delete_stays_absent(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, tmp_path: Path
+) -> None:
+    # K is absent at our first read; we fetch 68. A writer inserts K=75 (412), then
+    # another deletes K (412). The third attempt must not resurrect our stale 68.
+    history = _observations("2026-01-01T00:00:00Z")
+    fake_s3.concurrent_bodies = [
+        _partition_bytes(tmp_path, [history, _observations(_recent(), tmpf=75.0)], "added"),
+        _partition_bytes(tmp_path, [history], "removed"),
+    ]
+    _fake_stations(monkeypatch, _stations())
+    recording = _fake_fetch(monkeypatch, _observations(_recent(), tmpf=68.0))
+
+    result = _manual()
+
+    assert result["status"] == "success"
+    assert len(recording.calls) == 1
+    assert len(fake_s3.puts) == 3
+    assert result["withheld_concurrent"] == {"added": 1, "changed": 0, "removed": 0}
+    published = fake_s3.put_frame()
+    assert pd.Timestamp(_recent()) not in set(published["valid"])
+
+
+def test_withheld_correction_reverted_keeps_theirs(
+    monkeypatch: pytest.MonkeyPatch, s3_env: Any, tmp_path: Path
+) -> None:
+    # K=60 at our first read; we fetch 68. Writers publish 75 (412), then correct it
+    # back to 60 (412). The third attempt publishes their 60, not our 68.
+    history = _observations("2026-01-01T00:00:00Z")
+    s3 = s3_env(FakeS3(_base(tmp_path, [history, _observations(_recent(), tmpf=60.0)])))
+    s3.concurrent_bodies = [
+        _partition_bytes(tmp_path, [history, _observations(_recent(), tmpf=75.0)], "c1"),
+        _partition_bytes(tmp_path, [history, _observations(_recent(), tmpf=60.0)], "c2"),
+    ]
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations(_recent(), tmpf=68.0))
+
+    result = modal_app._update_asos_data_impl(now=NOW)
+
+    assert result["status"] == "success"
+    assert len(s3.puts) == 3
+    assert result["withheld_concurrent"] == {"added": 0, "changed": 1, "removed": 0}
+    published = s3.put_frame()
+    assert published.loc[published["valid"] == pd.Timestamp(_recent()), "tmpf"].tolist() == [60.0]
+
+
+def _live_iem_table(monkeypatch: pytest.MonkeyPatch, table: pd.DataFrame) -> dict[str, Any]:
+    """Discovery returns whatever IEM's table is at call time."""
+    iem = {"table": table}
+    monkeypatch.setattr(
+        stations,
+        "fetch_all_stations_result",
+        lambda networks=None, online_only=False: StationFetchResult(iem["table"], ()),
+    )
+    return iem
+
+
+def test_discovery_after_base_read_sees_metadata_published_before_retry_get(
+    monkeypatch: pytest.MonkeyPatch, s3_env: Any, tmp_path: Path
+) -> None:
+    # After our first 412, IEM renames KAAA and a writer publishes "Renamed" just
+    # before our retry GET. Discovering after the GET sees the rename too.
+    history = _observations("2026-01-01T00:00:00Z")
+    recent = _observations(_recent())
+    s3 = s3_env(FakeS3(_base(tmp_path, [history, recent])))
+    s3.concurrent_bodies = [
+        _partition_bytes(
+            tmp_path, [history, recent, _observations("2026-09-28T09:00Z", "KB")], "first"
+        )
+    ]
+    renamed = _stations().assign(name="Renamed")
+    corrected = compose_partition(None, pd.concat([history, recent], ignore_index=True), renamed)
+    corrected_bytes = ParquetPublisher(tmp_path / "renamed").publish(corrected, 2026).read_bytes()
+    iem = _live_iem_table(monkeypatch, _stations())
+    get = s3.get_object
+
+    def get_after_rename(Bucket: str, Key: str) -> dict[str, Any]:
+        if s3.gets == 1:
+            iem["table"] = renamed
+            s3.replace(corrected_bytes)
+        return get(Bucket=Bucket, Key=Key)
+
+    monkeypatch.setattr(s3, "get_object", get_after_rename)
+    _fake_fetch(monkeypatch, recent)
+
+    result = modal_app._update_asos_data_impl(now=NOW)
+
+    assert result["status"] == "success"
+    assert set(s3.put_frame()["name"]) == {"Renamed"}
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_lagging_discovery_older_than_base_metadata(
+    monkeypatch: pytest.MonkeyPatch, s3_env: Any, tmp_path: Path, manual: bool
+) -> None:
+    # Current behavior, not new policy: the table we discover (after the base
+    # read) wins in scheduled runs even if it is older than the base's metadata;
+    # the manual gate rejects the metadata change.
+    history = _observations("2026-01-01T00:00:00Z")
+    renamed = _stations().assign(name="Renamed")
+    base = compose_partition(None, history, renamed)
+    path = tmp_path / "base.parquet"
+    path.write_bytes(ParquetPublisher(tmp_path / "b").publish(base, 2026).read_bytes())
+    s3 = s3_env(FakeS3(path))
+    _live_iem_table(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations("2026-09-28T07:00:00Z"))
+
+    if manual:
+        with pytest.raises(modal_app.AcceptanceGateError, match="metadata changed"):
+            _manual()
+        assert s3.puts == []
+    else:
+        assert modal_app._update_asos_data_impl(now=NOW)["status"] == "success"
+        assert set(s3.put_frame()["name"]) == {"Example"}
+
+
 def test_manual_rebase_aborts_on_a_failed_network(
     monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, tmp_path: Path
 ) -> None:
