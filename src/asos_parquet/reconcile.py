@@ -444,7 +444,8 @@ def _text_metadata_as(existing: pd.DataFrame, stations: pd.DataFrame) -> pd.Data
     IEM's station table can type text columns (county, wfo) as object while the stored
     partition reads them back as pandas strings; enrichment would otherwise hand the
     candidate object columns. Only object -> string is converted, and only when every
-    non-null value is already a str: anything else is left for the gate to reject.
+    non-null value is already a str (otherwise ValueError). Every other dtype
+    difference is left unchanged, so the manual gate still sees it.
     """
     stations = stations.copy()
     for column in STATION_METADATA_COLUMNS:
