@@ -431,9 +431,17 @@ def compose_partition(
     if existing is not None and not existing.empty and not observations.empty:
         observations = observations.copy()
         observations["valid"] = observations["valid"].astype(existing["valid"].dtype)
-    return AsosParquetComposer().compose(
+    composed = AsosParquetComposer().compose(
         existing, {"iem": SourceFrame("iem", observations)}, enrichment
     )
+    if existing is None or existing.empty:
+        return composed
+    # IEM's station table can type string columns (county, wfo) as object; keep the
+    # partition's own dtypes so the in-memory candidate matches what it will store.
+    for column, dtype in existing.dtypes.items():
+        if column in composed and column != "geometry" and composed[column].dtype != dtype:
+            composed[column] = composed[column].astype(dtype)
+    return composed
 
 
 # --- coverage ----------------------------------------------------------------

@@ -1220,3 +1220,28 @@ def test_withheld_keys_stay_withheld_across_rebases() -> None:
         ("KAAA", "02:53"),
         ("KBBB", "01:53"),
     }
+
+
+def test_compose_keeps_the_base_dtypes_when_iem_metadata_is_object(tmp_path: Path) -> None:
+    # IEM's station table can type county/wfo as object (e.g. with missing values),
+    # while the stored partition reads them back as pandas strings. Composition must not
+    # change the partition's in-memory dtypes, or the manual gate refuses the candidate
+    # even though the written Arrow types are identical.
+    written = ParquetPublisher(tmp_path / "base").publish(
+        compose_partition(
+            None,
+            observations([("KAAA", "2026-02-10T00:53Z"), ("KBBB", "2026-02-10T00:53Z")]),
+            stations_table("KAAA", "KBBB"),
+        ),
+        2026,
+    )
+    base = gpd.read_parquet(written)
+    fresh = stations_table("KAAA", "KBBB")
+    fresh["county"] = pd.Series(["Palm Beach", None], dtype=object)
+    fresh["wfo"] = fresh["wfo"].astype(object)
+
+    candidate = compose_partition(base, observations([("KAAA", "2026-02-10T01:53Z")]), fresh)
+
+    assert candidate[list(base.columns)].dtypes.to_dict() == base.dtypes.to_dict()
+    diff = diff_partitions(base, candidate, WINDOWS, expected_metadata=None)
+    assert not [v for v in diff.violations if "dtype" in v], diff.violations
