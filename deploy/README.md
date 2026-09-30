@@ -2,17 +2,33 @@
 
 Deploy ASOS Parquet for continuous data updates using Modal - a serverless platform that runs Python functions in the cloud.
 
-## Cost Estimate
+## Cost
 
-Modal's free tier ($30/month credits) covers this workload entirely:
+Measured from Modal's hourly billing report for the deployed
+`asos-parquet-update` app from 2026-09-29 15:00Z to 2026-09-30 13:00Z, the
+first day on the 6 h lookback and daily reconcile. The 2026 partition held ~44M
+rows (~450 MB) at the time. The week before, on the old code, came to ~$34/month.
 
-| Resource | Usage | Cost |
-|----------|-------|------|
-| CPU (1 core) | ~10 min × 720 runs | ~$5.60 |
-| Memory (2GB) | ~10 min × 720 runs | ~$1.90 |
-| **Total** | | **~$7.50** |
+| Function | Runs | Request | Measured per run | Cost/month |
+|----------|------|---------|------------------|-----------:|
+| `update_asos_data` | 48/day | 1 CPU, 4 GiB | ~420 core-seconds; ~18–26 GiB average memory | ~$32 ($24 memory, $8 CPU) |
+| `reconcile_asos_data` (scheduled) | 1/day | 1 CPU, 64 GiB | ~5 min, billed at the 64 GiB request | ~$1.35 |
+| **Total** | | | | **~$33** |
 
-With the **$30/month free tier**, this costs **$0/month**.
+Modal bills the higher of the request and actual usage, at $0.0000131 per
+core-second and $0.00000222 per GiB-second. The hourly run's memory is well
+above its 4 GiB request because it reads, merges and rewrites the whole
+current-year partition, so memory is most of the bill. The average-memory range
+divides billed GiB-seconds by billed CPU-seconds (low end) and by logged run
+time (high end). Modal reports no peak.
+
+Cost tracks the size of the current-year partition: it grows through the year
+and drops after January 1, when the new partition starts empty. This app alone
+is above the Starter plan's $30/month credit. To re-measure:
+
+```bash
+uv run modal billing report --for "last week" --show-resources
+```
 
 ## Prerequisites
 

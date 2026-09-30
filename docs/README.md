@@ -1,8 +1,8 @@
 # ASOS Surface Weather Observations
 
 **Status:** Updating hourly
-**Spatial Domain:** United States (50 states)
-**Spatial Resolution:** ~2,900 weather stations
+**Spatial Domain:** United States (50 states) plus airports in 13 other countries
+**Spatial Resolution:** ~4,060 weather stations in 2025–2026, ~2,640 of them in the US
 **Temporal Coverage:** 1940 to present
 **Temporal Resolution:** Hourly (typically every 20-60 minutes)
 
@@ -15,6 +15,7 @@ This dataset provides access to historical and near-real-time ASOS observations 
 ### Key Features
 
 - **Complete US Coverage**: All 50 states including Alaska and Hawaii
+- **International Airports**: Stations in Canada, India, France, Brazil, Japan, the UK, Russia, Germany, Mexico, Australia, South Korea, China and South Africa
 - **Deep Historical Archive**: Observations dating back to 1940
 - **Cloud-Native Format**: GeoParquet with Hive-style partitioning for efficient queries
 - **Geospatial Ready**: Point geometries included for spatial analysis and interpolation
@@ -26,14 +27,10 @@ This dataset provides access to historical and near-real-time ASOS observations 
 ```python
 import duckdb
 
-# Connect and configure S3 access (see R2/S3 Configuration section)
-conn = duckdb.connect()
-# ... configure s3_endpoint, credentials ...
-
-# Query temperature extremes from 2020
-result = conn.execute("""
+# Public over HTTPS: no credentials needed. Query temperature extremes from 2020.
+result = duckdb.execute("""
     SELECT station, valid, tmpf, dwpf
-    FROM read_parquet('s3://your-bucket/asos/year=2020/data.parquet')
+    FROM read_parquet('https://data.source.coop/dynamical/asos-parquet/year=2020/data.parquet')
     WHERE tmpf > 100
     ORDER BY tmpf DESC
     LIMIT 10
@@ -48,11 +45,14 @@ Access the interactive viewer at the dataset URL to explore data directly in you
 
 ### Endpoint
 
+The data is hosted on [Source Cooperative](https://source.coop/) and needs no credentials:
+
 ```
-s3://{YOUR_BUCKET}/asos/year={YYYY}/data.parquet
+https://data.source.coop/dynamical/asos-parquet/year={YYYY}/data.parquet
+s3://us-west-2.opendata.source.coop/dynamical/asos-parquet/year={YYYY}/data.parquet
 ```
 
-Replace `{YOUR_BUCKET}` with your S3 or R2 bucket name. See [R2/S3 Configuration](#r2s3-configuration) for connection setup.
+See [S3 Configuration](#s3-configuration) for reading the `s3://` form.
 
 ### Update Frequency
 
@@ -69,7 +69,7 @@ Updates are performed via serverless functions that fetch recent observations fr
 Data is partitioned by year using Hive-style naming (`year=YYYY`). This strategy balances:
 
 - **Query Efficiency**: Partition pruning eliminates irrelevant years from scans
-- **File Size**: Each year contains 20-30 million observations (~200-400 MB compressed)
+- **File Size**: Complete years since 2019 hold 56-60 million observations (~650-690 MB compressed); 2010-2018 hold 39-55 million (~450-660 MB), and early years are far smaller (1940: 1.4 million, 13 MB)
 - **Browser Compatibility**: DuckDB-WASM can load individual year files without memory issues
 
 ### Access Patterns
@@ -77,15 +77,15 @@ Data is partitioned by year using Hive-style naming (`year=YYYY`). This strategy
 **Single Year (recommended for most queries):**
 ```sql
 -- Fast - directly accesses one file
-SELECT * FROM read_parquet('s3://your-bucket/asos/year=2015/data.parquet')
+SELECT * FROM read_parquet('https://data.source.coop/dynamical/asos-parquet/year=2015/data.parquet')
 ```
 
 **Multiple Specific Years:**
 ```sql
 -- Explicit list - no glob overhead
 SELECT * FROM read_parquet([
-    's3://your-bucket/asos/year=2014/data.parquet',
-    's3://your-bucket/asos/year=2015/data.parquet'
+    'https://data.source.coop/dynamical/asos-parquet/year=2014/data.parquet',
+    'https://data.source.coop/dynamical/asos-parquet/year=2015/data.parquet'
 ])
 ```
 
@@ -93,7 +93,8 @@ SELECT * FROM read_parquet([
 ```sql
 -- Glob pattern - scans all partitions first, then filters
 -- Only use when you genuinely need many years (climate normals, long-term trends)
-SELECT * FROM read_parquet('s3://your-bucket/asos/year=*/data.parquet', hive_partitioning=true)
+-- Globs need the s3:// form (see S3 Configuration); HTTPS cannot list files
+SELECT * FROM read_parquet('s3://us-west-2.opendata.source.coop/dynamical/asos-parquet/year=*/data.parquet', hive_partitioning=true)
 WHERE year BETWEEN 2010 AND 2020
 ```
 
@@ -103,18 +104,16 @@ WHERE year BETWEEN 2010 AND 2020
 - One corrupt/missing partition can fail the entire query
 - Browser environments (DuckDB-WASM) have memory limits that glob exacerbates
 
-### R2/S3 Configuration
+### S3 Configuration
+
+The bucket allows anonymous reads. Its name contains dots, so use path-style URLs:
 
 ```python
 import duckdb
 
 conn = duckdb.connect()
 conn.execute("INSTALL httpfs; LOAD httpfs;")
-conn.execute(f"SET s3_endpoint = '{account_id}.r2.cloudflarestorage.com';")
-conn.execute("SET s3_use_ssl = true;")
-conn.execute(f"SET s3_access_key_id = '{access_key}';")
-conn.execute(f"SET s3_secret_access_key = '{secret_key}';")
-conn.execute("SET s3_region = 'auto';")
+conn.execute("SET s3_region = 'us-west-2';")
 conn.execute("SET s3_url_style = 'path';")
 ```
 
@@ -209,14 +208,13 @@ Station locations are stored as GeoParquet-compliant WKB-encoded point geometrie
 
 ## Examples
 
-See the [example notebook](../notebooks/examples.ipynb) for comprehensive usage patterns including:
+See the [example scripts](../examples/) for usage patterns that query the data directly from Source Cooperative:
 
-1. **Single Station Analysis**: Historical temperature trends at a specific airport
-2. **Multi-Station Comparison**: Comparing weather across regions
-3. **Extreme Event Detection**: Finding heat waves, cold snaps, and wind events
-4. **Spatial Interpolation**: Estimating weather at locations between stations
-5. **Climate Normals**: Computing 30-year climatological averages
-6. **Data Quality Assessment**: Identifying and filtering suspect observations
+1. **Station History** (`station_history.py`): JFK's full temperature record, 1940 to present
+2. **Coldest Temperatures** (`coldest_temperature.py`): The 20 coldest readings in New York state since 2000
+3. **Wind Rose** (`wind_rose.py`): Wind direction and speed at Nantucket (ACK) in 2024
+4. **Summer Heatwave** (`summer_heatwave.py`): Hourly temperatures at 5 airports in July 2024
+5. **Precipitation Ranking** (`precipitation_ranking.py`): The 25 wettest stations of 2024
 
 ## Attribution
 
@@ -230,7 +228,7 @@ ASOS data is collected and maintained by the National Weather Service (NWS) and 
 
 ### Storage
 
-Cloud storage provided by [Cloudflare R2](https://www.cloudflare.com/products/r2/).
+Hosted by [Source Cooperative](https://source.coop/), a [Radiant Earth](https://radiant.earth/) initiative.
 
 ### Processing
 

@@ -75,10 +75,8 @@ Setup:
        (log streaming + error tracking + cron monitoring via Sentry; see obs.py.)
     3. Deploy: modal deploy modal_app.py
 
-Cost estimate (twice-hourly runs with bulk fetch):
-    - ~$2-3/month (well within $30 free tier)
-    - CPU: 1 core * 2 min * 1440 runs = ~$1.90/month
-    - Memory: 2GB * 2 min * 1440 runs = ~$0.65/month
+Cost (Modal billing, 2026-09-29/30, 2026 partition ~44M rows): ~$33/month.
+Hourly runs are ~$32 of that, mostly memory; see deploy/README.md.
 """
 
 import contextlib
@@ -246,7 +244,9 @@ _SECRETS = [
     # (~32M rows by mid-2026) and takes proportionally longer to read and rewrite.
     schedule=modal.Cron(_UPDATE_CRON_SCHEDULE),  # Run at :20 and :50 past each hour
     cpu=1.0,
-    memory=UPDATE_MEMORY_MB,  # matches backfill_year: same yearly partition to read/merge/write
+    # A request, not a cap: Modal bills usage above it. Measured 2026-09-30 (44M rows):
+    # ~18-26 GiB average; see deploy/README.md "Cost".
+    memory=UPDATE_MEMORY_MB,
 )
 def update_asos_data(lookback_hours: int = HOURLY_LOOKBACK_HOURS):
     """Fetch recent ASOS observations and update S3.
