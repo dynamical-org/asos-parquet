@@ -6,8 +6,10 @@ import pytest
 import requests
 from pandas.testing import assert_frame_equal
 
-from asos_parquet.config import MAX_RETRIES
+from asos_parquet import fetch
+from asos_parquet.config import MAX_BACKOFF, MAX_RETRIES
 from asos_parquet.fetch import (
+    RequestPacer,
     build_bulk_observation_url,
     build_observation_url,
     fetch_bulk_chunk,
@@ -17,6 +19,22 @@ from asos_parquet.fetch import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class RecordingPacer:
+    def __init__(self) -> None:
+        self.waits = 0
+
+    def wait(self) -> None:
+        self.waits += 1
+
+
+@pytest.fixture(autouse=True)
+def pacer(monkeypatch: pytest.MonkeyPatch) -> RecordingPacer:
+    """No real pacing in tests; the pacer itself is tested with a fake clock."""
+    recording = RecordingPacer()
+    monkeypatch.setattr(fetch, "IEM_PACER", recording)
+    return recording
 
 
 class FakeResponse:
@@ -122,11 +140,13 @@ START = pd.Timestamp("2026-08-01 00:00", tz="UTC")
 END = pd.Timestamp("2026-08-01 03:00", tz="UTC")
 
 
-def http_error_response(status_code: int) -> requests.Response:
+def http_error_response(status_code: int, retry_after: str | None = None) -> requests.Response:
     # A real Response: falsy for 4xx/5xx, which is what hid the status code.
     response = requests.Response()
     response.status_code = status_code
     response.url = "https://example.invalid/asos.py"
+    if retry_after is not None:
+        response.headers["Retry-After"] = retry_after
     return response
 
 
@@ -256,3 +276,107 @@ def test_bulk_result_keeps_good_chunks_and_reports_failed_ones(
 
     observations = fetch_observations_bulk(stations, START, END, show_progress=False, chunk_size=1)
     assert_frame_equal(observations, result.observations)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    fake = FakeClock()
+    monkeypatch.setattr("asos_parquet.fetch.time.monotonic", fake.monotonic)
+    monkeypatch.setattr("asos_parquet.fetch.time.sleep", fake.sleep)
+    return fake
+
+
+def test_pacer_spaces_request_starts(clock: FakeClock) -> None:
+    pacer = RequestPacer(2.0)
+    starts = []
+    for _ in range(3):
+        pacer.wait()
+        starts.append(clock.now)
+
+    assert starts == [1000.0, 1002.0, 1004.0]
+
+
+def test_pacer_does_not_wait_after_a_quiet_spell(clock: FakeClock) -> None:
+    pacer = RequestPacer(2.0)
+    pacer.wait()
+    clock.now += 10
+
+    pacer.wait()
+
+    assert clock.sleeps == []
+
+
+def test_iem_pacer_outlasts_iem_throttle_key() -> None:
+    # IEM's asos.py throttles 1 s per IP with a memcached key that lives int(1) + 1 s.
+    assert fetch.IEM_MIN_REQUEST_INTERVAL >= 2.0
+
+
+def test_bulk_chunk_paces_every_attempt(
+    monkeypatch: pytest.MonkeyPatch, no_sleep: None, pacer: RecordingPacer
+) -> None:
+    text = (FIXTURES / "iem_observations.csv").read_text()
+    get = RecordingGet(http_error_response(429), FakeResponse(text))
+    monkeypatch.setattr("asos_parquet.fetch.requests.get", get)
+
+    fetch_bulk_chunk(["KJFK"], START, END)
+
+    assert pacer.waits == len(get.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [("30", 30.0), ("1", 6.0), ("100000", MAX_BACKOFF), ("soon", 6.0)],
+)
+def test_bulk_chunk_honors_retry_after(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, retry_after: str, expected: float
+) -> None:
+    text = (FIXTURES / "iem_observations.csv").read_text()
+    get = RecordingGet(http_error_response(429, retry_after), FakeResponse(text))
+    monkeypatch.setattr("asos_parquet.fetch.requests.get", get)
+
+    _, df, error = fetch_bulk_chunk(["KJFK"], START, END)
+
+    assert error is None
+    assert df is not None
+    assert clock.sleeps == [expected]
+
+
+def test_bulk_chunk_honors_retry_after_http_date(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    text = (FIXTURES / "iem_observations.csv").read_text()
+    when = pd.Timestamp.now("UTC").floor("s") + pd.Timedelta(seconds=60)
+    header = when.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    get = RecordingGet(http_error_response(503, header), FakeResponse(text))
+    monkeypatch.setattr("asos_parquet.fetch.requests.get", get)
+
+    fetch_bulk_chunk(["KJFK"], START, END)
+
+    assert len(clock.sleeps) == 1
+    assert 55 <= clock.sleeps[0] <= 60
+
+
+def test_bulk_chunk_persistent_rate_limit_still_fails(
+    monkeypatch: pytest.MonkeyPatch, no_sleep: None
+) -> None:
+    get = RecordingGet(http_error_response(429))
+    monkeypatch.setattr("asos_parquet.fetch.requests.get", get)
+
+    _, df, error = fetch_bulk_chunk(["KJFK"], START, END)
+
+    assert df is None
+    assert error == f"HTTP 429 after {MAX_RETRIES} retries"
+    assert len(get.calls) == MAX_RETRIES + 1

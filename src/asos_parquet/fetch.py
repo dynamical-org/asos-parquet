@@ -16,6 +16,8 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from threading import Lock
 
 import pandas as pd
@@ -44,6 +46,53 @@ MAX_URL_LENGTH = 7500  # Conservative limit below 8KB server limit
 MAX_STATIONS_PER_CHUNK = 1000  # Benchmarked: 1000 w/ 3 workers = 38k rec/s (vs 27k at 500)
 BULK_REQUEST_TIMEOUT = 300  # Bulk requests may take longer
 BULK_MAX_WORKERS = 3  # Stay under IEM's 6-cursor-per-subnet limit
+# IEM's asos.py throttles each IP to one request per second (since 2026-04-21) and
+# answers 429 without Retry-After. Its throttle key lives up to int(1 s) + 1 = 2 s
+# (pyiem.webutil.ip_is_throttled), so starts closer than that can collide; the
+# extra 0.5 s absorbs network jitter.
+IEM_MIN_REQUEST_INTERVAL = 2.5
+
+
+class RequestPacer:
+    """Space request starts from this process at least ``interval`` seconds apart.
+
+    Thread-safe: concurrent workers each reserve the next free start slot, so
+    requests still overlap in flight but never start closer than ``interval``.
+    """
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self._lock = Lock()
+        self._next_start = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_start)
+            self._next_start = start + self.interval
+        if start > now:
+            time.sleep(start - now)
+
+
+IEM_PACER = RequestPacer(IEM_MIN_REQUEST_INTERVAL)
+
+
+def _retry_after_seconds(response: requests.Response | None) -> float | None:
+    """Seconds a 429/503 asks us to wait (delta-seconds or HTTP-date), if it says."""
+    value = response.headers.get("Retry-After") if response is not None else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
 class IncompleteFetchError(RuntimeError):
@@ -304,6 +353,7 @@ def fetch_bulk_chunk(
     attempt = 0
     while True:
         try:
+            IEM_PACER.wait()
             response = requests.get(url, timeout=BULK_REQUEST_TIMEOUT)
             response.raise_for_status()
 
@@ -368,10 +418,14 @@ def fetch_bulk_chunk(
                 attempt += 1
                 if attempt > MAX_RETRIES:
                     return (chunk_id, None, f"HTTP {status_code} after {MAX_RETRIES} retries")
-                wait_time = min(RETRY_BACKOFF * (2**attempt), MAX_BACKOFF)
+                backoff = RETRY_BACKOFF * (2**attempt)
+                retry_after = _retry_after_seconds(e.response)
+                wait_time = min(max(backoff, retry_after or 0.0), MAX_BACKOFF)
                 logger.warning(
                     f"{label}: HTTP {status_code} error, retry {attempt}/{MAX_RETRIES} "
-                    f"(waiting {wait_time:.0f}s)"
+                    f"(waiting {wait_time:.0f}s"
+                    + (f", Retry-After {retry_after:.0f}s" if retry_after is not None else "")
+                    + ")"
                 )
                 time.sleep(wait_time)
                 continue
