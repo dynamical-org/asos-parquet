@@ -50,6 +50,10 @@ class IncompleteFetchError(RuntimeError):
     """Raised when a fetch returned less than was requested."""
 
 
+class EmptyFetchError(IncompleteFetchError):
+    """Raised when every request succeeded but none returned observations."""
+
+
 @dataclass(frozen=True)
 class BulkFetchResult:
     """Observations from a bulk fetch plus an account of what failed."""

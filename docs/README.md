@@ -57,7 +57,7 @@ Replace `{YOUR_BUCKET}` with your S3 or R2 bucket name. See [R2/S3 Configuration
 ### Update Frequency
 
 - **Current year**: Updated twice an hour (at minutes 20 and 50, UTC)
-- **Historical years**: Static after year ends
+- **Historical years**: Static after year ends, except that the previous year's last 72 hours keep healing into early January
 - **Latency**: ~30-60 minutes from observation to availability (IEM itself lags ~25-40 minutes)
 
 Updates are performed via serverless functions that fetch recent observations from Iowa Mesonet, merge with existing data, and upload to S3.

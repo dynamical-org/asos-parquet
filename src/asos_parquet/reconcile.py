@@ -109,6 +109,23 @@ def partition_year(windows: Sequence[Window]) -> int:
     return year
 
 
+def split_windows_by_year(windows: Sequence[Window]) -> list[tuple[int, list[Window]]]:
+    """Clip the normalized windows at each January 1 00:00Z and group them by year.
+
+    Years ascend, and each group fits :func:`partition_year`. A window ending exactly
+    at January 1 stays in the year before it.
+    """
+    by_year: dict[int, list[Window]] = {}
+    for window in normalize_windows(windows):
+        for year in range(window.start.year, (window.end - pd.Timedelta(1, "ns")).year + 1):
+            first = pd.Timestamp(year=year, month=1, day=1, tz="UTC")
+            last = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC")
+            by_year.setdefault(year, []).append(
+                Window(max(window.start, first), min(window.end, last))
+            )
+    return sorted(by_year.items())
+
+
 def hour_label(valid: pd.Series) -> pd.Series:
     """Right-labelled hour: 05:53 -> 06:00, 06:00 -> 06:00, 06:00:01 -> 07:00."""
     labels = (valid.dt.as_unit("ns") - pd.Timedelta(1, "ns")).dt.floor("h") + _HOUR
@@ -235,13 +252,16 @@ def _key_index(frame: pd.DataFrame) -> pd.MultiIndex:
     )
 
 
-def window_fingerprint(frame: pd.DataFrame, windows: Sequence[Window]) -> pd.Series:
+def window_fingerprint(frame: pd.DataFrame | None, windows: Sequence[Window]) -> pd.Series:
     """Hash of each row inside the windows, keyed by (station, valid).
 
     Covers every column except the key, geometry and bbox; NaN/None hash equal to
     themselves. Used as the merge base of a three-way rebase: rows whose hash
-    differs between two reads of the partition were touched by another writer.
+    differs between two reads of the partition were touched by another writer. A
+    partition that does not exist yet (``None``) has no rows.
     """
+    if frame is None:
+        return pd.Series([], index=_no_keys(), dtype="uint64", name="fingerprint")
     inside = _in_windows(_valid_us(frame), normalize_windows(windows))
     rows = frame.loc[inside]
     columns = sorted(

@@ -53,10 +53,16 @@ Manual runs are strict: any failed chunk or station network, or any acceptance
 gate violation (diff against the base, written-file schema), aborts before the
 PUT. Scheduled runs publish what they fetched and then fail the run.
 
-Limitations: a window never crosses a year boundary — hourly and daily windows
-are clipped at January 1 00:00Z, so the previous year's tail is not healed
-after rollover, and on January 1 the new year's partition must already be
-seeded (the updater refuses to create a missing partition; pre-existing).
+Year rollover: scheduled windows may cross January 1 00:00Z. They are split
+per year and each year partition is published on its own (the new year first),
+so the previous year's tail keeps healing for 6 h (hourly) and 72 h (daily)
+after rollover. A scheduled run creates the current year's partition when it is
+missing, but only in the first week of January and only while the previous
+year's partition exists; any other missing partition is refused. It waits for
+the first new-year rows: an empty new-year fetch skips the create while the run
+also published the previous year. A run fails if it fetched nothing at all, and
+a failure in one year is raised after the other year is published. Manual
+windows must still fit one year partition.
 
 Setup:
     1. Install modal: pip install modal
@@ -141,6 +147,9 @@ RECONCILE_MEMORY_MB = 65536
 
 HOURLY_LOOKBACK_HOURS = 6
 DAILY_RECONCILE_HOURS = 72
+# Scheduled runs create a missing current-year partition only this soon after
+# January 1; later, a missing partition means something deleted it.
+NEW_PARTITION_GRACE_DAYS = 7
 _COVERAGE_THRESHOLD = 0.5
 _MAX_PUT_ATTEMPTS = 3  # the first PUT plus two rebases
 
@@ -275,30 +284,22 @@ def reconcile_asos_data(windows: str | None = None, restore_retired_metadata: bo
     )
 
 
-def _year_start(now: "pd.Timestamp") -> "pd.Timestamp":
-    import pandas as pd
-
-    return pd.Timestamp(year=now.year, month=1, day=1, tz="UTC")
-
-
 def _hourly_windows(now: "pd.Timestamp", lookback_hours: int) -> list["Window"]:
-    """``[max(now - lookback, Jan 1 00:00Z), now)``: a window never crosses a year."""
+    """``[now - lookback, now)``; it may cross January 1 (see ``_publish_scheduled``)."""
     import pandas as pd
 
     from asos_parquet.reconcile import Window
 
-    start = max(now - pd.Timedelta(hours=lookback_hours), _year_start(now))
-    return [Window(start, now)]
+    return [Window(now - pd.Timedelta(hours=lookback_hours), now)]
 
 
 def _daily_windows(now: "pd.Timestamp") -> list["Window"]:
-    """``[max(floor_hour(now) - 72 h, Jan 1 00:00Z), now)``."""
+    """``[floor_hour(now) - 72 h, now)``; it may cross January 1."""
     import pandas as pd
 
     from asos_parquet.reconcile import Window
 
-    start = max(now.floor("h") - pd.Timedelta(hours=DAILY_RECONCILE_HOURS), _year_start(now))
-    return [Window(start, now)]
+    return [Window(now.floor("h") - pd.Timedelta(hours=DAILY_RECONCILE_HOURS), now)]
 
 
 def _utc_now(now: "pd.Timestamp | None") -> "pd.Timestamp":
@@ -311,12 +312,7 @@ def _update_asos_data_impl(
     lookback_hours: int = HOURLY_LOOKBACK_HOURS, now: "pd.Timestamp | None" = None
 ) -> dict[str, Any]:
     now = _utc_now(now)
-    return _publish_windows(
-        _hourly_windows(now, lookback_hours),
-        manual=False,
-        restore_retired_metadata=False,
-        now=now,
-    )
+    return _publish_scheduled(_hourly_windows(now, lookback_hours), reconcile=False, now=now)
 
 
 def _reconcile_asos_data_impl(
@@ -330,19 +326,68 @@ def _reconcile_asos_data_impl(
         raise ValueError("restore_retired_metadata requires explicit windows")
     now = _utc_now(now)
     if windows is None:
-        return _publish_windows(
-            _daily_windows(now),
-            manual=False,
-            reconcile=True,
-            restore_retired_metadata=False,
-            now=now,
-        )
+        return _publish_scheduled(_daily_windows(now), reconcile=True, now=now)
     return _publish_windows(
         parse_windows(windows),
         manual=True,
         restore_retired_metadata=restore_retired_metadata,
         now=now,
     )
+
+
+def _publish_scheduled(
+    windows: Sequence["Window"], *, reconcile: bool, now: "pd.Timestamp"
+) -> dict[str, Any]:
+    """Publish scheduled windows into each year partition they touch, newest first.
+
+    A window inside one year publishes as before. Across January 1, every year is
+    attempted even if another fails; a clean empty fetch for one year is fine while
+    another year published (the new year may have no rows yet), and the first
+    failure is raised after all years ran.
+    """
+    from asos_parquet.fetch import EmptyFetchError
+    from asos_parquet.reconcile import split_windows_by_year
+
+    by_year = split_windows_by_year(windows)
+    if len(by_year) == 1:
+        return _publish_windows(
+            windows,
+            manual=False,
+            reconcile=reconcile,
+            restore_retired_metadata=False,
+            now=now,
+            create_missing=by_year[0][0] == now.year,
+        )
+    results: list[dict[str, Any]] = []
+    empty: list[EmptyFetchError] = []
+    failures: list[Exception] = []
+    for year, year_windows in reversed(by_year):
+        try:
+            results.append(
+                _publish_windows(
+                    year_windows,
+                    manual=False,
+                    reconcile=reconcile,
+                    restore_retired_metadata=False,
+                    now=now,
+                    create_missing=year == now.year,
+                )
+            )
+        except EmptyFetchError as error:
+            empty.append(error)
+            results.append({"status": "empty", "year": year})
+        except Exception as error:
+            failures.append(error)
+            results.append({"status": "failed", "year": year})
+    if len(empty) == len(by_year):
+        raise empty[0]
+    for error in empty:
+        logger.info(f"{error}; nothing to publish there yet")
+    for error in failures[1:]:
+        logger.error("ASOS publish failed for another year partition", exc_info=error)
+    if failures:
+        raise failures[0]
+    return {"status": "success", "partitions": results}
 
 
 @dataclass(frozen=True)
@@ -373,8 +418,19 @@ def _s3_client() -> Any:
     return boto3.client("s3", **s3_kwargs)
 
 
-def _read_base(s3: Any, bucket: str, key: str, path: Path) -> _Base:
-    """Stream the partition to ``path``; its ETag/VersionId come from the same GET."""
+def _is_missing(error: Exception) -> bool:
+    from botocore.exceptions import ClientError
+
+    return isinstance(error, ClientError) and (
+        error.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound")
+    )
+
+
+def _read_base(s3: Any, bucket: str, key: str, path: Path, *, missing_ok: bool) -> _Base | None:
+    """Stream the partition to ``path``; its ETag/VersionId come from the same GET.
+
+    A missing partition is ``None`` when ``missing_ok``, else refused.
+    """
     import shutil
 
     from botocore.exceptions import ClientError
@@ -382,11 +438,13 @@ def _read_base(s3: Any, bucket: str, key: str, path: Path) -> _Base:
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
     except ClientError as e:
-        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
-            raise ValueError(
-                f"Missing legacy ASOS partition {key}; refusing to replace its history"
-            ) from e
-        raise
+        if not _is_missing(e):
+            raise
+        if missing_ok:
+            return None
+        raise ValueError(
+            f"Missing legacy ASOS partition {key}; refusing to replace its history"
+        ) from e
     with path.open("wb") as handle:
         shutil.copyfileobj(response["Body"], handle)
     base = _Base(path, response["ETag"].strip('"'), response.get("VersionId"))
@@ -394,9 +452,30 @@ def _read_base(s3: Any, bucket: str, key: str, path: Path) -> _Base:
     return base
 
 
+def _may_create(s3: Any, bucket: str, prefix: str, year: int, now: "pd.Timestamp") -> bool:
+    """Whether a missing ``year`` partition may be created: early January, previous year present."""
+    import pandas as pd
+
+    if year != now.year or now - pd.Timestamp(year=year, month=1, day=1, tz="UTC") >= pd.Timedelta(
+        days=NEW_PARTITION_GRACE_DAYS
+    ):
+        return False
+    previous = f"{prefix}/year={year - 1}/data.parquet"
+    try:
+        s3.head_object(Bucket=bucket, Key=previous)
+    except Exception as e:
+        if _is_missing(e):
+            raise ValueError(
+                f"Refusing to create year={year}: s3://{bucket}/{previous} (year={year - 1}) "
+                "does not exist"
+            ) from e
+        raise
+    return True
+
+
 @dataclass
 class _Published:
-    base: _Base
+    base: _Base | None  # None: the partition was created
     candidate: Any  # the published GeoDataFrame
     file_size_mb: float
     response: dict[str, Any]
@@ -436,6 +515,7 @@ def _publish_windows(
     restore_retired_metadata: bool,
     now: "pd.Timestamp",
     reconcile: bool = False,
+    create_missing: bool = False,
 ) -> dict[str, Any]:
     """Fetch the windows, merge them into their year partition, and PUT it.
 
@@ -450,17 +530,25 @@ def _publish_windows(
     partition knows. ``manual`` is strict: an incomplete fetch or an acceptance
     gate violation raises before any PUT. Scheduled runs publish a partial fetch
     and then raise.
+
+    ``create_missing`` lets a missing partition be created (``IfNoneMatch="*"``) when
+    ``_may_create`` allows it; a clean fetch with no rows then creates nothing.
     """
     import gc
     import tempfile
     import time
 
     import geopandas as gpd
+    import pandas as pd
     from botocore.exceptions import ClientError
 
     from asos_parquet.composers import ParquetPublisher
     from asos_parquet.config import get_all_network_ids
-    from asos_parquet.fetch import IncompleteFetchError, fetch_observations_bulk_result
+    from asos_parquet.fetch import (
+        EmptyFetchError,
+        IncompleteFetchError,
+        fetch_observations_bulk_result,
+    )
     from asos_parquet.reconcile import (
         compose_partition,
         concurrent_change_violations,
@@ -484,7 +572,8 @@ def _publish_windows(
     windows = normalize_windows(windows)
     year = partition_year(windows)
     window_text = ", ".join(str(window) for window in windows)
-    s3_key = f"{_asos_parquet_s3_prefix()}/year={year}/data.parquet"
+    prefix = _asos_parquet_s3_prefix()
+    s3_key = f"{prefix}/year={year}/data.parquet"
     mode = "manual reconcile" if manual else "reconcile" if reconcile else "update"
     logger.info(f"ASOS {mode} started: windows {window_text} → s3://{s3_bucket}/{s3_key}")
     s3 = _s3_client()
@@ -498,9 +587,19 @@ def _publish_windows(
         # Step 1: Base partition
         started = time.monotonic()
         try:
-            base = _read_base(s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet")
-            existing: gpd.GeoDataFrame | None = gpd.read_parquet(base.path)
-            logger.info(f"Read existing partition ({len(existing):,} records)")
+            base = _read_base(
+                s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet", missing_ok=create_missing
+            )
+            existing: gpd.GeoDataFrame | None = None
+            if base is not None:
+                existing = gpd.read_parquet(base.path)
+                logger.info(f"Read existing partition ({len(existing):,} records)")
+            elif _may_create(s3, s3_bucket, prefix, year, now):
+                logger.warning(f"s3://{s3_bucket}/{s3_key} does not exist yet; creating it")
+            else:
+                raise ValueError(
+                    f"Missing legacy ASOS partition {s3_key}; refusing to replace its history"
+                )
 
             # Step 2: Station metadata, every attempt and AFTER the base read. Whoever
             # wrote the base we read discovered before their PUT, which precedes our
@@ -547,7 +646,7 @@ def _publish_windows(
                 )
                 # Step 5: Completeness
                 if fetched.observations.empty:
-                    raise IncompleteFetchError(
+                    raise (IncompleteFetchError if fetched.errors else EmptyFetchError)(
                         f"No observations fetched for {window_text} from {len(requested)} "
                         f"stations ({run.summary(fetched)})"
                     )
@@ -592,7 +691,7 @@ def _publish_windows(
             # Step 7: Checks relative to this base. A rebased candidate must carry
             # the other writer's rows for every withheld key (all modes).
             violations: list[str] = []
-            if withheld is not None:
+            if withheld is not None and existing is not None:
                 conflicts = concurrent_change_violations(candidate, existing, withheld, windows)
                 if conflicts:
                     raise AcceptanceGateError(
@@ -600,6 +699,7 @@ def _publish_windows(
                         f"nothing published: {'; '.join(conflicts)}"
                     )
             if manual:
+                assert existing is not None  # manual runs never create a partition
                 diff = diff_partitions(
                     existing, candidate, windows, expected_metadata=expected_metadata
                 )
@@ -615,15 +715,17 @@ def _publish_windows(
             # Step 8: Write locally, then conditional PUT
             output_path = ParquetPublisher(work / f"candidate-{attempt}").publish(candidate, year)
             if manual:
+                assert base is not None
                 violations.extend(written_file_violations(base.path, output_path))
                 if violations:
                     raise AcceptanceGateError(
                         f"Candidate for {window_text} failed the acceptance gate; nothing "
                         f"published: {'; '.join(violations)}"
                     )
-            logger.info(f"Uploading to S3 (IfMatch {base.etag})...")
+            condition = {"IfMatch": base.etag} if base is not None else {"IfNoneMatch": "*"}
+            logger.info(f"Uploading to S3 ({condition})...")
             with output_path.open("rb") as body:
-                response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, IfMatch=base.etag)
+                response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, **condition)
             return _Published(
                 base=base,
                 candidate=candidate,
@@ -669,8 +771,10 @@ def _publish_windows(
         f"version {published_version_id})"
     )
 
-    # Step 10: Advisory coverage check on what we published
-    coverage = coverage_report(candidate, now, threshold=_COVERAGE_THRESHOLD)
+    # Step 10: Advisory coverage check on what we published. A past year's partition
+    # ends at January 1: hours after that live in the next partition.
+    year_end = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC")
+    coverage = coverage_report(candidate, min(now, year_end), threshold=_COVERAGE_THRESHOLD)
     low = coverage.low_hours
     if not low.empty:
         logger.error(
@@ -706,12 +810,13 @@ def _publish_windows(
     logger.info(f"ASOS {mode} complete")
     return {
         "status": "success",
+        "year": year,
         "windows": [str(window) for window in windows],
         "observations": observations,
         "total_records": total_records,
         "file_size_mb": round(file_size, 2),
-        "base_etag": base.etag,
-        "base_version_id": base.version_id,
+        "base_etag": base.etag if base is not None else None,
+        "base_version_id": base.version_id if base is not None else None,
         "published_etag": published_etag,
         "published_version_id": published_version_id,
         "withheld_concurrent": withheld_concurrent,

@@ -32,6 +32,7 @@ from asos_parquet.reconcile import (
     reconcile_fetch_stations,
     reference_hour_counts,
     run_shard,
+    split_windows_by_year,
     station_shards,
     unresolved_station_ids,
     window_fingerprint,
@@ -178,6 +179,40 @@ def test_partition_year_accepts_window_ending_at_next_new_year() -> None:
 def test_partition_year_rejects_spanning_years(windows: list[Window]) -> None:
     with pytest.raises(ValueError):
         partition_year(windows)
+
+
+def test_split_windows_by_year_clips_at_new_year() -> None:
+    assert split_windows_by_year(
+        [
+            window("2027-01-01T01:00Z", "2027-01-01T02:00Z"),
+            window("2026-12-31T20:00Z", "2027-01-01T00:30Z"),
+        ]
+    ) == [
+        (2026, [window("2026-12-31T20:00Z", "2027-01-01T00:00Z")]),
+        (
+            2027,
+            [
+                window("2027-01-01T00:00Z", "2027-01-01T00:30Z"),
+                window("2027-01-01T01:00Z", "2027-01-01T02:00Z"),
+            ],
+        ),
+    ]
+
+
+def test_split_windows_by_year_keeps_a_window_ending_at_new_year_in_one_year() -> None:
+    assert split_windows_by_year([window("2026-12-31T20:00Z", "2027-01-01T00:00Z")]) == [
+        (2026, [window("2026-12-31T20:00Z", "2027-01-01T00:00Z")])
+    ]
+    assert split_windows_by_year([window("2027-01-01T00:00Z", "2027-01-01T02:00Z")]) == [
+        (2027, [window("2027-01-01T00:00Z", "2027-01-01T02:00Z")])
+    ]
+
+
+def test_window_fingerprint_of_a_missing_partition_is_empty() -> None:
+    fingerprint = window_fingerprint(None, [window("2027-01-01T00:00Z", "2027-01-01T02:00Z")])
+
+    assert fingerprint.empty
+    assert list(fingerprint.index.names) == ["station", "valid"]
 
 
 def test_hour_label_is_right_labelled() -> None:
