@@ -320,23 +320,12 @@ def test_hourly_window_is_six_hours(monkeypatch: pytest.MonkeyPatch, fake_s3: Fa
     ]
 
 
-def test_hourly_window_is_clipped_at_january_first() -> None:
-    now = pd.Timestamp("2026-01-01T02:10:00Z")
-
-    windows = modal_app._hourly_windows(now, 6)
-
-    assert [(w.start, w.end) for w in windows] == [(pd.Timestamp("2026-01-01T00:00:00Z"), now)]
-
-
 def test_daily_reconcile_window_is_72_hours_from_the_hour() -> None:
     now = pd.Timestamp("2026-09-28T05:35:10Z")
 
     windows = modal_app._daily_windows(now)
 
     assert [(w.start, w.end) for w in windows] == [(pd.Timestamp("2026-09-25T05:00:00Z"), now)]
-    assert modal_app._daily_windows(pd.Timestamp("2026-01-02T05:35Z"))[0].start == pd.Timestamp(
-        "2026-01-01T00:00Z"
-    )
 
 
 def test_daily_reconcile_requests_existing_only_stations(
@@ -959,3 +948,334 @@ def test_manual_reconcile_does_not_check_in(checkins: list[tuple[str, str]]) -> 
     modal_app._run_monitored("reconcile_asos_data", lambda: {"status": "success"}, None)
 
     assert checkins == []
+
+
+# --- year rollover -----------------------------------------------------------
+
+
+class BucketS3:
+    """Several keys with ETag/VersionId, IfMatch and IfNoneMatch="*"; a missing key 404s."""
+
+    def __init__(self, objects: dict[int, bytes]) -> None:
+        self.objects = {_key(year): (body, f"etag-{year}-1") for year, body in objects.items()}
+        self.versions = dict.fromkeys(self.objects, 1)
+        self.puts: list[dict[str, Any]] = []
+        self.put_errors: dict[str, Exception] = {}  # raised by the next PUT of that key
+        self.concurrent: dict[str, bytes] = {}  # lands just before the next PUT of that key
+
+    @staticmethod
+    def _missing(operation: str) -> ClientError:
+        code = "NoSuchKey" if operation == "GetObject" else "404"
+        return ClientError({"Error": {"Code": code, "Message": "missing"}}, operation)
+
+    def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:
+        if Key not in self.objects:
+            raise self._missing("GetObject")
+        body, etag = self.objects[Key]
+        return {"Body": io.BytesIO(body), "ETag": f'"{etag}"', "VersionId": etag}
+
+    def head_object(self, Bucket: str, Key: str) -> dict[str, Any]:
+        if Key not in self.objects:
+            raise self._missing("HeadObject")
+        return {"ETag": f'"{self.objects[Key][1]}"'}
+
+    def _replace(self, key: str, body: bytes) -> str:
+        self.versions[key] = self.versions.get(key, 0) + 1
+        etag = f"etag-{key.split('=')[1].split('/')[0]}-{self.versions[key]}"
+        self.objects[key] = (body, etag)
+        return etag
+
+    def put_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Body: Any,
+        IfMatch: str | None = None,
+        IfNoneMatch: str | None = None,
+    ) -> dict[str, str]:
+        body = Body.read()
+        self.puts.append({"Key": Key, "IfMatch": IfMatch, "IfNoneMatch": IfNoneMatch, "body": body})
+        if Key in self.concurrent:
+            self._replace(Key, self.concurrent.pop(Key))
+        if Key in self.put_errors:
+            raise self.put_errors.pop(Key)
+        current = self.objects.get(Key)
+        if IfNoneMatch == "*" and current is not None:
+            raise _client_error("PreconditionFailed", 412)
+        if IfMatch is not None and (current is None or IfMatch != current[1]):
+            raise _client_error("PreconditionFailed", 412)
+        assert (IfMatch is None) != (IfNoneMatch is None), "every PUT must be conditional"
+        etag = self._replace(Key, body)
+        return {"ETag": f'"{etag}"', "VersionId": etag}
+
+    def frame(self, year: int) -> gpd.GeoDataFrame:
+        return gpd.read_parquet(io.BytesIO(self.objects[_key(year)][0]))
+
+    def put_keys(self) -> list[str]:
+        return [put["Key"] for put in self.puts]
+
+
+def _key(year: int) -> str:
+    return f"asos-parquet/year={year}/data.parquet"
+
+
+def _year_bytes(tmp_path: Path, frames: Iterable[pd.DataFrame], year: int) -> bytes:
+    existing = compose_partition(None, pd.concat(frames, ignore_index=True), _stations())
+    return ParquetPublisher(tmp_path / f"seed-{year}").publish(existing, year).read_bytes()
+
+
+ROLLOVER = pd.Timestamp("2027-01-01T02:20:00Z")
+DEC31_LATE = "2026-12-31T23:53:00Z"  # IEM published it after the year rolled over
+JAN1 = "2027-01-01T00:53:00Z"
+
+
+@pytest.fixture
+def bucket(s3_env: Any, tmp_path: Path) -> BucketS3:
+    s3: BucketS3 = s3_env(
+        BucketS3({2026: _year_bytes(tmp_path, [_observations("2026-12-31T18:53:00Z")], 2026)})
+    )
+    return s3
+
+
+def _both_years() -> pd.DataFrame:
+    return pd.concat([_observations(DEC31_LATE), _observations(JAN1)], ignore_index=True)
+
+
+def _valid(frame: pd.DataFrame) -> list[pd.Timestamp]:
+    return sorted(pd.Timestamp(value).tz_convert("UTC") for value in frame["valid"])
+
+
+def test_hourly_window_crosses_january_first() -> None:
+    windows = modal_app._hourly_windows(pd.Timestamp("2027-01-01T02:10:00Z"), 6)
+
+    assert [(w.start, w.end) for w in windows] == [
+        (pd.Timestamp("2026-12-31T20:10:00Z"), pd.Timestamp("2027-01-01T02:10:00Z"))
+    ]
+
+
+def test_daily_reconcile_window_crosses_january_first() -> None:
+    windows = modal_app._daily_windows(pd.Timestamp("2027-01-02T05:35Z"))
+
+    assert windows[0].start == pd.Timestamp("2026-12-30T05:00Z")
+
+
+def test_rollover_creates_new_year_and_heals_the_old_tail(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    _fake_stations(monkeypatch, _stations())
+    recording = _fake_fetch(monkeypatch, _both_years())
+
+    result = modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert result["status"] == "success"
+    assert [(start, end) for _, start, end in recording.calls] == [
+        (pd.Timestamp("2027-01-01T00:00Z"), ROLLOVER),
+        (ROLLOVER - pd.Timedelta(hours=6), pd.Timestamp("2027-01-01T00:00Z")),
+    ]
+    assert [(put["Key"], put["IfMatch"], put["IfNoneMatch"]) for put in bucket.puts] == [
+        (_key(2027), None, "*"),
+        (_key(2026), "etag-2026-1", None),
+    ]
+    assert _valid(bucket.frame(2027)) == [pd.Timestamp(JAN1)]
+    assert _valid(bucket.frame(2026)) == [
+        pd.Timestamp("2026-12-31T18:53:00Z"),
+        pd.Timestamp(DEC31_LATE),
+    ]
+    assert [(p["year"], p["base_etag"]) for p in result["partitions"]] == [
+        (2027, None),
+        (2026, "etag-2026-1"),
+    ]
+
+
+def test_rollover_publishes_into_the_new_year_once_it_exists(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3, tmp_path: Path
+) -> None:
+    bucket.objects[_key(2027)] = (
+        _year_bytes(tmp_path, [_observations("2027-01-01T00:10:00Z")], 2027),
+        "etag-2027-1",
+    )
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _both_years())
+
+    modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert bucket.puts[0]["IfMatch"] == "etag-2027-1"
+    assert _valid(bucket.frame(2027)) == [
+        pd.Timestamp("2027-01-01T00:10:00Z"),
+        pd.Timestamp(JAN1),
+    ]
+
+
+def test_daily_reconcile_heals_the_old_tail_after_rollover(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _both_years())
+
+    result = modal_app._reconcile_asos_data_impl(None, False, now=pd.Timestamp("2027-01-02T05:35Z"))
+
+    assert result["status"] == "success"
+    assert bucket.put_keys() == [_key(2027), _key(2026)]
+    assert pd.Timestamp(DEC31_LATE) in _valid(bucket.frame(2026))
+
+
+def test_new_year_partition_waits_for_its_first_rows(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    # 00:20Z on January 1: IEM has nothing for the new year yet.
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations(DEC31_LATE))
+
+    result = modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-01T00:20Z"))
+
+    assert result["status"] == "success"
+    assert bucket.put_keys() == [_key(2026)]
+    assert _key(2027) not in bucket.objects
+    assert [(p["year"], p["status"]) for p in result["partitions"]] == [
+        (2027, "empty"),
+        (2026, "success"),
+    ]
+
+
+def test_rollover_run_that_fetches_nothing_fails(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, pd.DataFrame())
+
+    with pytest.raises(IncompleteFetchError, match="No observations fetched"):
+        modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert bucket.puts == []
+
+
+def test_new_year_partition_empty_after_rollover_window_fails(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    # 06:20Z: the hourly window no longer reaches 2026, so an empty fetch is an outage.
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, pd.DataFrame())
+
+    with pytest.raises(IncompleteFetchError, match="No observations fetched"):
+        modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-01T06:20Z"))
+
+    assert bucket.puts == []
+
+
+def test_new_year_partition_is_created_by_a_later_single_year_run(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations("2027-01-01T05:53:00Z"))
+
+    result = modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-01T06:20Z"))
+
+    assert result["status"] == "success"
+    assert result["base_etag"] is None
+    assert bucket.puts[0]["IfNoneMatch"] == "*"
+
+
+def test_missing_current_partition_after_the_first_week_is_refused(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations("2027-01-09T11:53:00Z"))
+
+    with pytest.raises(ValueError, match="refusing to replace its history"):
+        modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-09T12:20Z"))
+
+    assert bucket.puts == []
+
+
+def test_new_year_partition_requires_the_previous_year(
+    monkeypatch: pytest.MonkeyPatch, s3_env: Any
+) -> None:
+    bucket = s3_env(BucketS3({}))
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations("2027-01-01T05:53:00Z"))
+
+    with pytest.raises(ValueError, match="year=2026"):
+        modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-01T06:20Z"))
+
+    assert bucket.puts == []
+
+
+def test_past_year_partition_is_never_created(
+    monkeypatch: pytest.MonkeyPatch, s3_env: Any, tmp_path: Path
+) -> None:
+    bucket = s3_env(BucketS3({}))
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _both_years())
+
+    with pytest.raises(ValueError, match="year=2026"):
+        modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert _key(2026) not in bucket.objects
+
+
+def test_one_partition_failing_still_publishes_the_other(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3
+) -> None:
+    bucket.put_errors[_key(2027)] = _client_error("InternalError", 500)
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _both_years())
+
+    with pytest.raises(ClientError, match="InternalError"):
+        modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert pd.Timestamp(DEC31_LATE) in _valid(bucket.frame(2026))
+    assert _key(2027) not in bucket.objects
+
+
+def test_concurrent_creation_of_the_new_year_rebases(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3, tmp_path: Path
+) -> None:
+    theirs = _observations(JAN1, tmpf=10.0)
+    bucket.concurrent[_key(2027)] = _year_bytes(
+        tmp_path, [theirs, _observations("2027-01-01T00:10:00Z")], 2027
+    )
+    _fake_stations(monkeypatch, _stations())
+    recording = _fake_fetch(monkeypatch, _both_years())
+
+    result = modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert len(recording.calls) == 2  # no re-fetch on rebase
+    creates = [put for put in bucket.puts if put["Key"] == _key(2027)]
+    assert [(put["IfMatch"], put["IfNoneMatch"]) for put in creates] == [
+        (None, "*"),
+        ("etag-2027-1", None),
+    ]
+    published = bucket.frame(2027)
+    assert list(published.loc[published["valid"] == pd.Timestamp(JAN1), "tmpf"]) == [10.0]
+    assert result["partitions"][0]["withheld_concurrent"] == {
+        "added": 1,
+        "changed": 0,
+        "removed": 0,
+    }
+
+
+def test_old_year_coverage_ignores_hours_after_its_end(
+    monkeypatch: pytest.MonkeyPatch,
+    s3_env: Any,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    hours = pd.date_range("2026-12-20T00:53Z", "2026-12-31T23:53Z", freq="h")
+    history = [_observations(hour.isoformat()) for hour in hours]
+    s3_env(BucketS3({2026: _year_bytes(tmp_path, history, 2026)}))
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _both_years())
+
+    with caplog.at_level(logging.INFO):
+        result = modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-01T05:20Z"))
+
+    assert result["partitions"][1]["coverage"]["low_hours"] == 0
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_manual_reconcile_still_refuses_windows_across_new_year(bucket: BucketS3) -> None:
+    with pytest.raises(ValueError, match="not all inside"):
+        modal_app._reconcile_asos_data_impl(
+            "2026-12-31T20:00Z/2027-01-01T02:00Z", False, now=ROLLOVER
+        )

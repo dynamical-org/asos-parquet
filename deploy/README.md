@@ -155,11 +155,26 @@ This ensures the current year's data stays up-to-date with minimal compute costs
 
 ## New Year Rollover
 
-The updater does **not** create a new year's partition. When `year=YYYY/data.parquet` is missing it
-refuses to run ("Missing legacy ASOS partition ... refusing to replace its history"), so every run fails from
-00:20 UTC on Jan 1 until the partition is seeded. Windows never cross a year boundary: runs early on Jan 1
-fetch only from 00:00 UTC, so reports from the last hours of Dec 31 that IEM publishes late are not picked up
-by the scheduled runs. Seed the new partition before Jan 1, and reconcile the tail of Dec 31 manually if needed.
+Scheduled windows cross January 1 00:00 UTC. A run splits them per year and
+publishes each year partition separately, the new year first. The previous
+year's tail keeps healing for 6 hours (hourly runs) and 72 hours (daily
+reconcile) into January.
+
+A scheduled run creates the new year's partition (`year=YYYY/data.parquet`,
+a conditional create with `If-None-Match: *`) once IEM returns its first rows,
+typically at 00:50 or 01:20 UTC. A new-year fetch with no rows is not an error
+while the same run also published the previous year. After that, an empty
+fetch fails the run as usual.
+
+A missing partition is created only in the first 7 days of January
+(`NEW_PARTITION_GRACE_DAYS`), and only when the previous year's partition
+exists. Any other missing partition is refused ("Missing legacy ASOS
+partition ... refusing to replace its history"), so a deleted partition is
+never silently rebuilt from a few hours of data. If one year fails, the run
+still publishes the other and then fails.
+
+Manual reconcile windows must still fit one year; reconcile each side of
+January 1 separately.
 
 ## Troubleshooting
 
