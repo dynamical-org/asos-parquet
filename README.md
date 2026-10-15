@@ -146,7 +146,7 @@ make load RESUME=1               # Resume interrupted load
 make validate                    # Validate local data
 ```
 
-See [CLAUDE.md](CLAUDE.md) for full developer reference including architecture, module responsibilities, and all available commands.
+See [AGENTS.md](AGENTS.md) for full developer reference including architecture, module responsibilities, and all available commands.
 
 ### Deploy hourly updates
 
