@@ -21,6 +21,14 @@ from asos_parquet.stations import StationFetchResult, fetch_all_stations_result
 from modal_app import _asos_parquet_s3_prefix, _is_lifecycle_interruption
 
 
+@pytest.fixture(autouse=True, params=[True, False], ids=["bounded", "full-frame"])
+def update_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Run every test on the batched scheduled update and on its full-frame rollback."""
+    monkeypatch.setattr(modal_app, "BOUNDED_SCHEDULED_UPDATE", request.param)
+    bounded: bool = request.param
+    return bounded
+
+
 def test_keyboard_interrupt_is_lifecycle_interruption():
     assert _is_lifecycle_interruption(KeyboardInterrupt())
 
@@ -1279,3 +1287,169 @@ def test_manual_reconcile_still_refuses_windows_across_new_year(bucket: BucketS3
         modal_app._reconcile_asos_data_impl(
             "2026-12-31T20:00Z/2027-01-01T02:00Z", False, now=ROLLOVER
         )
+
+
+def _refuse_full_frame(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make full-frame reads and the whole-frame publisher raise; record each refusal."""
+    refused: list[str] = []
+    read_parquet = gpd.read_parquet
+
+    def bounded_read(path: Any, *args: Any, **kwargs: Any) -> gpd.GeoDataFrame:
+        if kwargs.get("filters") is None and not isinstance(path, io.BytesIO):
+            refused.append(f"read {Path(path).name}")
+            raise AssertionError(f"full-frame read of {path}")
+        return read_parquet(path, *args, **kwargs)
+
+    def publish(self: ParquetPublisher, observations: gpd.GeoDataFrame, year: int) -> Path:
+        refused.append("publish")
+        raise AssertionError("whole-frame ParquetPublisher used")
+
+    monkeypatch.setattr(gpd, "read_parquet", bounded_read)
+    monkeypatch.setattr(ParquetPublisher, "publish", publish)
+    return refused
+
+
+def test_scheduled_update_never_materializes_the_full_base(
+    monkeypatch: pytest.MonkeyPatch, s3_env: Any, tmp_path: Path, update_path: bool
+) -> None:
+    s3 = s3_env(FakeS3(_base(tmp_path, [_observations("2026-01-01T00:00:00Z")])))
+    s3.concurrent_bodies = [
+        _partition_bytes(
+            tmp_path,
+            [_observations("2026-01-01T00:00:00Z"), _observations(_recent(), tmpf=75.0)],
+            "concurrent",
+        )
+    ]
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations(_recent(), tmpf=68.0))
+    refused = _refuse_full_frame(monkeypatch)
+
+    if not update_path:
+        # The refusals are real: the full-frame path trips them.
+        with pytest.raises(AssertionError, match="full-frame read"):
+            modal_app._update_asos_data_impl(now=NOW)
+        assert refused == ["read base-1.parquet"]
+        assert s3.puts == []
+        return
+
+    result = modal_app._update_asos_data_impl(now=NOW)
+
+    assert refused == []
+    assert result["status"] == "success"
+    assert result["total_records"] == 2
+    assert result["withheld_concurrent"] == {"added": 1, "changed": 0, "removed": 0}
+    assert [put["IfMatch"] for put in s3.puts] == ["etag-1", "etag-2"]
+    published = s3.put_frame()
+    assert published.loc[published["valid"] == pd.Timestamp(_recent()), "tmpf"].tolist() == [75.0]
+
+
+def test_daily_and_manual_reconcile_keep_the_full_frame_path(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3
+) -> None:
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations("2026-09-28T07:00:00Z"))
+    refused = _refuse_full_frame(monkeypatch)
+
+    with pytest.raises(AssertionError, match="full-frame read"):
+        modal_app._reconcile_asos_data_impl(None, False, now=NOW)
+    with pytest.raises(AssertionError, match="full-frame read"):
+        _manual()
+
+    assert refused == ["read base-1.parquet", "read base-1.parquet"]
+    assert fake_s3.puts == []
+
+
+def test_bounded_update_checks_the_written_file_before_put(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, update_path: bool
+) -> None:
+    monkeypatch.setattr(
+        "asos_parquet.reconcile.written_file_violations",
+        lambda base, candidate: ("geo covering missing for geometry",),
+    )
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations(_recent()))
+
+    if update_path:
+        with pytest.raises(modal_app.AcceptanceGateError, match="geo covering missing"):
+            modal_app._update_asos_data_impl(now=NOW)
+        assert fake_s3.puts == []
+    else:  # the full-frame scheduled update never ran this check
+        assert modal_app._update_asos_data_impl(now=NOW)["status"] == "success"
+
+
+def test_bounded_rebase_rejects_a_candidate_that_overwrites_theirs(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, tmp_path: Path
+) -> None:
+    from asos_parquet import reconcile
+
+    history = _observations("2026-01-01T00:00:00Z")
+    fake_s3.concurrent_bodies = [
+        _partition_bytes(tmp_path, [history, _observations(_recent(), tmpf=75.0)], "c1")
+    ]
+    # Withhold nothing, so our stale 68 overwrites their added row.
+    monkeypatch.setattr(
+        reconcile,
+        "withhold_concurrent_changes",
+        lambda observations, base, current, previous=None: (
+            observations,
+            reconcile.Withheld(
+                pd.MultiIndex.from_tuples(
+                    [("KAAA", reconcile._valid_us(_observations(_recent()))[0])],
+                    names=["station", "valid"],
+                ),
+                reconcile._no_keys(),
+                reconcile._no_keys(),
+            ),
+        ),
+    )
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations(_recent(), tmpf=68.0))
+
+    with pytest.raises(modal_app.AcceptanceGateError, match="differ from another writer"):
+        modal_app._update_asos_data_impl(now=NOW)
+
+    assert len(fake_s3.puts) == 1  # only the 412'd first attempt
+
+
+def test_new_partition_created_concurrently_before_if_none_match(
+    monkeypatch: pytest.MonkeyPatch, bucket: BucketS3, tmp_path: Path
+) -> None:
+    # Single-year run: the base is missing at our GET (fingerprint of None), another
+    # writer creates it before our IfNoneMatch PUT, and the rebase keeps their row.
+    jan1 = "2027-01-01T05:53:00Z"
+    bucket.concurrent[_key(2027)] = _year_bytes(
+        tmp_path, [_observations(jan1, tmpf=10.0), _observations("2027-01-01T05:10:00Z")], 2027
+    )
+    _fake_stations(monkeypatch, _stations())
+    recording = _fake_fetch(monkeypatch, _observations(jan1, tmpf=68.0))
+
+    result = modal_app._update_asos_data_impl(now=pd.Timestamp("2027-01-01T06:20Z"))
+
+    assert len(recording.calls) == 1
+    assert [(put["IfMatch"], put["IfNoneMatch"]) for put in bucket.puts] == [
+        (None, "*"),
+        ("etag-2027-1", None),
+    ]
+    assert result["base_etag"] == "etag-2027-1"
+    assert result["withheld_concurrent"] == {"added": 1, "changed": 0, "removed": 0}
+    assert result["total_records"] == 2
+    published = bucket.frame(2027)
+    assert list(published.loc[published["valid"] == pd.Timestamp(jan1), "tmpf"]) == [10.0]
+
+
+def test_restore_retired_metadata_keeps_the_full_frame_path(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3
+) -> None:
+    # A direct scheduled-mode caller asking to restore metadata must not take the
+    # bounded path, which would silently ignore the request.
+    _fake_stations(monkeypatch, _stations())
+    _fake_fetch(monkeypatch, _observations(_recent()))
+    refused = _refuse_full_frame(monkeypatch)
+
+    with pytest.raises(AssertionError, match="full-frame read"):
+        modal_app._publish_windows(
+            modal_app._hourly_windows(NOW, 6), manual=False, restore_retired_metadata=True, now=NOW
+        )
+
+    assert refused == ["read base-1.parquet"]
+    assert fake_s3.puts == []
