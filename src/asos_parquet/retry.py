@@ -2,18 +2,24 @@
 
 Callers that pass no policy keep their legacy retry loops unchanged. With a
 policy, each operation (one network's metadata GET, one bulk chunk's GET) gets
-a fixed number of attempts with short jittered backoff, and every attempt must
-be admitted before a shared monotonic ``Deadline``.
+a fixed number of attempts with short jittered backoff.
 
-The deadline bounds the admission of new requests only. Socket timeouts are
-inactivity timeouts, not total-transfer limits: an admitted request that keeps
-dribbling bytes can outlive both its read timeout and the deadline, so the
-caller's hard ceiling (Modal's function timeout) still applies.
+A shared monotonic ``Deadline`` bounds retries and backoff only. Every first
+attempt runs, with full socket timeouts, even when the deadline passed while
+it was queued; a first attempt that fails after the deadline is logged and
+raised without a retry or a sleep. Retries must be admitted (paced, checked,
+and given socket timeouts clamped to the remaining budget) before the
+deadline, which is never renewed.
+
+Socket timeouts are inactivity timeouts, not total-transfer limits: a request
+that keeps dribbling bytes can outlive both its read timeout and the deadline,
+so the caller's hard ceiling (Modal's function timeout) still applies.
 """
 
 import http.client
 import logging
 import random
+import ssl
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,15 +33,18 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Request-admission budget for one scheduled bounded update, measured from entry.
+# Retry/backoff budget for one scheduled bounded update, measured from entry.
+# First attempts are not bounded by it.
 SCHEDULED_ADMISSION_BUDGET = 600.0
 
 # Transport failures worth another attempt. requests.ConnectionError covers
-# SSLError too; that one is excluded in classify().
+# SSLError too, so transient TLS failures (EOF, reset handshakes) are retried;
+# certificate-verification failures are excluded in classify().
 RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     requests.ConnectionError,
     requests.Timeout,
     requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
     http.client.RemoteDisconnected,
     http.client.IncompleteRead,
     ConnectionResetError,
@@ -44,7 +53,7 @@ RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
 
 
 class DeadlineExceeded(RuntimeError):
-    """Raised instead of admitting a request (or a wait) past the deadline."""
+    """Raised instead of admitting a retry (or the wait before it) past the deadline."""
 
 
 class RetryExhausted(RuntimeError):
@@ -61,7 +70,7 @@ class Pacer(Protocol):
 
 @dataclass(frozen=True)
 class Deadline:
-    """An absolute ``time.monotonic()`` instant after which no request is admitted."""
+    """An absolute ``time.monotonic()`` instant after which no retry is admitted."""
 
     expires_at: float
 
@@ -93,8 +102,12 @@ class RetryPolicy:
     pace_first_attempt: bool  # False: only retries go through the pacer
     jitter: Callable[[], float] = random.random  # uniform 0–1 s added to each delay
 
+    def first_timeout(self) -> tuple[float, float]:
+        """(connect, read) socket timeouts for a first attempt: never clamped."""
+        return (self.connect_timeout, self.read_timeout)
+
     def timeout(self) -> tuple[float, float]:
-        """(connect, read) socket timeouts clamped to the remaining budget."""
+        """(connect, read) socket timeouts for a retry, clamped to the remaining budget."""
         remaining = self.deadline.remaining()
         if remaining <= 0:
             raise DeadlineExceeded("admission deadline passed before the request")
@@ -102,7 +115,7 @@ class RetryPolicy:
 
 
 def metadata_retry_policy(deadline: Deadline) -> RetryPolicy:
-    """Station-metadata GETs: 3 attempts; retries (not first attempts) are paced."""
+    """Station-metadata GETs: 3 attempts; first attempts unpaced, retries paced."""
     return RetryPolicy(
         deadline=deadline,
         max_attempts=3,
@@ -115,7 +128,7 @@ def metadata_retry_policy(deadline: Deadline) -> RetryPolicy:
 
 
 def bulk_retry_policy(deadline: Deadline) -> RetryPolicy:
-    """Bulk observation GETs: 6 attempts, every attempt paced as today."""
+    """Bulk observation GETs: 6 attempts, every attempt paced (first ones without deadline)."""
     return RetryPolicy(
         deadline=deadline,
         max_attempts=6,
@@ -145,9 +158,33 @@ def retry_after_seconds(response: requests.Response | None) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
+# Upper bound on exceptions inspected when searching an error's wrapper graph.
+_MAX_LINKED_ERRORS = 32
+
+
+def _linked_errors(error: BaseException) -> list[BaseException]:
+    """Exceptions this one wraps: cause, context, urllib3 ``reason`` and exception args."""
+    linked = [error.__cause__, error.__context__, getattr(error, "reason", None), *error.args]
+    return [e for e in linked if isinstance(e, BaseException)]
+
+
+def _is_certificate_error(error: BaseException) -> bool:
+    """True if a real ssl.SSLCertVerificationError is anywhere in the wrapper graph."""
+    pending, seen = [error], set()
+    while pending and len(seen) < _MAX_LINKED_ERRORS:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        pending.extend(_linked_errors(current))
+    return False
+
+
 def classify(error: BaseException) -> tuple[str, str] | None:
     """("throttle" | "transient", description) for a retryable error, else None."""
-    if isinstance(error, requests.exceptions.SSLError):
+    if _is_certificate_error(error):
         return None
     if isinstance(error, requests.HTTPError):
         # A Response is falsy for 4xx/5xx, so test identity, not truthiness.
@@ -165,7 +202,7 @@ def classify(error: BaseException) -> tuple[str, str] | None:
 
 
 def _describe(error: BaseException) -> str:
-    """Error class or HTTP status only: never a URL, header or response body."""
+    """A permanent failure's error class or HTTP status: never a URL, header or body."""
     if isinstance(error, requests.HTTPError):
         status = error.response.status_code if error.response is not None else None
         return f"HTTP {status}"
@@ -181,9 +218,11 @@ def call_with_retry(
 ) -> T:
     """Run ``operation(timeout)`` under ``policy``; permanent errors propagate as-is.
 
-    Raises RetryExhausted after ``max_attempts`` retryable failures, and
-    DeadlineExceeded when the next attempt (or the wait before it) cannot
-    start before the deadline. Both chain the last underlying error.
+    The first attempt always runs with full socket timeouts (paced without a
+    deadline if ``pace_first_attempt``). Raises RetryExhausted after
+    ``max_attempts`` retryable failures, and DeadlineExceeded when a retry (or
+    the wait before it) cannot start before the deadline. Both chain the last
+    underlying error.
     """
     started = time.monotonic()
     limit = policy.max_attempts
@@ -192,17 +231,23 @@ def call_with_retry(
     last_description: str | None = None
 
     for attempt in range(1, limit + 1):
-        try:
-            what = f"attempt {attempt}/{limit}"
-            policy.deadline.check(what)
-            if attempt > 1 or policy.pace_first_attempt:
+        if attempt == 1:
+            if policy.pace_first_attempt:
+                pacer.wait(deadline=None)
+            timeout = policy.first_timeout()
+        else:
+            try:
+                what = f"attempt {attempt}/{limit}"
+                policy.deadline.check(what)
                 pacer.wait(deadline=policy.deadline)
                 policy.deadline.check(what)
-            timeout = policy.timeout()
-        except DeadlineExceeded as e:
-            message = f"{e}" + (f" (last error: {last_description})" if last_description else "")
-            logger.warning(f"{label}: {message}", extra={"retry_event": "deadline"})
-            raise DeadlineExceeded(message) from last_error
+                timeout = policy.timeout()
+            except DeadlineExceeded as e:
+                message = f"{e}" + (
+                    f" (last error: {last_description})" if last_description else ""
+                )
+                logger.warning(f"{label}: {message}", extra={"retry_event": "deadline"})
+                raise DeadlineExceeded(message) from last_error
 
         try:
             result = operation(timeout)

@@ -355,9 +355,10 @@ def _publish_scheduled(
     from asos_parquet.reconcile import split_windows_by_year
     from asos_parquet.retry import SCHEDULED_ADMISSION_BUDGET, Deadline
 
-    # Reserve nominal publication margin inside UPDATE_TIMEOUT_S. Socket
-    # timeouts limit inactivity, not total transfer duration; Modal's timeout
-    # remains the hard job ceiling. Never reset this deadline per year/rebase.
+    # Stop extra retry work after ten minutes, leaving healthy first requests
+    # available for later years/rebases. Socket timeouts limit inactivity, not
+    # total transfer duration; Modal's timeout remains the hard job ceiling.
+    # Never reset this retry-admission deadline per year/rebase.
     fetch_deadline = (
         Deadline.after(SCHEDULED_ADMISSION_BUDGET)
         if BOUNDED_SCHEDULED_UPDATE and not reconcile

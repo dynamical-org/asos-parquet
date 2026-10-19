@@ -1643,6 +1643,8 @@ def test_expired_fetch_budget_on_rebase_keeps_all_failed_discovery_guard(
 
     def get(url: str, **kwargs: Any) -> requests.Response:
         calls.append(url)
+        if len(calls) > 1:
+            raise requests.ConnectionError("transient disconnect after rebase")
         return _network_response()
 
     def conflict(**kwargs: Any) -> dict[str, str]:
@@ -1656,9 +1658,51 @@ def test_expired_fetch_budget_on_rebase_keeps_all_failed_discovery_guard(
     with pytest.raises(IncompleteFetchError, match="No online stations"):
         modal_app._update_asos_data_impl(now=NOW)
 
-    assert len(calls) == 1
+    # Even after retry-budget expiry, discovery gets a fresh first request. Its
+    # failure cannot be retried, and the all-failed guard still prevents a PUT.
+    assert len(calls) == 2
     assert fake_s3.gets == 2
     assert fake_s3.body == original
+
+
+def test_healthy_double_rebase_publishes_after_retry_budget_expires(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3
+) -> None:
+    from asos_parquet import retry
+
+    _disable_retry_waits(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(retry.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr("asos_parquet.config.get_all_network_ids", lambda: ["ZZ_ASOS"])
+    discoveries: list[float] = []
+
+    def get(url: str, **kwargs: Any) -> requests.Response:
+        discoveries.append(clock[0])
+        return _network_response()
+
+    original_put = fake_s3.put_object
+    attempts = 0
+
+    def put(**kwargs: Any) -> dict[str, str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            clock[0] += 310.0
+            raise _client_error("PreconditionFailed", 412)
+        return original_put(**kwargs)
+
+    monkeypatch.setattr(requests, "get", get)
+    recording = _fake_fetch(monkeypatch, _observations(_recent()))
+    monkeypatch.setattr(fake_s3, "put_object", put)
+
+    result = modal_app._update_asos_data_impl(now=NOW)
+
+    assert result["status"] == "success"
+    assert discoveries == [100.0, 410.0, 720.0]
+    assert attempts == 3
+    assert len(recording.calls) == 1
+    assert len(fake_s3.puts) == 1
+    assert pd.Timestamp(_recent()) in _valid(fake_s3.put_frame())
 
 
 def test_exhausted_observation_retries_publish_other_chunks_then_raise(

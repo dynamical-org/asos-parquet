@@ -3,12 +3,14 @@
 import http.client
 import json
 import logging
+import ssl
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import pytest
 import requests
+import urllib3
 
 from asos_parquet import fetch, stations
 from asos_parquet.fetch import RequestPacer, fetch_bulk_chunk, fetch_observations_bulk_result
@@ -137,6 +139,22 @@ def patch_get(monkeypatch: pytest.MonkeyPatch, get: ScriptedGet) -> None:
     monkeypatch.setattr("asos_parquet.stations.requests.get", get)
 
 
+def wrapped_tls_error(cause: ssl.SSLError) -> requests.exceptions.SSLError:
+    """The shape requests raises: SSLError(MaxRetryError(reason=urllib3 SSLError(ssl error)))."""
+    reason = urllib3.exceptions.SSLError(cause)
+    return requests.exceptions.SSLError(
+        urllib3.exceptions.MaxRetryError(None, "/asos.py", reason=reason)  # type: ignore[arg-type]
+    )
+
+
+def certificate_error() -> ssl.SSLCertVerificationError:
+    return ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] self-signed")
+
+
+def tls_eof_error() -> requests.exceptions.SSLError:
+    return wrapped_tls_error(ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+
+
 # --- bulk chunks -------------------------------------------------------------
 
 
@@ -213,6 +231,8 @@ def test_default_jitter_is_uniform_zero_to_one(
         http.client.RemoteDisconnected("gone"),
         ConnectionResetError("reset"),
         TimeoutError("timed out"),
+        requests.exceptions.ContentDecodingError("bad gzip"),
+        tls_eof_error(),
     ],
 )
 def test_bulk_retries_transport_errors(
@@ -233,7 +253,7 @@ def test_bulk_retries_transport_errors(
     [
         (http_error(404), "HTTP 404"),
         (http_error(403), "HTTP 403"),
-        (requests.exceptions.SSLError("bad certificate"), "SSLError: bad certificate"),
+        (wrapped_tls_error(certificate_error()), "SSLError: "),
     ],
 )
 def test_bulk_permanent_errors_are_not_retried(
@@ -242,11 +262,10 @@ def test_bulk_permanent_errors_are_not_retried(
     get = ScriptedGet(outcome)
     patch_get(monkeypatch, get)
 
-    assert fetch_bulk_chunk(["KJFK"], START, END, 1, retry_policy=bulk(clock)) == (
-        1,
-        None,
-        expected,
-    )
+    chunk_id, df, error = fetch_bulk_chunk(["KJFK"], START, END, 1, retry_policy=bulk(clock))
+
+    assert (chunk_id, df) == (1, None)
+    assert error is not None and error.startswith(expected)
     assert len(get.calls) == 1
     assert clock.sleeps == []
 
@@ -277,16 +296,18 @@ def test_bulk_legitimate_empty_is_not_an_error(
     assert len(get.calls) == 1
 
 
-def test_bulk_paces_every_attempt_against_the_deadline(
+def test_bulk_paces_first_attempt_without_deadline_and_retries_against_it(
     monkeypatch: pytest.MonkeyPatch, clock: FakeClock, pacers: dict[str, RecordingPacer]
 ) -> None:
-    get = ScriptedGet(http_error(503), FakeResponse(CSV))
+    get = ScriptedGet(http_error(503), http_error(503), FakeResponse(CSV))
     patch_get(monkeypatch, get)
     policy = bulk(clock)
 
     fetch_bulk_chunk(["KJFK"], START, END, retry_policy=policy)
 
-    assert pacers["bulk"].deadlines == [policy.deadline, policy.deadline]
+    # The shared deadline is passed through unchanged, never renewed.
+    assert pacers["bulk"].deadlines == [None, policy.deadline, policy.deadline]
+    assert all(d is policy.deadline for d in pacers["bulk"].deadlines[1:])
 
 
 @pytest.mark.parametrize("status", [429, 503])
@@ -334,16 +355,20 @@ def test_backoff_that_would_cross_the_deadline_stops(
     assert clock.now < 1010
 
 
-def test_socket_timeouts_are_clamped_to_remaining_budget(
-    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+def test_first_timeout_is_full_and_retry_timeouts_are_clamped_until_expiry(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, caplog: pytest.LogCaptureFixture
 ) -> None:
-    get = ScriptedGet(FakeResponse(CSV))
+    get = ScriptedGet(http_error(503))
     patch_get(monkeypatch, get)
 
-    fetch_bulk_chunk(["KJFK"], START, END, retry_policy=bulk(clock))
-    fetch_bulk_chunk(["KJFK"], START, END, retry_policy=bulk(clock, budget=3))
+    # 3 s budget: first attempt unclamped; 2.5 s backoff leaves 0.5 s for the retry,
+    # whose failure then needs 4.5 s more than the budget allows.
+    _, _, error = fetch_bulk_chunk(["KJFK"], START, END, retry_policy=bulk(clock, budget=3))
 
-    assert [timeout for _, timeout in get.calls] == [(5.0, 300.0), (3.0, 3.0)]
+    assert [timeout for _, timeout in get.calls] == [(5.0, 300.0), (0.5, 0.5)]
+    assert clock.sleeps == [2.5]
+    assert error is not None and error.startswith("HTTP 503; retry 2/5 needs 4.5s")
+    assert caplog.records[-1].retry_event == "deadline"
 
 
 def test_timeout_rejects_an_exhausted_budget(clock: FakeClock) -> None:
@@ -354,8 +379,8 @@ def test_timeout_rejects_an_exhausted_budget(clock: FakeClock) -> None:
         policy.timeout()
 
 
-def test_no_request_is_admitted_after_the_deadline(
-    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+def test_healthy_first_bulk_attempt_after_expiry_succeeds_with_full_timeout(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, pacers: dict[str, RecordingPacer]
 ) -> None:
     get = ScriptedGet(FakeResponse(CSV))
     patch_get(monkeypatch, get)
@@ -364,12 +389,35 @@ def test_no_request_is_admitted_after_the_deadline(
 
     _, df, error = fetch_bulk_chunk(["KJFK"], START, END, retry_policy=policy)
 
+    assert error is None
+    assert df is not None and len(df) == 4
+    assert get.calls[0][1] == (5.0, 300.0)
+    assert pacers["bulk"].deadlines == [None]
+
+
+def test_failed_first_bulk_attempt_after_expiry_is_recorded_without_retry(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    get = ScriptedGet(requests.ConnectionError("reset"), FakeResponse(CSV))
+    patch_get(monkeypatch, get)
+    policy = bulk(clock, budget=5)
+    clock.now += 10
+
+    _, df, error = fetch_bulk_chunk(["KJFK"], START, END, 4, retry_policy=policy)
+
     assert df is None
-    assert error == "admission deadline passed before attempt 1/6"
-    assert get.calls == []
+    assert error is not None
+    assert error.startswith("ConnectionError; retry 1/5 needs 2.5s")
+    assert "0.0s of admission budget remain" in error
+    assert len(get.calls) == 1
+    assert clock.sleeps == []
+    (record,) = caplog.records
+    assert record.retry_event == "deadline"
+    assert "Chunk 4 [" in record.getMessage()
+    assert "attempt 1/6 failed (ConnectionError)" in record.getMessage()
 
 
-def test_queued_chunks_fail_explicitly_once_budget_is_gone(
+def test_queued_chunks_still_get_their_first_attempt_after_expiry(
     monkeypatch: pytest.MonkeyPatch, clock: FakeClock
 ) -> None:
     get = ScriptedGet(FakeResponse(CSV))
@@ -382,11 +430,31 @@ def test_queued_chunks_fail_explicitly_once_budget_is_gone(
         frame, START, END, show_progress=False, chunk_size=1, retry_policy=policy
     )
 
-    assert result.observations.empty
     assert result.tasks == 3
+    assert result.errors == ()
+    assert not result.observations.empty
+    assert len(get.calls) == 3
+    assert all(timeout == (5.0, 300.0) for _, timeout in get.calls)
+
+
+def test_queued_chunks_that_fail_after_expiry_fail_once_each(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    get = ScriptedGet(http_error(503))
+    patch_get(monkeypatch, get)
+    policy = bulk(clock, budget=5)
+    clock.now += 10
+    frame = pd.DataFrame({"station": ["KAAA", "KBBB", "KCCC"], "state": ["IA"] * 3})
+
+    result = fetch_observations_bulk_result(
+        frame, START, END, show_progress=False, chunk_size=1, retry_policy=policy
+    )
+
+    assert result.observations.empty
     assert len(result.errors) == 3
-    assert all("admission deadline passed" in error for error in result.errors)
-    assert get.calls == []
+    assert all("admission budget remain" in error for error in result.errors)
+    assert len(get.calls) == 3
+    assert clock.sleeps == []
 
 
 def test_bulk_result_forwards_policy_only_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,19 +593,33 @@ def test_metadata_permanent_failures_are_not_retried(
     assert clock.sleeps == []
 
 
-def test_metadata_tls_failure_is_not_retried(
+def test_metadata_certificate_failure_is_not_retried(
     monkeypatch: pytest.MonkeyPatch, clock: FakeClock
 ) -> None:
-    get = ScriptedGet(requests.exceptions.SSLError("bad certificate"))
+    get = ScriptedGet(wrapped_tls_error(certificate_error()), FakeResponse(json.dumps(GEOJSON)))
     patch_get(monkeypatch, get)
 
     with pytest.raises(requests.exceptions.SSLError):
         fetch_network_stations("IA_ASOS", retry_policy=metadata(clock))
     assert len(get.calls) == 1
+    assert clock.sleeps == []
 
 
-def test_metadata_expired_deadline_fails_every_network_without_requests(
+def test_metadata_transient_tls_eof_is_retried(
     monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    get = ScriptedGet(tls_eof_error(), FakeResponse(json.dumps(GEOJSON)))
+    patch_get(monkeypatch, get)
+
+    df = fetch_network_stations("IA_ASOS", retry_policy=metadata(clock))
+
+    assert list(df["station"]) == ["KAAA"]
+    assert len(get.calls) == 2
+    assert clock.sleeps == [2.5]
+
+
+def test_healthy_first_metadata_attempts_after_expiry_succeed_unpaced(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, pacers: dict[str, RecordingPacer]
 ) -> None:
     get = ScriptedGet(FakeResponse(json.dumps(GEOJSON)))
     patch_get(monkeypatch, get)
@@ -546,9 +628,27 @@ def test_metadata_expired_deadline_fails_every_network_without_requests(
 
     result = fetch_all_stations_result(networks=["IA_ASOS", "MN_ASOS"], retry_policy=policy)
 
-    assert result.failed_networks == ("IA_ASOS", "MN_ASOS")
-    assert result.stations.empty
-    assert get.calls == []
+    assert result.failed_networks == ()
+    assert len(result.stations) == 2
+    assert [timeout for _, timeout in get.calls] == [(5.0, 30.0), (5.0, 30.0)]
+    assert pacers["metadata"].deadlines == []
+
+
+def test_failed_first_metadata_attempt_after_expiry_fails_without_retry(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, pacers: dict[str, RecordingPacer]
+) -> None:
+    get = ScriptedGet(http_error(502), FakeResponse(json.dumps(GEOJSON)))
+    patch_get(monkeypatch, get)
+    policy = metadata(clock, budget=1)
+    clock.now += 1
+
+    with pytest.raises(DeadlineExceeded, match="0.0s of admission budget remain") as info:
+        fetch_network_stations("IA_ASOS", retry_policy=policy)
+
+    assert isinstance(info.value.__cause__, requests.HTTPError)
+    assert len(get.calls) == 1
+    assert clock.sleeps == []
+    assert pacers["metadata"].deadlines == []
 
 
 def test_station_result_forwards_policy_only_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -579,7 +679,12 @@ def test_metadata_default_path_is_one_plain_get(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_classify_matches_the_spec() -> None:
-    assert classify(requests.exceptions.SSLError()) is None
+    assert classify(requests.exceptions.SSLError()) == ("transient", "SSLError")
+    assert classify(tls_eof_error()) == ("transient", "SSLError")
+    assert classify(requests.exceptions.ContentDecodingError()) == (
+        "transient",
+        "ContentDecodingError",
+    )
     assert classify(requests.HTTPError(response=http_error(400))) is None
     assert classify(requests.HTTPError(response=http_error(429))) == ("throttle", "HTTP 429")
     assert classify(requests.HTTPError(response=http_error(500))) == ("transient", "HTTP 500")
@@ -599,3 +704,50 @@ def test_permanent_failures_are_logged_before_propagating(
     assert record.retry_event == "permanent"
     assert "Chunk 7 [" in record.getMessage()
     assert "attempt 1/6 failed (HTTP 404) after 0.0s; not retryable" in record.getMessage()
+
+
+def _raised_from(error: BaseException, cause: BaseException) -> BaseException:
+    try:
+        raise error from cause
+    except BaseException as raised:
+        return raised
+
+
+def _raised_during(error: BaseException, context: BaseException) -> BaseException:
+    try:
+        try:
+            raise context
+        except BaseException:
+            raise error from None  # suppressed for display, still recorded as context
+    except BaseException as raised:
+        return raised
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        certificate_error(),
+        requests.exceptions.SSLError(certificate_error()),  # exception-valued arg
+        wrapped_tls_error(certificate_error()),  # urllib3 MaxRetryError.reason
+        _raised_from(requests.exceptions.SSLError("handshake"), certificate_error()),
+        _raised_during(requests.ConnectionError("handshake"), certificate_error()),
+        _raised_from(
+            requests.ConnectionError("outer"),
+            _raised_from(
+                urllib3.exceptions.ProtocolError("mid"), wrapped_tls_error(certificate_error())
+            ),
+        ),
+    ],
+)
+def test_nested_certificate_errors_are_permanent(error: BaseException) -> None:
+    assert classify(error) is None
+
+
+def test_certificate_search_does_not_match_messages_and_survives_cycles() -> None:
+    lookalike = requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED in the message only")
+    looped = requests.ConnectionError("loop")
+    looped.__context__ = looped
+    looped.__cause__ = requests.ConnectionError(looped)
+
+    assert classify(lookalike) == ("transient", "SSLError")
+    assert classify(looped) == ("transient", "ConnectionError")
