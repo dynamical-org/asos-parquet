@@ -150,6 +150,11 @@ DAILY_RECONCILE_HOURS = 72
 NEW_PARTITION_GRACE_DAYS = 7
 _COVERAGE_THRESHOLD = 0.5
 _MAX_PUT_ATTEMPTS = 3  # the first PUT plus two rebases
+# Scheduled twice-hourly updates rewrite the partition station batch by batch
+# (asos_parquet.batched) and read only the windows back, instead of holding the
+# whole year in memory. False restores the full-frame path; the daily and manual
+# reconciles always use it.
+BOUNDED_SCHEDULED_UPDATE = True
 
 
 class AcceptanceGateError(RuntimeError):
@@ -476,7 +481,8 @@ def _may_create(s3: Any, bucket: str, prefix: str, year: int, now: "pd.Timestamp
 @dataclass
 class _Published:
     base: _Base | None  # None: the partition was created
-    candidate: Any  # the published GeoDataFrame
+    coverage_input: Any  # frame for coverage_report: the candidate, or its recent rows
+    total_records: int  # rows in the published file
     file_size_mb: float
     response: dict[str, Any]
     withheld: dict[str, int] | None  # rebased attempts: withheld keys by kind
@@ -539,9 +545,10 @@ def _publish_windows(
     import time
 
     import geopandas as gpd
-    import pandas as pd
     from botocore.exceptions import ClientError
 
+    from asos_parquet.batched import rewrite_batched
+    from asos_parquet.bounded import coverage_cutoff, coverage_rows, window_rows
     from asos_parquet.composers import ParquetPublisher
     from asos_parquet.config import get_all_network_ids
     from asos_parquet.fetch import (
@@ -575,12 +582,74 @@ def _publish_windows(
     prefix = _asos_parquet_s3_prefix()
     s3_key = f"{prefix}/year={year}/data.parquet"
     mode = "manual reconcile" if manual else "reconcile" if reconcile else "update"
+    # Only the plain scheduled update; anything else (including a direct caller
+    # asking to restore retired metadata) keeps the full-frame path.
+    bounded = (
+        BOUNDED_SCHEDULED_UPDATE and not manual and not reconcile and not restore_retired_metadata
+    )
     logger.info(f"ASOS {mode} started: windows {window_text} → s3://{s3_bucket}/{s3_key}")
     s3 = _s3_client()
 
     expected_metadata = retired_station_metadata() if restore_retired_metadata else None
 
     run = _FetchedRun()
+
+    def base_windows(base: _Base | None, existing: "pd.DataFrame | None") -> "pd.DataFrame | None":
+        """The base for fingerprinting: the full frame, or its window rows when bounded."""
+        if not bounded:
+            return existing
+        return window_rows(base.path if base is not None else None, windows)
+
+    def publish_bounded(
+        attempt: int,
+        work: Path,
+        base: _Base | None,
+        observations: "pd.DataFrame",
+        online: "pd.DataFrame",
+        withheld: Any,
+    ) -> _Published:
+        """Steps 6-8 without the full frame: batched rewrite, window checks, PUT."""
+        rewrite = rewrite_batched(
+            base.path if base is not None else None,
+            observations,
+            online,
+            year,
+            work / f"candidate-{attempt}",
+        )
+        del observations
+        output_path = rewrite.path
+        logger.info(f"Merged data: {rewrite.rows:,} total records")
+        if base is not None:
+            if withheld is not None:
+                conflicts = concurrent_change_violations(
+                    window_rows(output_path, windows, include_geometry=True),
+                    window_rows(base.path, windows, include_geometry=True),
+                    withheld,
+                    windows,
+                )
+                if conflicts:
+                    raise AcceptanceGateError(
+                        f"Rebased candidate for {window_text} overwrote concurrent changes; "
+                        f"nothing published: {'; '.join(conflicts)}"
+                    )
+            violations = written_file_violations(base.path, output_path)
+            if violations:
+                raise AcceptanceGateError(
+                    f"Candidate for {window_text} failed the written-file check; nothing "
+                    f"published: {'; '.join(violations)}"
+                )
+        condition = {"IfMatch": base.etag} if base is not None else {"IfNoneMatch": "*"}
+        logger.info(f"Uploading to S3 ({condition})...")
+        with output_path.open("rb") as body:
+            response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, **condition)
+        return _Published(
+            base=base,
+            coverage_input=coverage_rows(output_path, coverage_cutoff(now, year)),
+            total_records=rewrite.rows,
+            file_size_mb=output_path.stat().st_size / 1024 / 1024,
+            response=response,
+            withheld=withheld.counts() if withheld is not None else None,
+        )
 
     def attempt_publish(attempt: int, work: Path) -> _Published:
         """One read-compose-PUT attempt; observations are fetched on attempt 1 only."""
@@ -591,9 +660,11 @@ def _publish_windows(
                 s3, s3_bucket, s3_key, work / f"base-{attempt}.parquet", missing_ok=create_missing
             )
             existing: gpd.GeoDataFrame | None = None
-            if base is not None:
+            if base is not None and not bounded:
                 existing = gpd.read_parquet(base.path)
                 logger.info(f"Read existing partition ({len(existing):,} records)")
+            elif base is not None:
+                logger.info(f"Read existing partition ({base.path.stat().st_size:,} bytes)")
             elif _may_create(s3, s3_bucket, prefix, year, now):
                 logger.warning(f"s3://{s3_bucket}/{s3_key} does not exist yet; creating it")
             else:
@@ -659,7 +730,7 @@ def _publish_windows(
                 logger.info(f"Fetched {len(fetched.observations):,} observations")
                 run.fetched = fetched
                 # The merge base for any later rebase; never replaced.
-                run.base_fingerprint = window_fingerprint(existing, windows)
+                run.base_fingerprint = window_fingerprint(base_windows(base, existing), windows)
                 observations = fetched.observations
             else:
                 # Step 9 (rebase): someone published since the first read. Keep their
@@ -668,7 +739,7 @@ def _publish_windows(
                 observations, withheld = withhold_concurrent_changes(
                     run.fetched.observations,
                     run.base_fingerprint,
-                    window_fingerprint(existing, windows),
+                    window_fingerprint(base_windows(base, existing), windows),
                     previous=run.withheld,
                 )
                 run.withheld = withheld  # sticky for the rest of the run
@@ -678,6 +749,8 @@ def _publish_windows(
                     f"samples {withheld.samples()}"
                 )
 
+            if bounded:
+                return publish_bounded(attempt, work, base, observations, online, withheld)
             # Step 6: Compose against this exact base
             candidate = compose_partition(
                 existing,
@@ -728,7 +801,8 @@ def _publish_windows(
                 response = s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=body, **condition)
             return _Published(
                 base=base,
-                candidate=candidate,
+                coverage_input=candidate,
+                total_records=len(candidate),
                 file_size_mb=output_path.stat().st_size / 1024 / 1024,
                 response=response,
                 withheld=withheld.counts() if withheld is not None else None,
@@ -760,7 +834,8 @@ def _publish_windows(
     observations = len(run.fetched.observations)
     run.fetched = None
     base = published.base
-    candidate = published.candidate
+    coverage_input = published.coverage_input
+    total_records = published.total_records
     withheld_concurrent = published.withheld
     file_size = published.file_size_mb
     published_etag = str(published.response.get("ETag", "")).strip('"') or None
@@ -773,8 +848,9 @@ def _publish_windows(
 
     # Step 10: Advisory coverage check on what we published. A past year's partition
     # ends at January 1: hours after that live in the next partition.
-    year_end = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC")
-    coverage = coverage_report(candidate, min(now, year_end), threshold=_COVERAGE_THRESHOLD)
+    coverage = coverage_report(
+        coverage_input, coverage_cutoff(now, year), threshold=_COVERAGE_THRESHOLD
+    )
     low = coverage.low_hours
     if not low.empty:
         logger.error(
@@ -796,8 +872,7 @@ def _publish_windows(
         )
     if coverage.insufficient_baseline:
         logger.info("ASOS coverage check: insufficient baseline for some monitored hours")
-    total_records = len(candidate)
-    del candidate
+    del coverage_input
 
     # Step 11: Scheduled runs publish a partial fetch, then fail so the gap is reported
     if failures:
