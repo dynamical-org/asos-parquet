@@ -141,7 +141,7 @@ def bulk_retry_policy(deadline: Deadline) -> RetryPolicy:
 
 
 def retry_after_seconds(response: requests.Response | None) -> float | None:
-    """Seconds a 429/503 asks us to wait (delta-seconds or HTTP-date), if it says."""
+    """Seconds a response asks us to wait (delta-seconds or HTTP-date), if it says."""
     value = response.headers.get("Retry-After") if response is not None else None
     if not value:
         return None
@@ -275,7 +275,7 @@ def call_with_retry(
             delays = policy.throttle_delays if kind == "throttle" else policy.transient_delays
             delay = delays[attempt - 1] + policy.jitter()
             retry_after = None
-            if isinstance(error, requests.HTTPError) and description in ("HTTP 429", "HTTP 503"):
+            if isinstance(error, requests.HTTPError):
                 retry_after = retry_after_seconds(error.response)
                 if retry_after is not None:
                     delay = max(delay, retry_after)

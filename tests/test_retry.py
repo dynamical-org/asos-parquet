@@ -310,7 +310,7 @@ def test_bulk_paces_first_attempt_without_deadline_and_retries_against_it(
     assert all(d is policy.deadline for d in pacers["bulk"].deadlines[1:])
 
 
-@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
 def test_retry_after_is_honored_in_full_when_it_fits(
     monkeypatch: pytest.MonkeyPatch, clock: FakeClock, status: int
 ) -> None:
@@ -323,10 +323,14 @@ def test_retry_after_is_honored_in_full_when_it_fits(
     assert clock.sleeps == [120.0]  # beyond the legacy cap of short delays, no 10 s cap
 
 
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
 def test_retry_after_beyond_budget_fails_without_retrying_early(
-    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
 ) -> None:
-    get = ScriptedGet(http_error(429, "300"), FakeResponse(CSV))
+    get = ScriptedGet(http_error(status, "300"), FakeResponse(CSV))
     patch_get(monkeypatch, get)
 
     _, df, error = fetch_bulk_chunk(["KJFK"], START, END, retry_policy=bulk(clock, budget=100))
