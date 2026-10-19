@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 from collections.abc import Iterable
 from pathlib import Path
@@ -8,6 +9,7 @@ import geopandas as gpd
 import modal
 import pandas as pd
 import pytest
+import requests
 from botocore.exceptions import ClientError
 
 import modal_app
@@ -222,7 +224,9 @@ def _fake_stations(
     faileds = failed if isinstance(failed, list) else [failed]
     calls: list[None] = []
 
-    def discover(networks: Any = None, online_only: bool = False) -> StationFetchResult:
+    def discover(
+        networks: Any = None, online_only: bool = False, **kwargs: Any
+    ) -> StationFetchResult:
         calls.append(None)
         return StationFetchResult(
             frames[min(len(calls), len(frames)) - 1], faileds[min(len(calls), len(faileds)) - 1]
@@ -399,7 +403,7 @@ def test_update_fails_on_empty_stations(monkeypatch: pytest.MonkeyPatch, fake_s3
     assert fake_s3.puts == []
 
 
-def _flaky_network_stations(network_id: str) -> pd.DataFrame:
+def _flaky_network_stations(network_id: str, **kwargs: Any) -> pd.DataFrame:
     if network_id == "ZZ_ASOS":
         raise ConnectionError("network down")
     return _stations()
@@ -580,7 +584,7 @@ def _live_iem_table(monkeypatch: pytest.MonkeyPatch, table: pd.DataFrame) -> dic
     monkeypatch.setattr(
         stations,
         "fetch_all_stations_result",
-        lambda networks=None, online_only=False: StationFetchResult(iem["table"], ()),
+        lambda networks=None, online_only=False, **kwargs: StationFetchResult(iem["table"], ()),
     )
     return iem
 
@@ -1453,3 +1457,240 @@ def test_restore_retired_metadata_keeps_the_full_frame_path(
 
     assert refused == ["read base-1.parquet"]
     assert fake_s3.puts == []
+
+
+def test_retry_policy_is_only_enabled_for_bounded_updates(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, update_path: bool
+) -> None:
+    discovery_policies: list[Any] = []
+    observation_policies: list[Any] = []
+
+    def discover(**kwargs: Any) -> StationFetchResult:
+        discovery_policies.append(kwargs.get("retry_policy"))
+        return StationFetchResult(_stations(), ())
+
+    def observations(*args: Any, **kwargs: Any) -> BulkFetchResult:
+        observation_policies.append(kwargs.get("retry_policy"))
+        return BulkFetchResult(_observations(_recent()), 1, ())
+
+    monkeypatch.setattr(stations, "fetch_all_stations_result", discover)
+    monkeypatch.setattr(fetch, "fetch_observations_bulk_result", observations)
+    modal_app._update_asos_data_impl(now=NOW)
+    modal_app._reconcile_asos_data_impl(None, False, now=NOW)
+    _manual()
+
+    assert (discovery_policies[0] is not None) is update_path
+    if update_path:
+        assert observation_policies[0].deadline is discovery_policies[0].deadline
+    else:
+        assert observation_policies[0] is None
+    assert discovery_policies[1:] == [None, None]
+    assert observation_policies[1:] == [None, None]
+    assert len(fake_s3.puts) == 3
+
+
+def test_retry_budget_is_shared_across_year_partitions(
+    monkeypatch: pytest.MonkeyPatch, update_path: bool
+) -> None:
+    policies: list[Any] = []
+
+    def publish(windows: Any, **kwargs: Any) -> dict[str, Any]:
+        policies.append(kwargs.get("fetch_deadline"))
+        return {"status": "success"}
+
+    monkeypatch.setattr(modal_app, "_publish_windows", publish)
+    modal_app._update_asos_data_impl(now=ROLLOVER)
+
+    assert len(policies) == 2
+    assert (policies[0] is not None) is update_path
+    assert policies[0] is policies[1]
+
+
+def test_retry_budget_is_shared_across_publication_rebase(
+    monkeypatch: pytest.MonkeyPatch, fake_s3: FakeS3, update_path: bool
+) -> None:
+    policies: list[Any] = []
+
+    def discover(**kwargs: Any) -> StationFetchResult:
+        policies.append(kwargs.get("retry_policy"))
+        return StationFetchResult(_stations(), ())
+
+    monkeypatch.setattr(stations, "fetch_all_stations_result", discover)
+    recording = _fake_fetch(monkeypatch, _observations(_recent()))
+    fake_s3.put_errors = [_client_error("PreconditionFailed", 412)]
+    result = modal_app._update_asos_data_impl(now=NOW)
+
+    assert result["status"] == "success"
+    assert len(policies) == 2
+    assert (policies[0] is not None) is update_path
+    assert policies[0] is policies[1]
+    assert len(recording.calls) == 1
+
+
+def _network_response() -> requests.Response:
+    response = requests.Response()
+    response.status_code = 200
+    response._content = json.dumps(
+        {
+            "features": [
+                {
+                    "properties": {
+                        "sid": "KAAA",
+                        "sname": "Example",
+                        "online": True,
+                        "archive_begin": "2000-01-01",
+                        "archive_end": None,
+                        "elevation": 250.0,
+                        "county": "Example",
+                        "wfo": "ZZZ",
+                        "tzname": "UTC",
+                    },
+                    "geometry": {"coordinates": [-90.0, 40.0]},
+                }
+            ]
+        }
+    ).encode()
+    return response
+
+
+def _disable_retry_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    from asos_parquet import retry
+
+    monkeypatch.setattr(retry.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(fetch.IEM_PACER, "wait", lambda *args, **kwargs: None)
+    monkeypatch.setattr(stations.METADATA_RETRY_PACER, "wait", lambda *args, **kwargs: None)
+
+
+@pytest.mark.parametrize("failed_endpoint", ["metadata", "observations"])
+def test_recovered_transport_error_allows_scheduled_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_s3: FakeS3,
+    update_path: bool,
+    failed_endpoint: str,
+) -> None:
+    if not update_path:
+        pytest.skip("the opt-in policy is specific to bounded updates")
+    _disable_retry_waits(monkeypatch)
+    monkeypatch.setattr("asos_parquet.config.get_all_network_ids", lambda: ["ZZ_ASOS"])
+    monkeypatch.setattr(
+        fetch, "parse_observations", lambda *args, **kwargs: _observations(_recent())
+    )
+    counts = {"metadata": 0, "observations": 0}
+
+    def get(url: str, **kwargs: Any) -> requests.Response:
+        endpoint = "metadata" if "/geojson/" in url else "observations"
+        counts[endpoint] += 1
+        if endpoint == failed_endpoint and counts[endpoint] == 1:
+            raise requests.exceptions.ChunkedEncodingError("IncompleteRead: truncated response")
+        if endpoint == "metadata":
+            return _network_response()
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"station,valid,tmpf\nKAAA,2026-09-28 11:34,68\n"
+        return response
+
+    monkeypatch.setattr(requests, "get", get)
+    result = modal_app._update_asos_data_impl(now=NOW)
+
+    assert result["status"] == "success"
+    assert counts[failed_endpoint] == 2
+    assert len(fake_s3.puts) == 1
+    assert pd.Timestamp(_recent()) in _valid(fake_s3.put_frame())
+
+
+def test_exhausted_network_retries_publish_partial_then_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_s3: FakeS3,
+    update_path: bool,
+) -> None:
+    if not update_path:
+        pytest.skip("the opt-in policy is specific to bounded updates")
+    _disable_retry_waits(monkeypatch)
+    monkeypatch.setattr("asos_parquet.config.get_all_network_ids", lambda: ["IA_ASOS", "ZZ_ASOS"])
+    calls: list[str] = []
+
+    def get(url: str, **kwargs: Any) -> requests.Response:
+        calls.append(url)
+        if "ZZ_ASOS" in url:
+            raise requests.ConnectionError("transient disconnect")
+        return _network_response()
+
+    monkeypatch.setattr(requests, "get", get)
+    _fake_fetch(monkeypatch, _observations(_recent()))
+    with pytest.raises(IncompleteFetchError, match="ZZ_ASOS"):
+        modal_app._update_asos_data_impl(now=NOW)
+
+    assert sum("ZZ_ASOS" in url for url in calls) == 3
+    assert sum("IA_ASOS" in url for url in calls) == 1
+    assert len(fake_s3.puts) == 1
+    assert pd.Timestamp(_recent()) in _valid(fake_s3.put_frame())
+
+
+def test_expired_fetch_budget_on_rebase_keeps_all_failed_discovery_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_s3: FakeS3,
+    update_path: bool,
+) -> None:
+    if not update_path:
+        pytest.skip("the opt-in policy is specific to bounded updates")
+    from asos_parquet import retry
+
+    _disable_retry_waits(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(retry.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr("asos_parquet.config.get_all_network_ids", lambda: ["ZZ_ASOS"])
+    calls: list[str] = []
+
+    def get(url: str, **kwargs: Any) -> requests.Response:
+        calls.append(url)
+        return _network_response()
+
+    def conflict(**kwargs: Any) -> dict[str, str]:
+        clock[0] = 701.0
+        raise _client_error("PreconditionFailed", 412)
+
+    monkeypatch.setattr(requests, "get", get)
+    _fake_fetch(monkeypatch, _observations(_recent()))
+    monkeypatch.setattr(fake_s3, "put_object", conflict)
+    original = fake_s3.body
+    with pytest.raises(IncompleteFetchError, match="No online stations"):
+        modal_app._update_asos_data_impl(now=NOW)
+
+    assert len(calls) == 1
+    assert fake_s3.gets == 2
+    assert fake_s3.body == original
+
+
+def test_exhausted_observation_retries_publish_other_chunks_then_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_s3: FakeS3,
+    update_path: bool,
+) -> None:
+    if not update_path:
+        pytest.skip("the opt-in policy is specific to bounded updates")
+    _disable_retry_waits(monkeypatch)
+    metadata = pd.concat([_stations(), _stations().assign(station="KBBB")], ignore_index=True)
+    _fake_stations(monkeypatch, metadata)
+    monkeypatch.setattr(fetch, "calculate_optimal_chunk_size", lambda count: 1)
+    monkeypatch.setattr(
+        fetch, "parse_observations", lambda *args, **kwargs: _observations(_recent())
+    )
+    calls: list[str] = []
+
+    def get(url: str, **kwargs: Any) -> requests.Response:
+        calls.append(url)
+        if "station=KBBB" in url:
+            raise requests.exceptions.ChunkedEncodingError("IncompleteRead: truncated response")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"station,valid,tmpf\nKAAA,2026-09-28 11:34,68\n"
+        return response
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(IncompleteFetchError, match="1/2 chunks failed"):
+        modal_app._update_asos_data_impl(now=NOW)
+
+    assert sum("station=KBBB" in url for url in calls) == 6
+    assert sum("station=KAAA" in url for url in calls) == 1
+    assert len(fake_s3.puts) == 1
+    assert pd.Timestamp(_recent()) in _valid(fake_s3.put_frame())

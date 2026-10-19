@@ -16,8 +16,6 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from threading import Lock
 
 import pandas as pd
@@ -38,6 +36,15 @@ from .config import (
     REQUEST_TIMEOUT,
     RETRY_BACKOFF,
 )
+from .retry import (
+    Deadline,
+    DeadlineExceeded,
+    RetryableResponse,
+    RetryExhausted,
+    RetryPolicy,
+    call_with_retry,
+)
+from .retry import retry_after_seconds as _retry_after_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -65,34 +72,25 @@ class RequestPacer:
         self._lock = Lock()
         self._next_start = 0.0
 
-    def wait(self) -> None:
+    def wait(self, deadline: Deadline | None = None) -> None:
+        """Block until this caller's start slot.
+
+        With a deadline, a slot at or after it is refused (DeadlineExceeded, slot
+        not consumed) and the deadline is re-checked after sleeping.
+        """
         with self._lock:
             now = time.monotonic()
             start = max(now, self._next_start)
+            if deadline is not None and start >= deadline.expires_at:
+                raise DeadlineExceeded("admission deadline passed before the paced start slot")
             self._next_start = start + self.interval
         if start > now:
             time.sleep(start - now)
+        if deadline is not None:
+            deadline.check()
 
 
 IEM_PACER = RequestPacer(IEM_MIN_REQUEST_INTERVAL)
-
-
-def _retry_after_seconds(response: requests.Response | None) -> float | None:
-    """Seconds a 429/503 asks us to wait (delta-seconds or HTTP-date), if it says."""
-    value = response.headers.get("Retry-After") if response is not None else None
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
-    try:
-        when = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
 class IncompleteFetchError(RuntimeError):
@@ -335,6 +333,8 @@ def fetch_bulk_chunk(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
     chunk_id: int = 0,
+    *,
+    retry_policy: RetryPolicy | None = None,
 ) -> tuple[int, pd.DataFrame | None, str | None]:
     """Fetch observations for multiple stations in one request.
 
@@ -343,12 +343,15 @@ def fetch_bulk_chunk(
         start_date: Start timestamp
         end_date: End timestamp
         chunk_id: Identifier for this chunk (for logging)
+        retry_policy: Opt-in bounded retries (see retry.py); None keeps the legacy loop
 
     Returns:
         Tuple of (chunk_id, DataFrame or None, error message or None)
     """
     url = build_bulk_observation_url(station_ids, start_date, end_date)
     label = _describe_chunk(chunk_id, station_ids, start_date, end_date)
+    if retry_policy is not None:
+        return _fetch_bulk_chunk_bounded(url, label, chunk_id, retry_policy)
 
     attempt = 0
     while True:
@@ -447,6 +450,50 @@ def fetch_bulk_chunk(
 
         except Exception as e:
             return (chunk_id, None, f"{type(e).__name__}: {e}")
+
+
+def _fetch_bulk_chunk_bounded(
+    url: str, label: str, chunk_id: int, policy: RetryPolicy
+) -> tuple[int, pd.DataFrame | None, str | None]:
+    """fetch_bulk_chunk under a bounded RetryPolicy; failures become error strings."""
+
+    def attempt(timeout: tuple[float, float]) -> pd.DataFrame | None:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+
+        # Check for server error returned as 200 (IEM sometimes does this)
+        text = response.text.strip()
+        if text.startswith("ERROR:"):
+            raise RetryableResponse(f"server error in body: {text[:200]!r}")
+
+        if "No results found" in text:
+            return None
+
+        # Same empty-vs-bad-payload rules as the legacy loop in fetch_bulk_chunk.
+        is_iem_csv = text.startswith("station,valid")
+        try:
+            df = parse_observations(response.text, timestamp_format="mixed")
+        except (pd.errors.ParserError, ValueError):
+            df = None
+            is_iem_csv = False
+        if df is None and is_iem_csv:
+            return None
+        if df is None:
+            raise RetryableResponse(f"unparseable body: {text[:200]!r}")
+        return df
+
+    try:
+        df = call_with_retry(attempt, label=label, policy=policy, pacer=IEM_PACER)
+    except requests.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else None
+        if status_code == 414:
+            return (chunk_id, None, f"URL too long ({len(url)} chars)")
+        return (chunk_id, None, f"HTTP {status_code}")
+    except (RetryExhausted, DeadlineExceeded) as e:
+        return (chunk_id, None, str(e))
+    except Exception as e:
+        return (chunk_id, None, f"{type(e).__name__}: {e}")
+    return (chunk_id, df, None)
 
 
 def fetch_station_observations(
@@ -616,6 +663,8 @@ def fetch_observations_bulk_result(
     description: str = "",
     chunk_size: int | None = None,
     max_workers: int | None = None,
+    *,
+    retry_policy: RetryPolicy | None = None,
 ) -> BulkFetchResult:
     """Fetch observations using bulk multi-station requests.
 
@@ -633,6 +682,8 @@ def fetch_observations_bulk_result(
         description: Description to show in progress display
         chunk_size: Override automatic chunk size calculation
         max_workers: Override default parallel workers (default: 5)
+        retry_policy: Opt-in bounded retries shared by every chunk; None keeps the
+                      legacy per-chunk retry loop
 
     Returns:
         BulkFetchResult with the combined observations, the number of tasks,
@@ -655,6 +706,9 @@ def fetch_observations_bulk_result(
 
     if max_workers is None:
         max_workers = BULK_MAX_WORKERS
+
+    # Only the opt-in path passes the new keyword down.
+    chunk_kwargs = {"retry_policy": retry_policy} if retry_policy is not None else {}
 
     # Split stations into chunks
     station_chunks = [station_ids[i : i + chunk_size] for i in range(0, num_stations, chunk_size)]
@@ -703,7 +757,9 @@ def fetch_observations_bulk_result(
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(fetch_bulk_chunk, stn_chunk, p_start, p_end, i): i
+                    executor.submit(
+                        fetch_bulk_chunk, stn_chunk, p_start, p_end, i, **chunk_kwargs
+                    ): i
                     for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
                 }
 
@@ -738,7 +794,7 @@ def fetch_observations_bulk_result(
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(fetch_bulk_chunk, stn_chunk, p_start, p_end, i): i
+                executor.submit(fetch_bulk_chunk, stn_chunk, p_start, p_end, i, **chunk_kwargs): i
                 for i, (stn_chunk, p_start, p_end) in enumerate(tasks)
             }
 
