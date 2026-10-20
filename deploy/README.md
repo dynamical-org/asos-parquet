@@ -56,7 +56,7 @@ modal secret create source-coop-asos-s3 \
     ASOS_AWS_SESSION_TOKEN=your_session_token \
     ASOS_AWS_DEFAULT_REGION=us-east-1 \
     ASOS_S3_BUCKET=your-bucket-name \
-    OBS_S3_PREFIX=obs-parquet/v1
+    ASOS_S3_PREFIX=asos-parquet
 
 # 4. Create the observability secret (see Monitoring below)
 modal secret create sentry-asos-parquet \
@@ -65,6 +65,15 @@ modal secret create sentry-asos-parquet \
 # 5. Deploy (runs at :20 and :50 each hour)
 modal deploy modal_app.py
 ```
+
+`make deploy` runs only `uv run modal deploy modal_app.py`. It uses the existing
+`source-coop-asos-s3` and `sentry-asos-parquet` secrets; it does not read `.env`
+or create or replace secrets. Create those secrets separately during initial
+setup, and manage credential changes separately from code deployments. The
+command keeps Modal's default environment selection (`main` in this setup).
+When deliberately replacing `source-coop-asos-s3`, preserve its complete key
+set, including keys used by other apps sharing the secret; `--force` replaces
+the secret rather than patching individual keys.
 
 ## Apps
 
