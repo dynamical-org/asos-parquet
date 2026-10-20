@@ -56,22 +56,11 @@ load:
 upload:
 	./scripts/upload_s3.sh
 
-# Deploy to Modal (reads credentials from .env)
-# Creates/updates Modal secret and deploys the scheduled function
+# Deploy the scheduled ASOS app to Modal's critical environment.
+# Does not create or update secrets: source-coop-asos-s3 and sentry-asos-parquet
+# must already exist in critical (see deploy/README.md).
 deploy:
-	@if [ ! -f .env ]; then echo "Error: .env file not found. Copy .env.example and fill in values."; exit 1; fi
-	@echo "Updating Modal secrets from .env..."
-	@set -a && source .env && set +a && \
-		uv run modal secret create source-coop-asos-s3 --force \
-			ASOS_AWS_ACCESS_KEY_ID="$$ASOS_AWS_ACCESS_KEY_ID" \
-			ASOS_AWS_SECRET_ACCESS_KEY="$$ASOS_AWS_SECRET_ACCESS_KEY" \
-			ASOS_AWS_DEFAULT_REGION="$${ASOS_AWS_DEFAULT_REGION:-us-east-1}" \
-			ASOS_S3_BUCKET="$$ASOS_S3_BUCKET" \
-			$${ASOS_AWS_SESSION_TOKEN:+ASOS_AWS_SESSION_TOKEN="$$ASOS_AWS_SESSION_TOKEN"} \
-			$${OBS_S3_PREFIX:+OBS_S3_PREFIX="$$OBS_S3_PREFIX"} \
-			$${ASOS_AWS_ENDPOINT_URL:+ASOS_AWS_ENDPOINT_URL="$$ASOS_AWS_ENDPOINT_URL"}
-	@echo "Deploying to Modal..."
-	uv run modal deploy modal_app.py
+	uv run modal deploy --env critical modal_app.py
 
 # Validate data for gaps and quality issues
 validate:

@@ -3,7 +3,6 @@ name: Deploy to Modal
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch: {}
 
 concurrency:
@@ -15,14 +14,8 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-      - run: uv sync --all-extras --dev
-      - run: uv run ruff check src/asos_parquet/canonical.py src/asos_parquet/contracts.py tests/test_canonical.py
-      - run: uv run mypy
-      - run: uv run pytest
+    # Pull requests run checks.yml directly.
+    uses: ./.github/workflows/checks.yml
 
   deploy:
     # workflow_dispatch can target any branch; never expose prod Modal
@@ -35,10 +28,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The app lives in the `critical` Modal environment. Deploys stay held
+      # (and fail loudly, not skip) until the one-time cutover is done; see
+      # deploy/README.md "Modal environment".
+      - name: Require critical deploys to be enabled
+        if: vars.MODAL_CRITICAL_DEPLOY_ENABLED != 'true'
+        run: |
+          echo '::error::Critical deployment is held; complete the operator cutover before enabling.'
+          exit 1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - run: uv sync
       - name: Deploy
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-        run: uv run modal deploy modal_app.py
+        run: uv run modal deploy --env critical modal_app.py

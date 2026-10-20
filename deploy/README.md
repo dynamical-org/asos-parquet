@@ -43,27 +43,30 @@ uv run modal billing report --for "last week" --show-resources
 ## Setup
 
 ```bash
-# 1. Install Modal CLI
-pip install modal
+# 1. Install dependencies, including the Modal CLI
+uv sync --all-extras
 
 # 2. Authenticate (opens browser)
-modal setup
+uv run modal setup
 
-# 3. Create secrets with your AWS credentials (from source.coop)
-modal secret create source-coop-asos-s3 \
+# 3. Create secrets with your AWS credentials (from source.coop) in the
+#    critical environment, where the ASOS app runs. modal_app.py reads
+#    ASOS_S3_PREFIX (default asos-parquet). The obs-parquet app's secrets stay
+#    in the default environment and are not covered here.
+uv run modal secret create --env critical source-coop-asos-s3 \
     ASOS_AWS_ACCESS_KEY_ID=your_access_key \
     ASOS_AWS_SECRET_ACCESS_KEY=your_secret_key \
     ASOS_AWS_SESSION_TOKEN=your_session_token \
     ASOS_AWS_DEFAULT_REGION=us-east-1 \
     ASOS_S3_BUCKET=your-bucket-name \
-    OBS_S3_PREFIX=obs-parquet/v1
+    ASOS_S3_PREFIX=asos-parquet
 
 # 4. Create the observability secret (see Monitoring below)
-modal secret create sentry-asos-parquet \
+uv run modal secret create --env critical sentry-asos-parquet \
     SENTRY_DSN=https://xxxx@oNNNN.ingest.us.sentry.io/NNNN
 
 # 5. Deploy (runs at :20 and :50 each hour)
-modal deploy modal_app.py
+uv run modal deploy --env critical modal_app.py
 ```
 
 ## Apps
@@ -72,7 +75,7 @@ Two Modal apps, deployed separately on purpose:
 
 | App | File | Publishes | Deployed by |
 |-----|------|-----------|-------------|
-| `asos-parquet-update` | `modal_app.py` | legacy `asos-parquet` dataset | CI, on every push to main |
+| `asos-parquet-update` | `modal_app.py` | legacy `asos-parquet` dataset | CI, on every push to main, to the `critical` environment |
 | `obs-parquet-update` | `modal_obs_app.py` | `obs-parquet/v1` (MSC SWOB capture, year backfill) | by hand |
 
 Deploying an app registers every cron in its file. Keeping obs-parquet in its
@@ -86,17 +89,62 @@ Deploy it when you mean to:
 uv run modal deploy modal_obs_app.py
 ```
 
+## Modal environment
+
+`asos-parquet-update` runs in the `critical` Modal environment. Every
+`modal deploy` or `modal run` of `modal_app.py` must pass `--env critical`.
+Run locally against no environment (the workspace default), `main`, `staging`
+or anything else, the file raises on import, before it builds any Modal object
+or contacts Modal. There is no override. Inside Modal containers the check is
+skipped. Both secrets the app reads (`source-coop-asos-s3`,
+`sentry-asos-parquet`) must exist in `critical`. Sentry projects and monitor
+slugs do not change. `modal_obs_app.py` and `modal_backfill.py` stay in the
+default environment.
+
+Create both secrets in `critical` yourself, as in [Setup](#setup), before the
+first deploy. `make deploy` only runs
+`uv run modal deploy --env critical modal_app.py`; it no longer recreates
+`source-coop-asos-s3` from `.env`, so it cannot overwrite the secret.
+
+### Deploy hold
+
+CI deploys only from main, and only when the repository variable
+`MODAL_CRITICAL_DEPLOY_ENABLED` is `true`. Otherwise the deploy job fails on a
+step that runs before Modal credentials are used. Pull requests run checks
+from `.github/workflows/checks.yml`, which the deploy workflow also calls.
+
+### Cutover
+
+Moving a scheduled app between environments is break-before-make: never let
+two deployments of the same app's crons run at once.
+
+1. Create both secrets in `critical`.
+2. Stop the old deployment: `uv run modal app stop --env main asos-parquet-update`.
+3. Deploy: `uv run modal deploy --env critical modal_app.py`.
+4. Confirm the next scheduled run succeeds in `critical`.
+5. Only then release the hold: enable the deploy workflow and set
+   `MODAL_CRITICAL_DEPLOY_ENABLED` to `true` so CI deploys resume. Until then,
+   keep the variable `false` and the workflow disabled.
+
+### Rollback
+
+Also break-before-make. Set `MODAL_CRITICAL_DEPLOY_ENABLED` to `false`, stop
+the critical deployment with
+`uv run modal app stop --env critical asos-parquet-update`, then check out the
+commit recorded before this migration and deploy it from there with
+`uv run modal deploy --env main modal_app.py`.
+
 ## Testing
 
 ```bash
 # Run the update once manually (without waiting for schedule)
-modal run modal_app.py::main --lookback 6
+uv run modal run --env critical modal_app.py::main --lookback 6
 
 # View logs
-modal app logs asos-parquet-update
+uv run modal app logs --env critical asos-parquet-update
 
 # Check deployment status
-modal app list
+uv run modal app list --env critical
 ```
 
 ### Manual reconcile
@@ -105,8 +153,8 @@ To heal a gap older than the daily reconcile's 72 hours, re-fetch explicit UTC
 windows (`[start, end)`, each endpoint with a zone; comma-separate several):
 
 ```bash
-modal run modal_app.py::reconcile --windows 2026-02-10T02:00Z/2026-02-10T16:00Z
-modal run modal_app.py::reconcile --windows START/END[,START/END...] --restore-retired-metadata
+uv run modal run --env critical modal_app.py::reconcile --windows 2026-02-10T02:00Z/2026-02-10T16:00Z
+uv run modal run --env critical modal_app.py::reconcile --windows START/END[,START/END...] --restore-retired-metadata
 ```
 
 Manual runs are strict: a failed fetch chunk or station network aborts the run,
@@ -119,7 +167,7 @@ re-keyed stations' old IDs (see `src/asos_parquet/station_aliases.py`).
 
 ```bash
 # Redeploy after code changes
-modal deploy modal_app.py
+uv run modal deploy --env critical modal_app.py
 ```
 
 ## Monitoring
@@ -207,5 +255,5 @@ curl -I https://mesonet.agron.iastate.edu/
 **AWS credentials error:**
 ```bash
 # Recreate the secret
-modal secret create source-coop-asos-s3 ...
+uv run modal secret create --env critical source-coop-asos-s3 --force ...
 ```

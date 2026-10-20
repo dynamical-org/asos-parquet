@@ -153,7 +153,7 @@ See [AGENTS.md](AGENTS.md) for full developer reference including architecture, 
 The dataset updates via [Modal](https://modal.com/) serverless functions. See [deploy/README.md](deploy/README.md) for setup.
 
 ```bash
-modal deploy modal_app.py
+uv run modal deploy --env critical modal_app.py
 ```
 
 ## Attribution

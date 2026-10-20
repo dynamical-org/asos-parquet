@@ -24,9 +24,11 @@ def test_obs_ingest_is_not_deployed_by_ci() -> None:
     asos-parquet deployment.
     """
     workflow = (REPO_ROOT / ".github/workflows/deploy.yml").read_text()
+    checks = (REPO_ROOT / ".github/workflows/checks.yml").read_text()
 
-    assert "modal deploy modal_app.py" in workflow
+    assert "modal deploy --env critical modal_app.py" in workflow
     assert "modal_obs_app.py" not in workflow
+    assert "modal_obs_app.py" not in checks
 
 
 def test_obs_parquet_backfill_rejects_pre_2026(monkeypatch: pytest.MonkeyPatch) -> None:

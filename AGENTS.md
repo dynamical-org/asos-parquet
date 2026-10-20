@@ -61,8 +61,8 @@ Iowa Mesonet API  →  fetch.py  →  load.py  →  data/asos/year=YYYY/data.par
 
 ### Modal Deployment
 
-- **`modal_app.py`** (app `asos-parquet-update`): Serverless hourly updates for the legacy `asos-parquet` dataset - downloads current year from S3, fetches new observations, merges, uploads back. **Deployed by CI on every push to main**, so any cron added here goes live on merge.
-- **`modal_obs_app.py`** (app `obs-parquet-update`): obs-parquet v1 ingest - hourly MSC SWOB capture and year backfill. **Not deployed by CI**; deploy deliberately with `uv run modal deploy modal_obs_app.py`.
+- **`modal_app.py`** (app `asos-parquet-update`): Serverless hourly updates for the legacy `asos-parquet` dataset - downloads current year from S3, fetches new observations, merges, uploads back. Runs in the **`critical` Modal environment**: every `modal deploy`/`modal run` of it needs `--env critical` (the file refuses to import locally otherwise; no override). **Deployed by CI on every push to main** once the repo variable `MODAL_CRITICAL_DEPLOY_ENABLED` is `true` (until then the deploy job fails, held), so any cron added here goes live on merge. PR checks run from `.github/workflows/checks.yml`, which `deploy.yml` reuses.
+- **`modal_obs_app.py`** (app `obs-parquet-update`): obs-parquet v1 ingest - hourly MSC SWOB capture and year backfill. **Not deployed by CI**; deploy deliberately with `uv run modal deploy modal_obs_app.py`. Stays in the default (`main`) Modal environment.
 
 New scheduled work on obs-parquet belongs in `modal_obs_app.py`, never in `modal_app.py`.
 
@@ -98,11 +98,11 @@ make load                    # Full historical load (1940-present)
 ./scripts/upload_s3.sh       # Upload to S3
 
 # Deploy Modal for hourly updates
-pip install modal
-modal setup
-modal secret create source-coop-asos-s3 ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos
-modal secret create sentry-asos-parquet SENTRY_DSN=xxx
-modal deploy modal_app.py
+uv sync --all-extras
+uv run modal setup
+uv run modal secret create --env critical source-coop-asos-s3 ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos-parquet
+uv run modal secret create --env critical sentry-asos-parquet SENTRY_DSN=xxx
+uv run modal deploy --env critical modal_app.py
 ```
 
 ## Code Patterns

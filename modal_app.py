@@ -6,10 +6,11 @@ in S3, and upload back. A daily reconcile at 05:35 UTC re-fetches the last
 72 hours (from the top of the hour) to heal reports IEM published late or
 that a partial hourly run missed.
 
-This app publishes the legacy `asos-parquet` dataset and nothing else. CI
-deploys it on every push to main, and deploying an app registers every cron in
-the file — so anything scheduled here goes live on merge and reports its
-failures against this deployment. obs-parquet ingest lives in
+This app publishes the legacy `asos-parquet` dataset and nothing else. It
+lives in the `critical` Modal environment; CI deploys it there on every push to
+main (once critical deploys are enabled; see deploy/README.md), and deploying
+an app registers every cron in the file — so anything scheduled here goes live
+on merge and reports its failures against this deployment. obs-parquet ingest lives in
 modal_obs_app.py; keep it there.
 
 Schedule rationale:
@@ -47,8 +48,10 @@ Concurrency guarantee (snapshot-based):
 Manual reconcile over explicit UTC windows ([start, end), each endpoint with a
 zone; several comma-separated windows are fetched once each and published in
 one PUT):
-    modal run modal_app.py::reconcile --windows 2026-02-10T02:00Z/2026-02-10T16:00Z
-    modal run modal_app.py::reconcile --windows ... --restore-retired-metadata
+    uv run modal run --env critical modal_app.py::reconcile \\
+        --windows 2026-02-10T02:00Z/2026-02-10T16:00Z
+    uv run modal run --env critical modal_app.py::reconcile \\
+        --windows ... --restore-retired-metadata
 Manual runs are strict: any failed chunk or station network, or any acceptance
 gate violation (diff against the base, written-file schema), aborts before the
 PUT. Scheduled runs publish what they fetched and then fail the run.
@@ -65,15 +68,16 @@ a failure in one year is raised after the other year is published. Manual
 windows must still fit one year partition.
 
 Setup:
-    1. Install modal: pip install modal
-    2. Create secrets:
-       modal secret create source-coop-asos-s3 \\
+    1. Install dependencies (includes the Modal CLI): uv sync --all-extras
+    2. Create secrets in the critical environment:
+       uv run modal secret create --env critical source-coop-asos-s3 \\
          ASOS_AWS_ACCESS_KEY_ID=xxx ASOS_AWS_SECRET_ACCESS_KEY=xxx \\
          ASOS_AWS_SESSION_TOKEN=xxx ASOS_AWS_DEFAULT_REGION=us-west-2 \\
          ASOS_S3_BUCKET=your-bucket ASOS_S3_PREFIX=asos-parquet
-       modal secret create sentry-asos-parquet SENTRY_DSN=xxx
+       uv run modal secret create --env critical sentry-asos-parquet \\
+         SENTRY_DSN=xxx
        (log streaming + error tracking + cron monitoring via Sentry; see obs.py.)
-    3. Deploy: modal deploy modal_app.py
+    3. Deploy: uv run modal deploy --env critical modal_app.py
 
 Cost (Modal billing, 2026-09-29/30, 2026 partition ~44M rows): ~$33/month.
 Hourly runs are ~$32 of that, mostly memory; see deploy/README.md.
@@ -93,6 +97,28 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from asos_parquet.reconcile import Window
+
+# The scheduled ASOS publisher lives in the `critical` Modal environment only.
+# Checked before any Modal object is built, so a deploy or run that would land
+# in the workspace default (or any other environment) fails before the network.
+# The Modal CLI applies `--env` to this config before importing this file.
+# Containers skip the check: there the environment is fixed by the deployment.
+MODAL_ENVIRONMENT = "critical"
+
+
+def _require_critical_environment() -> None:
+    if not modal.is_local():
+        return
+    environment = modal.config.config.get("environment")
+    if environment != MODAL_ENVIRONMENT:
+        raise RuntimeError(
+            f"modal_app.py must target the {MODAL_ENVIRONMENT!r} Modal environment, "
+            f"got {environment or 'none (workspace default)'!r}; "
+            f"pass --env {MODAL_ENVIRONMENT} to modal deploy/run"
+        )
+
+
+_require_critical_environment()
 
 # Modal app configuration
 app = modal.App("asos-parquet-update")
