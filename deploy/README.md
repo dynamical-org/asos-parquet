@@ -86,7 +86,7 @@ ASOS publisher, and cannot report its failures against the ASOS deployment.
 Deploy it when you mean to:
 
 ```bash
-uv run modal deploy modal_obs_app.py
+uv run modal deploy --env main modal_obs_app.py
 ```
 
 ## Modal environment

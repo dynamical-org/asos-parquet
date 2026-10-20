@@ -62,7 +62,7 @@ Iowa Mesonet API  →  fetch.py  →  load.py  →  data/asos/year=YYYY/data.par
 ### Modal Deployment
 
 - **`modal_app.py`** (app `asos-parquet-update`): Serverless hourly updates for the legacy `asos-parquet` dataset - downloads current year from S3, fetches new observations, merges, uploads back. Runs in the **`critical` Modal environment**: every `modal deploy`/`modal run` of it needs `--env critical` (the file refuses to import locally otherwise; no override). **Deployed by CI on every push to main** once the repo variable `MODAL_CRITICAL_DEPLOY_ENABLED` is `true` (until then the deploy job fails, held), so any cron added here goes live on merge. PR checks run from `.github/workflows/checks.yml`, which `deploy.yml` reuses.
-- **`modal_obs_app.py`** (app `obs-parquet-update`): obs-parquet v1 ingest - hourly MSC SWOB capture and year backfill. **Not deployed by CI**; deploy deliberately with `uv run modal deploy modal_obs_app.py`. Stays in the default (`main`) Modal environment.
+- **`modal_obs_app.py`** (app `obs-parquet-update`): obs-parquet v1 ingest - hourly MSC SWOB capture and year backfill. **Not deployed by CI**; deploy deliberately with `uv run modal deploy --env main modal_obs_app.py`. Stays in the default (`main`) Modal environment.
 
 New scheduled work on obs-parquet belongs in `modal_obs_app.py`, never in `modal_app.py`.
 
