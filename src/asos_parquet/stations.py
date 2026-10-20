@@ -3,6 +3,7 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pandas as pd
 import requests
@@ -13,8 +14,13 @@ from .config import (
     REQUEST_TIMEOUT,
     get_all_network_ids,
 )
+from .fetch import IEM_MIN_REQUEST_INTERVAL, RequestPacer
+from .retry import RetryableResponse, RetryPolicy, call_with_retry
 
 logger = logging.getLogger(__name__)
+
+# Spaces metadata *retries* (first attempts stay unpaced) across all workers.
+METADATA_RETRY_PACER = RequestPacer(IEM_MIN_REQUEST_INTERVAL)
 
 
 @dataclass(frozen=True)
@@ -49,19 +55,45 @@ def _parse_network_id(network_id: str) -> tuple[str, str]:
     return region_code, country
 
 
-def fetch_network_stations(network_id: str) -> pd.DataFrame:
+def _get_network_json(url: str, network_id: str, policy: RetryPolicy) -> dict[str, Any]:
+    """GET one network's GeoJSON under a bounded RetryPolicy.
+
+    A 200 whose body is not JSON may be truncated, so it is retried; valid
+    JSON with an unexpected schema fails later, in parsing, without retry.
+    """
+
+    def attempt(timeout: tuple[float, float]) -> dict[str, Any]:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        try:
+            return cast(dict[str, Any], response.json())
+        except ValueError as e:  # requests.JSONDecodeError is a ValueError
+            raise RetryableResponse(f"invalid JSON ({type(e).__name__})") from e
+
+    return call_with_retry(
+        attempt, label=f"network {network_id}", policy=policy, pacer=METADATA_RETRY_PACER
+    )
+
+
+def fetch_network_stations(
+    network_id: str, *, retry_policy: RetryPolicy | None = None
+) -> pd.DataFrame:
     """Fetch station metadata for a single ASOS network.
 
     Args:
         network_id: Network ID string (e.g. 'CA_ASOS', 'AU__ASOS', 'CA_AB_ASOS')
+        retry_policy: Opt-in bounded retries (see retry.py); None keeps one plain GET
 
     Returns:
         DataFrame with station metadata including coordinates and archive dates
     """
     url = NETWORK_METADATA_URL.format(network_id=network_id)
-    response = requests.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
+    if retry_policy is None:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+    else:
+        data = _get_network_json(url, network_id, retry_policy)
 
     region_code, country = _parse_network_id(network_id)
 
@@ -113,12 +145,15 @@ def fetch_all_stations(
 def fetch_all_stations_result(
     networks: list[str] | None = None,
     online_only: bool = False,
+    *,
+    retry_policy: RetryPolicy | None = None,
 ) -> StationFetchResult:
     """Fetch station metadata for ASOS networks, reporting failed networks.
 
     Args:
         networks: List of network ID strings to fetch. Defaults to US-only networks.
         online_only: If True, only return currently online stations.
+        retry_policy: Opt-in bounded per-network retries; None keeps one plain GET
 
     Returns:
         StationFetchResult with all station metadata and the failed network IDs
@@ -129,9 +164,11 @@ def fetch_all_stations_result(
     all_stations: list[pd.DataFrame] = []
     failed_networks: list[str] = []
 
+    # Only the opt-in path passes the new keyword down.
+    network_kwargs = {"retry_policy": retry_policy} if retry_policy is not None else {}
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS * 2) as executor:
         futures = {
-            executor.submit(fetch_network_stations, network_id): network_id
+            executor.submit(fetch_network_stations, network_id, **network_kwargs): network_id
             for network_id in networks
         }
         for future in as_completed(futures):

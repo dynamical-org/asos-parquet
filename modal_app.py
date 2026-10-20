@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from asos_parquet.reconcile import Window
+    from asos_parquet.retry import Deadline
 
 # Modal app configuration
 app = modal.App("asos-parquet-update")
@@ -352,7 +353,17 @@ def _publish_scheduled(
     """
     from asos_parquet.fetch import EmptyFetchError
     from asos_parquet.reconcile import split_windows_by_year
+    from asos_parquet.retry import SCHEDULED_ADMISSION_BUDGET, Deadline
 
+    # Stop extra retry work after ten minutes, leaving healthy first requests
+    # available for later years/rebases. Socket timeouts limit inactivity, not
+    # total transfer duration; Modal's timeout remains the hard job ceiling.
+    # Never reset this retry-admission deadline per year/rebase.
+    fetch_deadline = (
+        Deadline.after(SCHEDULED_ADMISSION_BUDGET)
+        if BOUNDED_SCHEDULED_UPDATE and not reconcile
+        else None
+    )
     by_year = split_windows_by_year(windows)
     if len(by_year) == 1:
         return _publish_windows(
@@ -362,6 +373,7 @@ def _publish_scheduled(
             restore_retired_metadata=False,
             now=now,
             create_missing=by_year[0][0] == now.year,
+            fetch_deadline=fetch_deadline,
         )
     results: list[dict[str, Any]] = []
     empty: list[EmptyFetchError] = []
@@ -376,6 +388,7 @@ def _publish_scheduled(
                     restore_retired_metadata=False,
                     now=now,
                     create_missing=year == now.year,
+                    fetch_deadline=fetch_deadline,
                 )
             )
         except EmptyFetchError as error:
@@ -522,6 +535,7 @@ def _publish_windows(
     now: "pd.Timestamp",
     reconcile: bool = False,
     create_missing: bool = False,
+    fetch_deadline: "Deadline | None" = None,
 ) -> dict[str, Any]:
     """Fetch the windows, merge them into their year partition, and PUT it.
 
@@ -569,6 +583,7 @@ def _publish_windows(
         withhold_concurrent_changes,
         written_file_violations,
     )
+    from asos_parquet.retry import bulk_retry_policy, metadata_retry_policy
     from asos_parquet.station_aliases import retired_station_metadata
     from asos_parquet.stations import fetch_all_stations_result
 
@@ -586,6 +601,18 @@ def _publish_windows(
     # asking to restore retired metadata) keeps the full-frame path.
     bounded = (
         BOUNDED_SCHEDULED_UPDATE and not manual and not reconcile and not restore_retired_metadata
+    )
+    # One invocation deadline survives year rollover and conditional-PUT rebases.
+    # Other modes retain the existing fetch behavior, including direct callers.
+    metadata_options = (
+        {"retry_policy": metadata_retry_policy(fetch_deadline)}
+        if bounded and fetch_deadline is not None
+        else {}
+    )
+    observation_options = (
+        {"retry_policy": bulk_retry_policy(fetch_deadline)}
+        if bounded and fetch_deadline is not None
+        else {}
     )
     logger.info(f"ASOS {mode} started: windows {window_text} → s3://{s3_bucket}/{s3_key}")
     s3 = _s3_client()
@@ -678,7 +705,9 @@ def _publish_windows(
             # new as theirs; anyone publishing after our GET makes our PUT 412.
             networks = get_all_network_ids()
             logger.info(f"Fetching station metadata for {len(networks)} networks...")
-            station_result = fetch_all_stations_result(networks=networks, online_only=True)
+            station_result = fetch_all_stations_result(
+                networks=networks, online_only=True, **metadata_options
+            )
             online = station_result.stations
             failed_networks = station_result.failed_networks
             run.failed_networks.update(failed_networks)
@@ -713,6 +742,7 @@ def _publish_windows(
                         start,
                         end,
                         show_progress=False,  # No terminal in Modal
+                        **observation_options,
                     ),
                 )
                 # Step 5: Completeness
