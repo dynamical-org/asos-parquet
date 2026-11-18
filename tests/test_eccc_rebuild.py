@@ -3,10 +3,12 @@ from hashlib import sha256
 from json import loads
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from asos_parquet.canonical import read_attributions, read_normalized, read_raw_manifests
-from asos_parquet.capabilities import read_capabilities
+from asos_parquet.capabilities import read_capabilities, write_capabilities
 from asos_parquet.contracts import CapabilityState, RawObjectRef, Variable
 from asos_parquet.eccc_rebuild import EcccRawPayload, rebuild_eccc_2026
 
@@ -59,6 +61,20 @@ def test_rebuild_writes_deterministic_artifacts_and_completeness(tmp_path: Path)
     assert completeness["unavailable_intervals"] == [
         {"end": "2026-03-02T00:00:00+00:00", "start": "2026-03-01T00:00:00+00:00"}
     ]
+
+
+def test_rebuild_capabilities_append_to_public_writer_output_without_schema_promotion(
+    tmp_path: Path,
+) -> None:
+    result = rebuild_eccc_2026([_payload()], tmp_path, datetime(2026, 8, 10, 8, tzinfo=UTC))
+    capabilities = read_capabilities(result.capabilities_path)
+    public_path = tmp_path / "public-capabilities.parquet"
+    write_capabilities(capabilities, public_path)
+
+    combined = pa.concat_tables(
+        [pq.read_table(public_path), pq.read_table(result.capabilities_path)]
+    )
+    assert combined.num_rows == 2 * len(capabilities)
 
 
 def test_rebuild_is_idempotent_and_rejects_partial_restart(tmp_path: Path) -> None:
