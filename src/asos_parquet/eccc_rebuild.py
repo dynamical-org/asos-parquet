@@ -19,6 +19,7 @@ from .canonical import (
     write_attributions,
     write_raw_manifests,
 )
+from .capabilities import CAPABILITY_SCHEMA
 from .config import OBS_DATASET_START_YEAR
 from .contracts import Attribution, NormalizedObservation, RawObjectManifest, RawObjectRef
 
@@ -117,9 +118,7 @@ def _write_capabilities(normalized_path: Path, capabilities_path: Path) -> None:
     variables = tuple(dict.fromkeys(str(item.variable) for item in VARIABLE_MAPPINGS.values()))
     values = ",".join(f"('{variable}')" for variable in variables)
     normalized = str(normalized_path).replace("'", "''")
-    output = str(capabilities_path).replace("'", "''")
     query = f"""
-        COPY (
             WITH station_days AS (
                 SELECT raw_source AS source, source_station_id,
                        date_trunc('day', observed_at) AS valid_from,
@@ -159,9 +158,14 @@ def _write_capabilities(normalized_path: Path, capabilities_path: Path) -> None:
             FROM station_days CROSS JOIN variables
             LEFT JOIN counts USING (source, source_station_id, valid_from, variable)
             ORDER BY source, source_station_id, variable, valid_from
-        ) TO '{output}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """
-    duckdb.connect().execute(query).close()
+    with (
+        duckdb.connect() as connection,
+        pq.ParquetWriter(capabilities_path, CAPABILITY_SCHEMA, compression="zstd") as writer,
+    ):
+        with connection.sql(query).to_arrow_reader(batch_size=65_536) as batches:
+            for batch in batches:
+                writer.write_batch(batch.cast(CAPABILITY_SCHEMA))
 
 
 def rebuild_eccc_2026(
